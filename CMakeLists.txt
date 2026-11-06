@@ -63,6 +63,7 @@ set(MODS
         World
         FreelancerSeeder
         QuickSave
+        FocusForAll
 )
 
 foreach (MOD IN LISTS MODS)
