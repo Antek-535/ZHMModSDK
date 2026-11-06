@@ -1,9 +1,23 @@
-# BEST GUESS - compare with Mods/Freecam/CMakeLists.txt in your fork and
-# copy its exact pattern if this differs (the SDK changes this between versions).
+cmake_minimum_required(VERSION 3.12)
 
-add_mod(InstinctSounds
-    InstinctSounds.cpp
-    InstinctSounds.h
+file(GLOB_RECURSE SRC_FILES
+        CONFIGURE_DEPENDS
+        Src/*.cpp
+        Src/*.c
+        Src/*.hpp
+        Src/*.h
 )
 
-target_link_libraries(InstinctSounds PRIVATE winmm comdlg32)
+add_library(InstinctSounds SHARED
+        ${SRC_FILES}
+)
+
+target_include_directories(InstinctSounds PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/Src
+)
+
+target_link_libraries(InstinctSounds PRIVATE
+        ZHMModSDK
+        winmm
+        comdlg32
+)
