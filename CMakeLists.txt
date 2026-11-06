@@ -43,6 +43,7 @@ add_subdirectory(DirectInputProxy)
 set(MODS
         NoPause
         FocusForAll
+        InstinctSounds
 )
 foreach (MOD IN LISTS MODS)
     add_subdirectory("Mods/${MOD}")
