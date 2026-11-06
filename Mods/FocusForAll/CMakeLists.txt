@@ -6,6 +6,5 @@ add_library(FocusForAll SHARED
 )
 
 target_include_directories(FocusForAll PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(FocusForAll ZHMModSDK)
+target_link_libraries(FocusForAll ZHMModSDK winmm)
 set_target_properties(FocusForAll PROPERTIES CXX_STANDARD 23)
-target_link_libraries(FocusForAll PRIVATE winmm)
