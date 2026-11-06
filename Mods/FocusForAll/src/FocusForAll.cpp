@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <mmsystem.h>
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +13,7 @@
 
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZGameTime.h"
+#include "Glacier/ZHitman5.h"
 
 static constexpr char kSection[] = "FocusForAll";
 
@@ -199,7 +201,7 @@ void FocusForAll::OnEngineInitialized() {
 void FocusForAll::LoadSettings() {
     m_SlowKey = static_cast<int>(GetSettingInt(kSection, "slow_key", m_SlowKey));
     m_AimKey = static_cast<int>(GetSettingInt(kSection, "aim_key", m_AimKey));
-    m_RequireAim = GetSettingBool(kSection, "require_aim", m_RequireAim);
+    m_AimMode = std::clamp(static_cast<int>(GetSettingInt(kSection, "aim_mode", m_AimMode)), 0, 2);
     m_ToggleMode = GetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     m_FocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "focus_scale", m_FocusScale)), 0.05f, 0.95f);
     m_BlendSpeed = std::clamp(static_cast<float>(GetSettingDouble(kSection, "blend_speed", m_BlendSpeed)), 1.0f, 30.0f);
@@ -211,6 +213,22 @@ void FocusForAll::LoadSettings() {
     m_OverlayOpacity = std::clamp(static_cast<float>(GetSettingDouble(kSection, "overlay_opacity", m_OverlayOpacity)), 0.0f, 0.6f);
     m_BwStrength = std::clamp(static_cast<float>(GetSettingDouble(kSection, "bw_strength", m_BwStrength)), 0.0f, 0.9f);
 
+    m_VigEnabled = GetSettingBool(kSection, "vig_enabled", m_VigEnabled);
+    m_VigColor[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "vig_r", m_VigColor[0])), 0.0f, 1.0f);
+    m_VigColor[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "vig_g", m_VigColor[1])), 0.0f, 1.0f);
+    m_VigColor[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "vig_b", m_VigColor[2])), 0.0f, 1.0f);
+    m_VigOpacity = std::clamp(static_cast<float>(GetSettingDouble(kSection, "vig_opacity", m_VigOpacity)), 0.0f, 1.0f);
+    m_VigSize = std::clamp(static_cast<float>(GetSettingDouble(kSection, "vig_size", m_VigSize)), 0.1f, 0.5f);
+
+    m_OnAnd[0] = static_cast<uint64_t>(GetSettingInt(kSection, "on_and_0", -1));
+    m_OnAnd[1] = static_cast<uint64_t>(GetSettingInt(kSection, "on_and_1", -1));
+    m_OnAnd[2] = static_cast<uint64_t>(GetSettingInt(kSection, "on_and_2", -1));
+    m_OffOr[0] = static_cast<uint64_t>(GetSettingInt(kSection, "off_or_0", 0));
+    m_OffOr[1] = static_cast<uint64_t>(GetSettingInt(kSection, "off_or_1", 0));
+    m_OffOr[2] = static_cast<uint64_t>(GetSettingInt(kSection, "off_or_2", 0));
+    m_OnCount = static_cast<int>(GetSettingInt(kSection, "on_count", 0));
+    m_OffCount = static_cast<int>(GetSettingInt(kSection, "off_count", 0));
+
     m_SoundEnabled = GetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     m_SoundType = std::clamp(static_cast<int>(GetSettingInt(kSection, "sound_type", m_SoundType)), 0, kSoundCount - 1);
     m_Volume = std::clamp(static_cast<float>(GetSettingDouble(kSection, "volume", m_Volume)), 0.0f, 1.0f);
@@ -219,7 +237,7 @@ void FocusForAll::LoadSettings() {
 void FocusForAll::SaveSettings() {
     SetSettingInt(kSection, "slow_key", m_SlowKey);
     SetSettingInt(kSection, "aim_key", m_AimKey);
-    SetSettingBool(kSection, "require_aim", m_RequireAim);
+    SetSettingInt(kSection, "aim_mode", m_AimMode);
     SetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     SetSettingDouble(kSection, "focus_scale", m_FocusScale);
     SetSettingDouble(kSection, "blend_speed", m_BlendSpeed);
@@ -230,6 +248,22 @@ void FocusForAll::SaveSettings() {
     SetSettingDouble(kSection, "overlay_b", m_OverlayColor[2]);
     SetSettingDouble(kSection, "overlay_opacity", m_OverlayOpacity);
     SetSettingDouble(kSection, "bw_strength", m_BwStrength);
+
+    SetSettingBool(kSection, "vig_enabled", m_VigEnabled);
+    SetSettingDouble(kSection, "vig_r", m_VigColor[0]);
+    SetSettingDouble(kSection, "vig_g", m_VigColor[1]);
+    SetSettingDouble(kSection, "vig_b", m_VigColor[2]);
+    SetSettingDouble(kSection, "vig_opacity", m_VigOpacity);
+    SetSettingDouble(kSection, "vig_size", m_VigSize);
+
+    SetSettingInt(kSection, "on_and_0", static_cast<int64_t>(m_OnAnd[0]));
+    SetSettingInt(kSection, "on_and_1", static_cast<int64_t>(m_OnAnd[1]));
+    SetSettingInt(kSection, "on_and_2", static_cast<int64_t>(m_OnAnd[2]));
+    SetSettingInt(kSection, "off_or_0", static_cast<int64_t>(m_OffOr[0]));
+    SetSettingInt(kSection, "off_or_1", static_cast<int64_t>(m_OffOr[1]));
+    SetSettingInt(kSection, "off_or_2", static_cast<int64_t>(m_OffOr[2]));
+    SetSettingInt(kSection, "on_count", m_OnCount);
+    SetSettingInt(kSection, "off_count", m_OffCount);
 
     SetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     SetSettingInt(kSection, "sound_type", m_SoundType);
@@ -318,6 +352,78 @@ std::string FocusForAll::KeyName(int p_Vk) {
 }
 
 // ---------------------------------------------------------------------------
+// Weapon-state calibration
+// ---------------------------------------------------------------------------
+
+bool FocusForAll::ReadHeroFlags(uint64_t (&p_Out)[3]) const {
+    auto s_Player = SDK()->GetLocalPlayer();
+    ZHitman5* s_Hitman = s_Player.m_pInterfaceRef;
+    if (!s_Hitman) {
+        return false;
+    }
+
+    p_Out[0] = s_Hitman->m_nMovementFlags;
+    p_Out[1] = s_Hitman->m_nLocomotionFlag;
+    p_Out[2] = s_Hitman->m_nCustomFlags;
+    return true;
+}
+
+int FocusForAll::LearnedBitCount() const {
+    int s_Count = 0;
+    for (int i = 0; i < 3; ++i) {
+        s_Count += std::popcount(m_OnAnd[i] & ~m_OffOr[i]);
+    }
+    return m_OnCount > 0 ? s_Count : 0;
+}
+
+bool FocusForAll::LearnedStateMatches() const {
+    if (m_OnCount == 0 || LearnedBitCount() == 0) {
+        return false; // not calibrated (or no distinguishing bits found)
+    }
+
+    uint64_t s_Flags[3];
+    if (!ReadHeroFlags(s_Flags)) {
+        return false;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        const uint64_t s_Mask = m_OnAnd[i] & ~m_OffOr[i];
+        if ((s_Flags[i] & s_Mask) != s_Mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void FocusForAll::SetToast(const std::string& p_Text, float p_Seconds) {
+    m_Toast = p_Text;
+    m_ToastUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(p_Seconds * 1000.0f));
+}
+
+void FocusForAll::TakeSample(bool p_Aiming) {
+    uint64_t s_Flags[3];
+    if (!ReadHeroFlags(s_Flags)) {
+        SetToast("Focus For All: no player found (start a mission first)", 4.0f);
+        return;
+    }
+
+    if (p_Aiming) {
+        for (int i = 0; i < 3; ++i) m_OnAnd[i] &= s_Flags[i];
+        ++m_OnCount;
+    } else {
+        for (int i = 0; i < 3; ++i) m_OffOr[i] |= s_Flags[i];
+        ++m_OffCount;
+    }
+
+    SaveSettings();
+
+    char s_Buf[128];
+    std::snprintf(s_Buf, sizeof(s_Buf), "Focus For All: %s sample recorded (%d bits learned)",
+                  p_Aiming ? "AIMING" : "NOT-AIMING", LearnedBitCount());
+    SetToast(s_Buf, 4.0f);
+}
+
+// ---------------------------------------------------------------------------
 // Game loop
 // ---------------------------------------------------------------------------
 
@@ -332,13 +438,24 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     const float s_Dt = std::min(std::chrono::duration<float>(s_Now - m_LastFrame).count(), 0.1f);
     m_LastFrame = s_Now;
 
+    // Delayed calibration sample (lets you close the menu and pose first).
+    if (m_PendingSample != 0 && s_Now >= m_SampleTime) {
+        TakeSample(m_PendingSample == 1);
+        m_PendingSample = 0;
+    }
+
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &s_ForegroundPid);
     const bool s_GameFocused = s_ForegroundPid == GetCurrentProcessId() && m_BindingTarget == 0;
 
-    // "Aiming" = the game's aim button is held (see notes: this does not check for an equipped weapon).
-    const bool s_Aiming = !m_RequireAim || IsKeyDown(m_AimKey);
+    // Aim detection: 0 = always, 1 = aim button held, 2 = aim button held AND calibrated weapon state matches.
+    bool s_Aiming = true;
+    if (m_AimMode == 1) {
+        s_Aiming = IsKeyDown(m_AimKey);
+    } else if (m_AimMode == 2) {
+        s_Aiming = IsKeyDown(m_AimKey) && LearnedStateMatches();
+    }
     const bool s_SlowKeyDown = s_GameFocused && IsKeyDown(m_SlowKey);
 
     bool s_Active;
@@ -381,28 +498,71 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 // Overlay
 // ---------------------------------------------------------------------------
 
-void FocusForAll::DrawOverlay() {
-    if (m_OverlayStyle == 0 || !m_Touched) {
+void FocusForAll::DrawVignette(float p_Strength) {
+    const float s_Alpha = p_Strength * m_VigOpacity;
+    if (!m_VigEnabled || s_Alpha <= 0.001f) {
         return;
     }
 
-    // 0 at normal speed, 1 at full slowdown, so the effect fades with the time blend.
+    const ImVec2 s_Size = ImGui::GetIO().DisplaySize;
+    const float s_Tx = s_Size.x * m_VigSize;
+    const float s_Ty = s_Size.y * m_VigSize;
+
+    const ImU32 s_C = ImGui::ColorConvertFloat4ToU32(ImVec4(m_VigColor[0], m_VigColor[1], m_VigColor[2], s_Alpha));
+    const ImU32 s_C0 = ImGui::ColorConvertFloat4ToU32(ImVec4(m_VigColor[0], m_VigColor[1], m_VigColor[2], 0.0f));
+
+    // Four edge gradients; they overlap in the corners, which makes the corners strongest.
+    ImDrawList* s_Dl = ImGui::GetBackgroundDrawList();
+    s_Dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(s_Size.x, s_Ty), s_C, s_C, s_C0, s_C0);                       // top
+    s_Dl->AddRectFilledMultiColor(ImVec2(0, s_Size.y - s_Ty), ImVec2(s_Size.x, s_Size.y), s_C0, s_C0, s_C, s_C);     // bottom
+    s_Dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(s_Tx, s_Size.y), s_C, s_C0, s_C0, s_C);                       // left
+    s_Dl->AddRectFilledMultiColor(ImVec2(s_Size.x - s_Tx, 0), ImVec2(s_Size.x, s_Size.y), s_C0, s_C, s_C, s_C0);     // right
+}
+
+void FocusForAll::DrawOverlay() {
+    const auto s_Now = std::chrono::steady_clock::now();
+
+    // Calibration countdown / confirmation text.
+    std::string s_Text;
+    if (m_PendingSample != 0) {
+        const float s_Left = std::chrono::duration<float>(m_SampleTime - s_Now).count();
+        char s_Buf[128];
+        std::snprintf(s_Buf, sizeof(s_Buf), "Focus For All: recording %s sample in %.0f...",
+                      m_PendingSample == 1 ? "AIMING" : "NOT-AIMING", std::max(s_Left, 0.0f) + 0.49f);
+        s_Text = s_Buf;
+    } else if (s_Now < m_ToastUntil) {
+        s_Text = m_Toast;
+    }
+    if (!s_Text.empty()) {
+        const ImVec2 s_Ts = ImGui::CalcTextSize(s_Text.c_str());
+        const ImVec2 s_Pos((ImGui::GetIO().DisplaySize.x - s_Ts.x) * 0.5f, 60.0f);
+        ImGui::GetBackgroundDrawList()->AddText(ImVec2(s_Pos.x + 1, s_Pos.y + 1), IM_COL32(0, 0, 0, 255), s_Text.c_str());
+        ImGui::GetBackgroundDrawList()->AddText(s_Pos, IM_COL32(255, 255, 255, 255), s_Text.c_str());
+    }
+
+    if (!m_Touched) {
+        return;
+    }
+
+    // 0 at normal speed, 1 at full slowdown, so the effects fade with the time blend.
     const float s_Range = std::max(1.0f - m_FocusScale, 0.001f);
     const float s_Strength = std::clamp((1.0f - m_CurrentScale) / s_Range, 0.0f, 1.0f);
 
-    ImVec4 s_Color;
-    if (m_OverlayStyle == 2) {
-        s_Color = ImVec4(0.5f, 0.5f, 0.5f, s_Strength * m_BwStrength);
-    } else {
-        s_Color = ImVec4(m_OverlayColor[0], m_OverlayColor[1], m_OverlayColor[2], s_Strength * m_OverlayOpacity);
+    if (m_OverlayStyle != 0) {
+        ImVec4 s_Color;
+        if (m_OverlayStyle == 2) {
+            s_Color = ImVec4(0.5f, 0.5f, 0.5f, s_Strength * m_BwStrength);
+        } else {
+            s_Color = ImVec4(m_OverlayColor[0], m_OverlayColor[1], m_OverlayColor[2], s_Strength * m_OverlayOpacity);
+        }
+
+        if (s_Color.w > 0.001f) {
+            ImGui::GetBackgroundDrawList()->AddRectFilled(
+                ImVec2(0.0f, 0.0f), ImGui::GetIO().DisplaySize, ImGui::ColorConvertFloat4ToU32(s_Color));
+        }
     }
 
-    if (s_Color.w <= 0.001f) {
-        return;
-    }
-
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0.0f, 0.0f), ImGui::GetIO().DisplaySize, ImGui::ColorConvertFloat4ToU32(s_Color));
+    DrawVignette(s_Strength);
 }
 
 // ---------------------------------------------------------------------------
@@ -446,10 +606,56 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
 
         s_KeyButton("Slow-down key", m_SlowKey, 1);
 
-        if (ImGui::Checkbox("Only works while aiming", &m_RequireAim)) s_Changed = true;
-        ImGui::BeginDisabled(!m_RequireAim);
+        static const char* const s_AimNames[] = {"Off (works any time)", "Aim button held", "Weapon aim (calibrated)"};
+        if (ImGui::Combo("Aim detection", &m_AimMode, s_AimNames, 3)) s_Changed = true;
+        ImGui::BeginDisabled(m_AimMode == 0);
         s_KeyButton("Aim button (match your in-game aim bind)", m_AimKey, 2);
         ImGui::EndDisabled();
+
+        if (m_AimMode == 2) {
+            if (ImGui::CollapsingHeader("Weapon calibration", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextWrapped(
+                    "Teach the mod what 'aiming with a weapon' looks like. Click a record button, close this menu, "
+                    "strike the pose and stand still until the on-screen message confirms. Record 1-2 AIMING samples "
+                    "(weapon drawn, aim held) and a few NOT-AIMING samples (weapon holstered; also aiming with a coin or "
+                    "empty hands).");
+
+                uint64_t s_Flags[3];
+                if (ReadHeroFlags(s_Flags)) {
+                    ImGui::Text("Live: move %016llX  loco %08llX  custom %016llX",
+                                static_cast<unsigned long long>(s_Flags[0]),
+                                static_cast<unsigned long long>(s_Flags[1]),
+                                static_cast<unsigned long long>(s_Flags[2]));
+                    ImGui::Text("Matches learned weapon state right now: %s", LearnedStateMatches() ? "YES" : "no");
+                } else {
+                    ImGui::TextUnformatted("No player found (start a mission to calibrate).");
+                }
+
+                ImGui::Text("Samples: %d aiming, %d not aiming  |  learned bits: %d", m_OnCount, m_OffCount, LearnedBitCount());
+                if (m_OnCount > 0 && LearnedBitCount() == 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                        "No distinguishing bits yet - the AIMING and NOT-AIMING samples look identical. Clear and retry.");
+                } else if (m_OnCount == 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Not calibrated: slow-mo is blocked until you record an AIMING sample.");
+                }
+
+                if (ImGui::Button("Record AIMING sample (in 6s)")) {
+                    m_PendingSample = 1;
+                    m_SampleTime = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+                }
+                if (ImGui::Button("Record NOT-AIMING sample (in 6s)")) {
+                    m_PendingSample = 2;
+                    m_SampleTime = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+                }
+                if (ImGui::Button("Clear calibration")) {
+                    for (int i = 0; i < 3; ++i) { m_OnAnd[i] = ~0ull; m_OffOr[i] = 0ull; }
+                    m_OnCount = 0;
+                    m_OffCount = 0;
+                    m_PendingSample = 0;
+                    s_Changed = true;
+                }
+            }
+        }
 
         // Capture the next key press for whichever binding is active.
         if (m_BindingTarget != 0) {
@@ -499,6 +705,13 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
         } else if (m_OverlayStyle == 2) {
             if (ImGui::SliderFloat("B&W strength", &m_BwStrength, 0.0f, 0.9f, "%.2f")) s_Changed = true;
         }
+
+        if (ImGui::Checkbox("Vignette (colored corners)", &m_VigEnabled)) s_Changed = true;
+        ImGui::BeginDisabled(!m_VigEnabled);
+        if (ImGui::ColorEdit3("Vignette color", m_VigColor)) s_Changed = true;
+        if (ImGui::SliderFloat("Vignette strength", &m_VigOpacity, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::SliderFloat("Vignette size", &m_VigSize, 0.1f, 0.5f, "%.2f")) s_Changed = true;
+        ImGui::EndDisabled();
 
         ImGui::Separator();
 
