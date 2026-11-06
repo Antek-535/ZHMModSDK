@@ -20,12 +20,12 @@ private:
 
     void LoadSettings();
     void SaveSettings();
+    void DrawOverlay();
     void RebuildSounds();
     void PlayCue(bool p_Enter);
 
     static bool IsKeyDown(int p_Vk);
     static std::string KeyName(int p_Vk);
-    static const char* ModifierName(int p_Modifier);
 
     // --- Runtime state ---
     float m_CurrentScale = 1.0f;
@@ -36,22 +36,31 @@ private:
     std::chrono::steady_clock::time_point m_LastFrame = std::chrono::steady_clock::now();
 
     // --- Settings (persisted) ---
-    int m_TriggerKey = 0x02;     // VK_RBUTTON
-    int m_Modifier = 1;          // 0 = none, 1 = Shift, 2 = Ctrl, 3 = Alt
+    int m_SlowKey = 0x10;        // VK_SHIFT: the key that slows time
+    int m_AimKey = 0x02;         // VK_RBUTTON: the game's aim button
+    bool m_RequireAim = true;    // only slow time while the aim button is held
     bool m_ToggleMode = false;   // false = hold, true = press to toggle
     float m_FocusScale = 0.30f;  // time scale while focusing (1.0 = normal)
     float m_BlendSpeed = 6.0f;   // higher = snappier transition
+
+    int m_OverlayStyle = 2;      // 0 = off, 1 = color tint, 2 = black & white
+    float m_OverlayColor[3] = {0.35f, 0.65f, 1.0f};
+    float m_OverlayOpacity = 0.15f;  // color tint max opacity
+    float m_BwStrength = 0.55f;      // black & white max strength
+
     bool m_SoundEnabled = true;
-    float m_Volume = 0.5f;       // 0..1
+    int m_SoundType = 0;         // index into the sound list in the .cpp
+    float m_Volume = 0.5f;       // 0..1 (not applied to custom file)
 
     // --- UI state ---
     bool m_ShowUI = false;
-    bool m_Binding = false;
+    int m_BindingTarget = 0;     // 0 = none, 1 = slow key, 2 = aim key
     bool m_BindArmed = false;
 
     // --- Sounds (kept alive because PlaySound reads them asynchronously) ---
     std::vector<uint8_t> m_EnterWav;
     std::vector<uint8_t> m_ExitWav;
+    std::wstring m_CustomSoundPath;
 };
 
 DECLARE_ZHM_PLUGIN(FocusForAll)
