@@ -12,7 +12,7 @@
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZGameTime.h"
 
-static constexpr const char* kSection = "FocusForAll";
+static constexpr char kSection[] = "FocusForAll";
 
 // ---------------------------------------------------------------------------
 // Sound synthesis: a short sine sweep, built in memory (no extra files needed).
