@@ -21,7 +21,13 @@ private:
     void LoadSettings();
     void SaveSettings();
     void DrawOverlay();
+    void DrawVignette(float p_Strength);
     void RebuildSounds();
+    bool ReadHeroFlags(uint64_t (&p_Out)[3]) const;
+    bool LearnedStateMatches() const;
+    int LearnedBitCount() const;
+    void TakeSample(bool p_Aiming);
+    void SetToast(const std::string& p_Text, float p_Seconds);
     void PlayCue(bool p_Enter);
 
     static bool IsKeyDown(int p_Vk);
@@ -38,7 +44,7 @@ private:
     // --- Settings (persisted) ---
     int m_SlowKey = 0x10;        // VK_SHIFT: the key that slows time
     int m_AimKey = 0x02;         // VK_RBUTTON: the game's aim button
-    bool m_RequireAim = true;    // only slow time while the aim button is held
+    int m_AimMode = 1;           // 0 = always, 1 = aim button, 2 = aim button + learned weapon state
     bool m_ToggleMode = false;   // false = hold, true = press to toggle
     float m_FocusScale = 0.30f;  // time scale while focusing (1.0 = normal)
     float m_BlendSpeed = 6.0f;   // higher = snappier transition
@@ -48,6 +54,18 @@ private:
     float m_OverlayOpacity = 0.15f;  // color tint max opacity
     float m_BwStrength = 0.55f;      // black & white max strength
 
+    bool m_VigEnabled = true;
+    float m_VigColor[3] = {0.20f, 0.45f, 1.0f};
+    float m_VigOpacity = 0.60f;
+    float m_VigSize = 0.28f;     // band thickness as a fraction of the screen size
+
+    // Weapon calibration: bits that are set in every "aiming with weapon" sample
+    // and in none of the "not aiming / no weapon" samples.
+    uint64_t m_OnAnd[3] = {~0ull, ~0ull, ~0ull};
+    uint64_t m_OffOr[3] = {0ull, 0ull, 0ull};
+    int m_OnCount = 0;
+    int m_OffCount = 0;
+
     bool m_SoundEnabled = true;
     int m_SoundType = 0;         // index into the sound list in the .cpp
     float m_Volume = 0.5f;       // 0..1 (not applied to custom file)
@@ -56,6 +74,10 @@ private:
     bool m_ShowUI = false;
     int m_BindingTarget = 0;     // 0 = none, 1 = slow key, 2 = aim key
     bool m_BindArmed = false;
+    int m_PendingSample = 0;     // 0 = none, 1 = aiming sample, 2 = not-aiming sample
+    std::chrono::steady_clock::time_point m_SampleTime;
+    std::string m_Toast;
+    std::chrono::steady_clock::time_point m_ToastUntil;
 
     // --- Sounds (kept alive because PlaySound reads them asynchronously) ---
     std::vector<uint8_t> m_EnterWav;
