@@ -1,55 +1,60 @@
 #include "FocusForAll.h"
 
+#include <Windows.h>
 #include <algorithm>
 #include <chrono>
-#include <Windows.h>
+#include <cmath>
 
-#include <Logging.h>
-#include <Globals.h>
-#include <Glacier/ZGameTimeManager.h>
+#include "Glacier/ZGameLoopManager.h"
+#include "Glacier/ZGameTime.h"
 
-void FocusForAll::Init() {
-    Logger::Info("FocusForAll loaded: hold SHIFT + aim (right mouse) to slow time with any weapon.");
-}
+FocusForAll::~FocusForAll() {
+    const ZMemberDelegate<FocusForAll, void(const SGameUpdateEvent&)> s_Delegate(this, &FocusForAll::OnFrameUpdate);
+    Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
-void FocusForAll::OnEngineInitialized() {}
-
-void FocusForAll::SetTimeScale(float p_Scale) {
-    // !! VERIFY against your ZHMModSDK version !!
-    // ZGameTimeManager exposes time multipliers; check Glacier/ZGameTimeManager.h
-    // for the exact member names in the SDK revision you build against.
-    if (Globals::GameTimeManager) {
-        Globals::GameTimeManager->m_fTimeMultiplier0 = p_Scale;
+    if (m_Touched && Globals::GameTimeManager) {
+        Globals::GameTimeManager->m_fGameTimeMultiplier = 1.0f;
     }
 }
 
-void FocusForAll::OnFrameUpdate(const SGameUpdateEvent&) {
-    // Real (unscaled) frame delta so blending doesn't depend on the slowdown itself.
+void FocusForAll::OnEngineInitialized() {
+    const ZMemberDelegate<FocusForAll, void(const SGameUpdateEvent&)> s_Delegate(this, &FocusForAll::OnFrameUpdate);
+    Globals::GameLoopManager->RegisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+}
+
+void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
+    if (!Globals::GameTimeManager) {
+        return;
+    }
+
+    // Real (unscaled) frame delta, so the blend speed doesn't depend on the slowdown itself.
     using clock = std::chrono::steady_clock;
     static auto s_Last = clock::now();
     const auto s_Now = clock::now();
-    const float s_Dt = std::chrono::duration<float>(s_Now - s_Last).count();
+    const float s_Dt = std::min(std::chrono::duration<float>(s_Now - s_Last).count(), 0.1f);
     s_Last = s_Now;
 
-    const bool s_InMission = SDK()->GetLocalPlayer().m_pInterfaceRef != nullptr;
+    // Only react to keys when the game window is the active window.
+    DWORD s_ForegroundPid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &s_ForegroundPid);
+    const bool s_GameFocused = s_ForegroundPid == GetCurrentProcessId();
 
     const bool s_Shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool s_Aim = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    const bool s_Active = s_InMission && s_Shift && s_Aim;
+    const bool s_Active = s_GameFocused && s_Shift && s_Aim;
 
     const float s_Target = s_Active ? m_FocusScale : 1.0f;
     const float s_T = std::clamp(m_BlendSpeed * s_Dt, 0.0f, 1.0f);
     m_CurrentScale += (s_Target - m_CurrentScale) * s_T;
 
-    // Only touch the multiplier while we are (or were just) active, so we don't
-    // fight other mods or the game's own time effects the rest of the time.
-    if (s_Active || std::abs(m_CurrentScale - 1.0f) > 0.001f) {
-        SetTimeScale(m_CurrentScale);
-        m_WasActive = true;
-    } else if (m_WasActive) {
-        SetTimeScale(1.0f);
+    if (s_Active || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
+        Globals::GameTimeManager->m_fGameTimeMultiplier = m_CurrentScale;
+        m_Touched = true;
+    } else if (m_Touched) {
+        // Back to normal: hand control of the multiplier back to the game.
+        Globals::GameTimeManager->m_fGameTimeMultiplier = 1.0f;
         m_CurrentScale = 1.0f;
-        m_WasActive = false;
+        m_Touched = false;
     }
 }
 
