@@ -41,31 +41,9 @@ add_subdirectory(DirectInputProxy)
 
 # Mods.
 set(MODS
-        WakingUpNpcs
         NoPause
-        SkipIntro
-        MaxPatchLevel
-        DebugMod
-        AdvancedRating
-        FreeCam
-        TitaniumBullets
-        DiscordRichPresence
-        Editor
-        Clumsy
-        Noclip
-        #Hitmen
-        DebugCheckKeyEntityEnabler
-        OnlineTools
-        Player
-        Assets
-        Outfits
-        Randomizer
-        World
-        FreelancerSeeder
-        QuickSave
         FocusForAll
 )
-
 foreach (MOD IN LISTS MODS)
     add_subdirectory("Mods/${MOD}")
 
@@ -74,7 +52,7 @@ foreach (MOD IN LISTS MODS)
 endforeach ()
 
 # Install the discord SDK DLL.
-install(FILES ${DISCORD_SDK_DLL_PATH} DESTINATION bin)
+#install(FILES ${DISCORD_SDK_DLL_PATH} DESTINATION bin)
 
 # Tools.
 add_subdirectory("Tools/DevLoader")
