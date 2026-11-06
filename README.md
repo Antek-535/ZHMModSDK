@@ -169,6 +169,7 @@ to the `[sdk]` section of your `mods.ini` file (but don't ask for help when it d
 
 ## Contributing
 
+
 If you'd like to contribute to the SDK, feel free to open a pull request or an issue. If you're not sure where to start,
 check out the [issues](https://github.com/OrfeasZ/ZHMModSDK/issues) tab.
 
