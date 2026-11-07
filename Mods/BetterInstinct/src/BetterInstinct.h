@@ -12,7 +12,12 @@
 #include "Hooks.h"
 
 #include <Glacier/ZActor.h>
+#include <Glacier/ZCameraEntity.h>
+#include <Glacier/ZCollision.h>
+#include <Glacier/ZEntity.h>
+#include <Glacier/ZHitman5.h>
 #include <Glacier/ZInput.h>
+#include <Glacier/ZObject.h>
 
 // Ultimate Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
@@ -54,9 +59,27 @@ private:
     void ForceReleaseInstinct();
 
     // Point shooting (Absolution style): hold a key to slow time, aim at enemies to tag them, release to shoot them all.
-    ZActor* FindAimedActor();
-    void TryTagTarget();
+    struct AimHit {                    // what the crosshair is pointing at
+        ZActor* actor = nullptr;
+        ZSpatialEntity* anchor = nullptr; // the body part that was hit (moves with the actor)
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+    };
+    struct PsTarget {                  // a tagged enemy
+        ZActor* actor;
+        ZSpatialEntity* anchor;
+        float x, y, z;                 // last known world position (for the on-screen marker)
+    };
+    struct PsKill {                    // a "shot landed" marker that fades out
+        float x, y, z, age;
+    };
+
+    bool FindAimedActor(AimHit& p_Hit);
+    void TryTagTarget(bool p_Click, float p_Dt);
     void FirePointShot();
+    void RefreshTargetPositions();
+    size_t PsTargetCount();
+    void PlayShotSound();
+    void DrawPsOverlay(float p_Dt);
     bool DrawKeyBinder(const char* p_Id, int& p_Key, bool& p_Binding, bool& p_Armed);
 
     // Game-level input blocking: the game asks ZInputAction_Digital "is action X pressed?" for every
@@ -104,9 +127,16 @@ private:
     enum PsStateId : int { PS_IDLE = 0, PS_AIMING = 1, PS_EXECUTING = 2 };
     std::atomic<int> m_PsState{PS_IDLE};
     std::atomic<int> m_PsTagCount{0};  // tagged targets still waiting to be shot (for the HUD pips)
-    std::vector<ZActor*> m_PsTargets;
+    std::mutex m_PsMutex;              // guards m_PsTargets and m_PsKills (game thread writes, UI thread draws)
+    std::vector<PsTarget> m_PsTargets;
+    std::vector<PsKill> m_PsKills;
     bool m_PsPrevDown = false;
+    bool m_PsPrevClick = false;
     float m_PsShotTimer = 0.0f;
+    ZActor* m_PsHoverActor = nullptr;  // actor currently under the crosshair
+    float m_PsHoverTime = 0.0f;        // how long it has been there (seconds)
+    std::atomic<float> m_PsHoverProgress{0.0f}; // 0..1, fills while hovering to tag
+    std::atomic<float> m_PsFlash{0.0f};         // muzzle flash, fades out
 
     // --- Game-level input block state ---
     std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
@@ -136,6 +166,13 @@ private:
     int m_PsMaxTags = 6;             // most targets that can be tagged at once
     float m_PsShotDelay = 0.15f;     // real seconds between the shots
     float m_PsDrainMul = 0.5f;       // meter drain while aiming, compared to normal Instinct
+    bool m_PsClickTag = true;        // left click tags the target under the crosshair
+    float m_PsDwell = 0.35f;         // hover this long (seconds) to tag automatically; 0 = off
+    bool m_PsShotSound = true;       // play a shot sound for every point shot
+    float m_PsShotVolume = 0.7f;
+
+    bool m_HipAssist = true;         // during Instinct, hold short left clicks a bit longer so hip fire registers
+    int m_HipMinMs = 120;            // minimum click length (real milliseconds)
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
