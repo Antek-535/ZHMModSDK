@@ -3,6 +3,8 @@
 #include <Windows.h>
 #include <mmsystem.h>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -12,13 +14,19 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
 #include <imgui.h>
 
+#include "Functions.h"
+#include "Hooks.h"
+
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZGameTime.h"
+#include "Glacier/ZInput.h"
 
 static constexpr char kSection[] = "FocusForAll";
 static constexpr float kUnlockLevel = 0.25f; // after running dry, the meter must refill to this before Instinct works again
@@ -64,6 +72,7 @@ std::wstring FindModuleDir() {
 // Instinct key guard: a low-level keyboard/mouse hook that swallows the Instinct key press while
 // Instinct is unusable, and tracks the physical key state (swallowed presses included).
 // Best effort: it can only stop input that goes through normal Windows input.
+// The game-level block (ZInputAction_Digital detour, further below) is the main blocker.
 // ---------------------------------------------------------------------------
 
 std::atomic<bool> g_Block{false};
@@ -337,6 +346,20 @@ Samples PresetPulseSweep() { // 1.5 s loop, fades to silence at both ends
     return s;
 }
 
+// Case-insensitive "does p_Hay contain p_NeedleLower" (p_NeedleLower must already be lowercase). No allocations.
+bool ContainsNoCase(const char* p_Hay, const std::string& p_NeedleLower) {
+    if (p_NeedleLower.empty()) return false;
+    const size_t s_HayLen = std::strlen(p_Hay);
+    const size_t s_NeedleLen = p_NeedleLower.size();
+    if (s_NeedleLen > s_HayLen) return false;
+    for (size_t i = 0; i + s_NeedleLen <= s_HayLen; ++i) {
+        size_t j = 0;
+        while (j < s_NeedleLen && std::tolower(static_cast<unsigned char>(p_Hay[i + j])) == static_cast<unsigned char>(p_NeedleLower[j])) ++j;
+        if (j == s_NeedleLen) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -344,6 +367,9 @@ Samples PresetPulseSweep() { // 1.5 s loop, fades to silence at both ends
 // ---------------------------------------------------------------------------
 
 FocusForAll::~FocusForAll() {
+    m_InputBlock = false;
+    m_CaptureNames = false;
+
     const ZMemberDelegate<FocusForAll, void(const SGameUpdateEvent&)> s_Delegate(this, &FocusForAll::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
@@ -355,8 +381,14 @@ FocusForAll::~FocusForAll() {
     }
 }
 
+void FocusForAll::Init() {
+    // Lets us answer "not pressed" to the game when it asks about the Instinct action.
+    Hooks::ZInputAction_Digital->AddDetour(this, &FocusForAll::ZInputAction_Digital);
+}
+
 void FocusForAll::OnEngineInitialized() {
     LoadSettings();
+    RebuildPatterns(); // default patterns (LoadSoundText below may replace them)
 
     // Register the game-loop update first, so nothing below can stop the core feature from running.
     const ZMemberDelegate<FocusForAll, void(const SGameUpdateEvent&)> s_Delegate(this, &FocusForAll::OnFrameUpdate);
@@ -380,6 +412,73 @@ void FocusForAll::OnEngineInitialized() {
     } catch (...) {
         g_HookOk = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Game-level input blocking
+// ---------------------------------------------------------------------------
+
+void FocusForAll::RebuildPatterns() {
+    std::vector<std::string> s_New;
+    std::string s_Cur;
+
+    auto s_Flush = [&]() {
+        const size_t s_A = s_Cur.find_first_not_of(" \t");
+        if (s_A != std::string::npos) {
+            const size_t s_B = s_Cur.find_last_not_of(" \t");
+            std::string s_Item = s_Cur.substr(s_A, s_B - s_A + 1);
+            std::transform(s_Item.begin(), s_Item.end(), s_Item.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            s_New.push_back(std::move(s_Item));
+        }
+        s_Cur.clear();
+    };
+
+    for (const char* p = m_ActionPatterns; *p; ++p) {
+        if (*p == ',') s_Flush();
+        else s_Cur += *p;
+    }
+    s_Flush();
+
+    std::lock_guard<std::mutex> s_Lock(m_NameMutex);
+    m_Patterns = std::move(s_New);
+}
+
+bool FocusForAll::ActionMatches(const char* p_Name) {
+    std::lock_guard<std::mutex> s_Lock(m_NameMutex);
+    for (const auto& s_Pattern : m_Patterns) {
+        if (ContainsNoCase(p_Name, s_Pattern)) return true;
+    }
+    return false;
+}
+
+// The game polls this for every input action, many times per frame, possibly from several threads.
+DEFINE_PLUGIN_DETOUR(FocusForAll, bool, ZInputAction_Digital, ZInputAction* th, int32_t controllerId) {
+    const bool s_Block = m_InputBlock.load();
+    const bool s_Capture = m_CaptureNames.load();
+
+    if (!th || (!s_Block && !s_Capture)) {
+        return HookResult<bool>(HookAction::Continue());
+    }
+
+    const char* s_Name = th->m_szName;
+    if (!s_Name) {
+        return HookResult<bool>(HookAction::Continue());
+    }
+
+    if (s_Capture) {
+        std::lock_guard<std::mutex> s_Lock(m_NameMutex);
+        if (m_SeenNames.size() < 1000) {
+            m_SeenNames.insert(s_Name);
+        }
+    }
+
+    if (s_Block && ActionMatches(s_Name)) {
+        ++m_BlockedPolls;
+        return HookResult(HookAction::Return(), false);
+    }
+
+    return HookResult<bool>(HookAction::Continue());
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +551,7 @@ void FocusForAll::SaveSettings() {
     SaveSoundText();
 }
 
-// The two text values (selected file name, custom path) live in a small text file next to the DLL.
+// The text values (selected file name, custom path, Instinct action name(s)) live in a small text file next to the DLL.
 void FocusForAll::LoadSoundText() {
     std::ifstream s_File(fs::path(m_ModDir + L"FocusForAll.sound.txt"));
     std::string s_Line;
@@ -464,12 +563,19 @@ void FocusForAll::LoadSoundText() {
         while (!s_Line.empty() && (s_Line.back() == '\r' || s_Line.back() == '\n')) s_Line.pop_back();
         std::snprintf(m_CustomPath, sizeof(m_CustomPath), "%s", s_Line.c_str());
     }
+    if (std::getline(s_File, s_Line)) {
+        while (!s_Line.empty() && (s_Line.back() == '\r' || s_Line.back() == '\n')) s_Line.pop_back();
+        if (!s_Line.empty()) {
+            std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", s_Line.c_str());
+        }
+    }
+    RebuildPatterns();
 }
 
 void FocusForAll::SaveSoundText() {
     std::ofstream s_File(fs::path(m_ModDir + L"FocusForAll.sound.txt"), std::ios::trunc);
     if (s_File) {
-        s_File << m_PresetName << "\n" << m_CustomPath << "\n";
+        s_File << m_PresetName << "\n" << m_CustomPath << "\n" << m_ActionPatterns << "\n";
     }
 }
 
@@ -717,6 +823,8 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 
     // Block the key at the input level while unusable, so the game can't switch its own Instinct on either.
     g_Block = m_BlockEnabled && m_Blocked;
+    // Same at the game level: the game is told the Instinct action is not pressed.
+    m_InputBlock = (m_BlockEnabled && m_Blocked) || m_ForceBlockTest;
 
     // A key press that happened while blocked (or that we force-released) must be released before Instinct can start again.
     if (!s_KeyDown) {
@@ -750,6 +858,7 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         s_Want = false;
         if (m_BlockEnabled) {
             g_Block = true;
+            m_InputBlock = true; // game-level block takes effect immediately
             ForceReleaseInstinct();
         }
     }
@@ -901,8 +1010,17 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
     DrawHud();
     UpdateSound(m_LastHudDt, m_InPlay);
 
+    // Outside a mission the game loop doesn't run, so never leave the game-level block switched on.
+    if (!m_InPlay) {
+        m_InputBlock = false;
+    }
+
+    // Action names are only recorded while the Debug section is open (set again below if it is).
+    m_CaptureNames = false;
+
     if (!m_ShowUI) {
         m_Binding = false;
+        m_ForceBlockTest = false;
         if (m_Testing) {
             m_Testing = false;
         }
@@ -957,14 +1075,61 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
         if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
 
+        if (ImGui::InputText("Instinct action name(s)", m_ActionPatterns, sizeof(m_ActionPatterns))) {
+            RebuildPatterns();
+            s_Changed = true;
+        }
+        ImGui::TextDisabled("Comma-separated, matches part of the game's action name. Find it in Debug below.");
+
         if (ImGui::CollapsingHeader("Debug")) {
+            m_CaptureNames = true;
+
             ImGui::Text("Game updates seen: %u", m_FrameCount.load());
             ImGui::Text("Instinct key down:  Windows=%s  hook=%s", AsyncKeyDown(m_InstinctKey) ? "YES" : "no", HookKeyDown(m_InstinctKey) ? "YES" : "no");
             ImGui::Text("Hook events: keyboard=%u  mouse=%u  last key=0x%02X", g_KbEvents.load(), g_MouseEvents.load(), g_LastVk.load());
             ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
                         m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
             ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
+            ImGui::Text("Game-level block: %s   blocked polls=%u", m_InputBlock.load() ? "ON" : "off", m_BlockedPolls.load());
             ImGui::TextDisabled("Updates stay at 0 outside a mission. Hold your Instinct key in a mission and watch these.");
+
+            ImGui::Checkbox("Test: block matching actions now", &m_ForceBlockTest);
+            ImGui::TextDisabled("With this on, Instinct should stop working in game. If it doesn't, pick another action name.");
+
+            ImGui::InputText("Filter action names", m_NameFilter, sizeof(m_NameFilter));
+            if (ImGui::Button("Clear list")) {
+                std::lock_guard<std::mutex> s_Lock(m_NameMutex);
+                m_SeenNames.clear();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Click a name to use it as the Instinct action");
+
+            std::string s_Picked;
+            if (ImGui::BeginChild("SeenActions", ImVec2(0, 150), true)) {
+                std::lock_guard<std::mutex> s_Lock(m_NameMutex);
+                for (const auto& s_SeenName : m_SeenNames) {
+                    if (m_NameFilter[0] && !ContainsNoCase(s_SeenName.c_str(), [&]() {
+                            std::string s_F = m_NameFilter;
+                            std::transform(s_F.begin(), s_F.end(), s_F.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            return s_F;
+                        }())) {
+                        continue;
+                    }
+                    if (ImGui::Selectable(s_SeenName.c_str())) {
+                        s_Picked = s_SeenName;
+                    }
+                }
+            }
+            ImGui::EndChild();
+
+            if (!s_Picked.empty()) {
+                std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", s_Picked.c_str());
+                RebuildPatterns();
+                s_Changed = true;
+            }
+        } else {
+            m_ForceBlockTest = false;
         }
 
         ImGui::Separator();
