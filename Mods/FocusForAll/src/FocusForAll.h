@@ -61,6 +61,7 @@ private:
     float m_LastHudDt = 0.016f;
     std::chrono::steady_clock::time_point m_LastFrame = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point m_HudLast = std::chrono::steady_clock::now();
+    std::atomic<uint32_t> m_FrameCount{0};
     std::atomic<int64_t> m_LastUpdateTicks{0}; // last time the game loop ran (lets the HUD hide in menus)
 
     // --- Settings (persisted) ---
