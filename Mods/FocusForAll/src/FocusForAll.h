@@ -11,6 +11,7 @@
 #include "IPluginInterface.h"
 #include "Hooks.h"
 
+#include <Glacier/ZActor.h>
 #include <Glacier/ZInput.h>
 
 // Ultimate Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
@@ -51,6 +52,12 @@ private:
 
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
+
+    // Point shooting (Absolution style): hold a key to slow time, aim at enemies to tag them, release to shoot them all.
+    ZActor* FindAimedActor();
+    void TryTagTarget();
+    void FirePointShot();
+    bool DrawKeyBinder(const char* p_Id, int& p_Key, bool& p_Binding, bool& p_Armed);
 
     // Game-level input blocking: the game asks ZInputAction_Digital "is action X pressed?" for every
     // action each frame. While Instinct is unusable we answer "no" for the Instinct action(s).
@@ -93,6 +100,14 @@ private:
     uint32_t m_Rng = 0x1234567u;
     float Rand01();
 
+    // --- Point shooting state ---
+    enum PsStateId : int { PS_IDLE = 0, PS_AIMING = 1, PS_EXECUTING = 2 };
+    std::atomic<int> m_PsState{PS_IDLE};
+    std::atomic<int> m_PsTagCount{0};  // tagged targets still waiting to be shot (for the HUD pips)
+    std::vector<ZActor*> m_PsTargets;
+    bool m_PsPrevDown = false;
+    float m_PsShotTimer = 0.0f;
+
     // --- Game-level input block state ---
     std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
     std::atomic<bool> m_CaptureNames{false};   // detour records action names (Debug section open)
@@ -113,6 +128,14 @@ private:
     float m_RechargeSeconds = 30.0f; // real seconds from empty to full
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
+
+    bool m_PsEnabled = true;         // point shooting on/off
+    int m_PsKey = 0x05;              // VK_XBUTTON1 (mouse 4): hold to point shoot
+    float m_PsScale = 0.20f;         // time scale while point shooting
+    float m_PsTagCost = 0.10f;       // meter used up per tagged target (0..1)
+    int m_PsMaxTags = 6;             // most targets that can be tagged at once
+    float m_PsShotDelay = 0.15f;     // real seconds between the shots
+    float m_PsDrainMul = 0.5f;       // meter drain while aiming, compared to normal Instinct
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
@@ -150,6 +173,8 @@ private:
     bool m_ShowUI = false;
     bool m_Binding = false;
     bool m_BindArmed = false;
+    bool m_BindingPs = false;
+    bool m_BindArmedPs = false;
 };
 
 DECLARE_ZHM_PLUGIN(FocusForAll)
