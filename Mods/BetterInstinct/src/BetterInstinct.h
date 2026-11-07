@@ -58,17 +58,6 @@ private:
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
 
-    // --- Point shooting (Absolution / Dead Eye style) ---
-    // Hold the PS key: time nearly stops, aim at enemies and tag them (click or hover). Release: Agent 47 snaps from
-    // target to target and every tagged enemy is shot, with muzzle flash, kill confirmation and sound.
-    void UpdatePointShooting(float p_Dt, bool p_GameFocused);
-    void ResetPointShooting();
-    void DrawPsOverlay();
-    bool DrawKeyBinder(const char* p_Id, int& p_Key, bool& p_Binding, bool& p_Armed);
-    bool PsAimPoint(const TEntityRef<ZActor>& p_Actor, SVector3& p_Out);
-    bool PsLineOfSight(const float* p_Cam, const SVector3& p_To, ZActor* p_Actor);
-    void PsPlaySound(const wchar_t* p_File);
-
     // Game-level input blocking: the game asks ZInputAction_Digital "is action X pressed?" for every
     // action each frame. While Instinct is unusable we answer "no" for the Instinct action(s).
     void RebuildPatterns();
@@ -110,43 +99,6 @@ private:
     uint32_t m_Rng = 0x1234567u;
     float Rand01();
 
-    // --- Point shooting state ---
-    enum PsStateId : int { PS_IDLE = 0, PS_AIMING = 1, PS_EXECUTING = 2 };
-    struct PsTarget {
-        TEntityRef<ZActor> m_Ref;
-        SVector3 m_Aim;          // world position of the aim point (head / torso), refreshed every game update
-        float m_Dist = 0.0f;     // distance to the camera when tagged
-        float m_Age = 0.0f;      // real seconds since tagged (marker pop-in)
-    };
-    struct PsFlash {
-        SVector3 m_Pos;
-        float m_Age = 0.0f;
-        bool m_Kill = false;     // true = shot/kill confirmation, false = tag ping
-    };
-    std::atomic<int> m_PsState{PS_IDLE};
-    std::atomic<int> m_PsTagCount{0};          // tagged targets still waiting to be shot (HUD pips)
-    std::atomic<float> m_PsPunch{0.0f};        // screen flash when a shot goes off
-    std::atomic<float> m_ScreenW{1920.0f};     // cached by the UI thread, used by the game thread for targeting
-    std::atomic<float> m_ScreenH{1080.0f};
-    std::mutex m_PsMutex;                      // guards everything below up to m_PsPrevDown
-    std::vector<PsTarget> m_PsTargets;
-    std::vector<PsFlash> m_PsFlashes;
-    ZActor* m_PsHoverActor = nullptr;
-    bool m_PsHoverValid = false;
-    bool m_PsHoverCan = false;
-    SVector3 m_PsHoverAim;
-    float m_PsHoverFrac = 0.0f;                // hover dwell progress 0..1
-    SVector3 m_PsLastAim;
-    bool m_PsLastAimValid = false;
-    int m_PsExecPhase = 0;                     // 0 = snapping to the next target, 1 = pause after a shot
-    float m_PsExecTimer = 0.0f;
-    bool m_PsPrevDown = false;
-    uint32_t m_PsLastClicks = 0;
-    float m_PsFade = 0.0f;                     // UI thread only
-    float m_PsReticleX = 0.0f;
-    float m_PsReticleY = 0.0f;
-    bool m_PsReticleSet = false;
-
     // --- Game-level input block state ---
     std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
     std::atomic<bool> m_CaptureNames{false};   // detour records action names (Debug section open)
@@ -167,30 +119,6 @@ private:
     float m_RechargeSeconds = 30.0f; // real seconds from empty to full
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
-
-    bool m_HipAssist = true;         // during Instinct, hold left clicks until they lasted long enough in game time (hip fire)
-    int m_HipGameMs = 200;           // minimum click length in GAME milliseconds (real time = this / time scale)
-
-    bool m_PsEnabled = true;         // point shooting on/off
-    int m_PsKey = 0x05;              // VK_XBUTTON1 (mouse 4): hold to point shoot
-    int m_PsTagMode = 0;             // 0 = click to tag, 1 = hover to tag
-    float m_PsHoverDwell = 0.35f;    // real seconds the crosshair has to rest on an enemy (hover mode)
-    float m_PsScale = 0.12f;         // time scale while aiming
-    float m_PsExecScale = 0.30f;     // time scale while the shots play out
-    float m_PsTagCost = 0.10f;       // meter used up per tagged target (0..1)
-    int m_PsMaxTags = 6;             // most targets that can be tagged at once
-    float m_PsDrainMul = 0.5f;       // meter drain while aiming, compared to normal Instinct
-    float m_PsSnapRadius = 0.09f;    // how close to the crosshair an enemy has to be, as a fraction of screen height
-    float m_PsMaxDist = 70.0f;       // farthest taggable enemy (meters)
-    int m_PsAimPart = 0;             // 0 = head, 1 = torso
-    float m_PsSnapTime = 0.12f;      // real seconds the aim takes to snap to the next target
-    float m_PsShotDelay = 0.15f;     // real seconds between a shot and the next snap
-    int m_PsOrder = 0;               // 0 = order of tagging, 1 = nearest first
-    bool m_PsBlockFire = true;       // hover mode: also swallow left click while point shooting (click mode always does)
-    bool m_PsSoundOn = true;         // play PointTag.wav / PointShot.wav from the InstinctSounds folder if present
-    float m_PsHeadHeight = 1.62f;    // aim point height above the actor origin (meters)
-    float m_PsTorsoHeight = 1.25f;
-    bool m_PsYUp = false;            // debug: world up axis is Y instead of Z
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
@@ -228,8 +156,6 @@ private:
     bool m_ShowUI = false;
     bool m_Binding = false;
     bool m_BindArmed = false;
-    bool m_BindingPs = false;
-    bool m_BindArmedPs = false;
 };
 
 DECLARE_ZHM_PLUGIN(BetterInstinct)
