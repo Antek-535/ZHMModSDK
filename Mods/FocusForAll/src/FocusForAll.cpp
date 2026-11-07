@@ -73,6 +73,10 @@ std::atomic<bool> g_HookOk{false};
 std::atomic<bool> g_HookReady{false};
 std::atomic<DWORD> g_HookThreadId{0};
 DWORD g_Pid = 0;
+std::atomic<uint32_t> g_KbEvents{0};
+std::atomic<uint32_t> g_MouseEvents{0};
+std::atomic<int> g_LastVk{0};
+constexpr ULONG_PTR kOurMarker = 0x464F4341; // tags the key events we inject ourselves, so the hook can ignore them
 
 bool MatchesKey(int p_Configured, int p_Vk) {
     if (p_Configured == p_Vk) return true;
@@ -102,10 +106,12 @@ bool GameIsForeground() {
 LRESULT CALLBACK KeyboardProc(int p_Code, WPARAM p_W, LPARAM p_L) {
     if (p_Code == HC_ACTION) {
         const auto* s_Kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(p_L);
-        if (!(s_Kb->flags & LLKHF_INJECTED)) {
+        if (s_Kb->dwExtraInfo != kOurMarker) { // everything except what we injected ourselves (remapper/driver keys count)
             const bool s_Down = p_W == WM_KEYDOWN || p_W == WM_SYSKEYDOWN;
             const bool s_Up = p_W == WM_KEYUP || p_W == WM_SYSKEYUP;
             if (s_Down || s_Up) {
+                ++g_KbEvents;
+                g_LastVk = static_cast<int>(s_Kb->vkCode);
                 g_Phys[s_Kb->vkCode & 0xFF] = s_Down;
                 if (s_Down && g_Block.load() && MatchesKey(g_Key.load(), static_cast<int>(s_Kb->vkCode)) && GameIsForeground()) {
                     return 1; // swallow the press: the game never sees it
@@ -119,7 +125,7 @@ LRESULT CALLBACK KeyboardProc(int p_Code, WPARAM p_W, LPARAM p_L) {
 LRESULT CALLBACK MouseProc(int p_Code, WPARAM p_W, LPARAM p_L) {
     if (p_Code == HC_ACTION && p_W != WM_MOUSEMOVE) {
         const auto* s_Ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(p_L);
-        if (!(s_Ms->flags & LLMHF_INJECTED)) {
+        if (s_Ms->dwExtraInfo != kOurMarker) {
             int s_Vk = 0;
             bool s_Down = false;
             switch (p_W) {
@@ -138,6 +144,7 @@ LRESULT CALLBACK MouseProc(int p_Code, WPARAM p_W, LPARAM p_L) {
             }
 
             if (s_Vk != 0) {
+                ++g_MouseEvents;
                 g_Phys[s_Vk] = s_Down;
                 if (s_Down && g_Block.load() && g_Key.load() == s_Vk && GameIsForeground()) {
                     return 1;
@@ -196,12 +203,24 @@ private:
 
 std::unique_ptr<InputGuard> g_Guard;
 
-bool PhysKeyDown(int p_Key) {
+bool AsyncKeyDown(int p_Key) {
     for (int s_Vk : KeyVariants(p_Key)) {
-        const bool s_Down = g_HookOk.load() ? g_Phys[s_Vk & 0xFF].load() : ((GetAsyncKeyState(s_Vk) & 0x8000) != 0);
-        if (s_Down) return true;
+        if ((GetAsyncKeyState(s_Vk) & 0x8000) != 0) return true;
     }
     return false;
+}
+
+bool HookKeyDown(int p_Key) {
+    if (!g_HookOk.load()) return false;
+    for (int s_Vk : KeyVariants(p_Key)) {
+        if (g_Phys[s_Vk & 0xFF].load()) return true;
+    }
+    return false;
+}
+
+// Down if either Windows' own key state or the hook says so (the hook also sees keys we swallowed).
+bool PhysKeyDown(int p_Key) {
+    return AsyncKeyDown(p_Key) || HookKeyDown(p_Key);
 }
 
 void SendKey(int p_Vk, bool p_Up) {
@@ -233,6 +252,8 @@ void SendKey(int p_Vk, bool p_Up) {
             break;
         }
     }
+    if (s_In.type == INPUT_MOUSE) s_In.mi.dwExtraInfo = kOurMarker;
+    else s_In.ki.dwExtraInfo = kOurMarker;
     SendInput(1, &s_In, sizeof(INPUT));
 }
 
@@ -337,19 +358,28 @@ FocusForAll::~FocusForAll() {
 void FocusForAll::OnEngineInitialized() {
     LoadSettings();
 
-    m_ModDir = FindModuleDir();
-    m_SoundDir = m_ModDir + L"InstinctSounds\\";
-    std::error_code s_Ec;
-    fs::create_directories(m_SoundDir, s_Ec);
-    EnsurePresets();
-    LoadSoundText();
-    ScanSounds();
-
-    g_Key = m_InstinctKey;
-    g_Guard = std::make_unique<InputGuard>();
-
+    // Register the game-loop update first, so nothing below can stop the core feature from running.
     const ZMemberDelegate<FocusForAll, void(const SGameUpdateEvent&)> s_Delegate(this, &FocusForAll::OnFrameUpdate);
     Globals::GameLoopManager->RegisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+
+    try {
+        m_ModDir = FindModuleDir();
+        m_SoundDir = m_ModDir + L"InstinctSounds\\";
+        std::error_code s_Ec;
+        fs::create_directories(fs::path(m_SoundDir), s_Ec);
+        EnsurePresets();
+        LoadSoundText();
+        ScanSounds();
+    } catch (...) {
+        m_SoundStatus = "Couldn't prepare the sound folder.";
+    }
+
+    try {
+        g_Key = m_InstinctKey;
+        g_Guard = std::make_unique<InputGuard>();
+    } catch (...) {
+        g_HookOk = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +646,7 @@ void FocusForAll::ForceReleaseInstinct() {
     }
 
     for (int s_Vk : s_Variants) {
-        const bool s_Down = g_HookOk.load() ? g_Phys[s_Vk & 0xFF].load() : ((GetAsyncKeyState(s_Vk) & 0x8000) != 0);
-        if (s_Down) SendKey(s_Vk, true);
+        if (PhysKeyDown(s_Vk)) SendKey(s_Vk, true);
     }
 }
 
@@ -672,6 +701,7 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     const float s_Dt = std::min(std::chrono::duration<float>(s_Now - m_LastFrame).count(), 0.1f);
     m_LastFrame = s_Now;
     m_LastUpdateTicks.store(s_Now.time_since_epoch().count());
+    ++m_FrameCount;
 
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
@@ -926,6 +956,16 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
 
         if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
+
+        if (ImGui::CollapsingHeader("Debug")) {
+            ImGui::Text("Game updates seen: %u", m_FrameCount.load());
+            ImGui::Text("Instinct key down:  Windows=%s  hook=%s", AsyncKeyDown(m_InstinctKey) ? "YES" : "no", HookKeyDown(m_InstinctKey) ? "YES" : "no");
+            ImGui::Text("Hook events: keyboard=%u  mouse=%u  last key=0x%02X", g_KbEvents.load(), g_MouseEvents.load(), g_LastVk.load());
+            ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
+                        m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
+            ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
+            ImGui::TextDisabled("Updates stay at 0 outside a mission. Hold your Instinct key in a mission and watch these.");
+        }
 
         ImGui::Separator();
 
