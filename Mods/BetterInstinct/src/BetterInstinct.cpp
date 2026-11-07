@@ -89,7 +89,7 @@ std::wstring FindModuleDir() {
 // ---------------------------------------------------------------------------
 
 std::atomic<bool> g_Block{false};
-std::atomic<int> g_Key{0x10};
+std::atomic<int> g_Key{0x11};
 std::atomic<bool> g_Phys[256];
 std::atomic<bool> g_HookOk{false};
 std::atomic<bool> g_HookReady{false};
