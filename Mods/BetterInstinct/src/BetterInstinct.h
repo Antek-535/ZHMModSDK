@@ -111,9 +111,9 @@ private:
     std::set<std::string> m_SeenNames;         // every action name the game has polled (debug)
 
     // --- Settings (persisted) ---
-    int m_InstinctKey = 0x10;        // VK_SHIFT: set this to your in-game Instinct key
+    int m_InstinctKey = 0x11;        // VK_CONTROL (either Ctrl): set this to your in-game Instinct key
     bool m_ToggleMode = false;       // false = hold, true = press to toggle
-    float m_FocusScale = 0.25f;      // time scale while Instinct is active
+    float m_FocusScale = 0.50f;      // time scale while Instinct is active
     float m_BlendSpeed = 6.0f;       // higher = snappier transition
     float m_DrainSeconds = 15.0f;    // real seconds from full to empty
     float m_RechargeSeconds = 30.0f; // real seconds from empty to full
