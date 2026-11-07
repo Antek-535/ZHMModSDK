@@ -29,6 +29,11 @@ private:
 
     void LoadSettings();
     void SaveSettings();
+
+    // Own settings file (%APPDATA%\FocusForAll\FocusForAll.cfg): written on every change, so options never get lost.
+    bool SaveConfigFile();
+    bool LoadConfigFile();
+    bool m_ConfigReady = false;
     void DrawHud();
 
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
@@ -76,6 +81,17 @@ private:
     std::chrono::steady_clock::time_point m_HudLast = std::chrono::steady_clock::now();
     std::atomic<uint32_t> m_FrameCount{0};
     std::atomic<int64_t> m_LastUpdateTicks{0}; // last time the game loop ran (lets the HUD hide in menus)
+    std::atomic<bool> m_HasPlayer{false};      // Agent 47 exists (false in the main menu / hub screens)
+    float m_NoPlayerTime = 0.0f;               // how long there has been no player (resets the meter after a moment)
+
+    // Sparkle particles shown at the tip of the meter while Instinct is in use.
+    struct Particle {
+        float x, y, vx, vy, life, maxLife, size;
+    };
+    std::vector<Particle> m_Particles;
+    float m_EmitAcc = 0.0f;
+    uint32_t m_Rng = 0x1234567u;
+    float Rand01();
 
     // --- Game-level input block state ---
     std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
@@ -104,7 +120,7 @@ private:
     float m_HudYOffset = 64.0f;      // pixels from the bottom (at 1080p)
     float m_HudScale = 1.0f;
     float m_HudOpacity = 0.95f;
-    float m_FillColor[3] = {0.93f, 0.93f, 0.90f};
+    float m_FillColor[3] = {1.00f, 0.78f, 0.28f}; // gold
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
 
     bool m_SoundEnabled = true;
