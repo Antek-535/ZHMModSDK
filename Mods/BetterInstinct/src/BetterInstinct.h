@@ -19,7 +19,7 @@
 #include <Glacier/ZInput.h>
 #include <Glacier/ZObject.h>
 
-// Ultimate Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
+// Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
 class BetterInstinct : public IPluginInterface {
 public:
@@ -57,30 +57,6 @@ private:
 
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
-
-    // Point shooting (Absolution style): hold a key to slow time, aim at enemies to tag them, release to shoot them all.
-    struct AimHit {                    // what the crosshair is pointing at
-        ZActor* actor = nullptr;
-        ZSpatialEntity* anchor = nullptr; // the body part that was hit (moves with the actor)
-        float x = 0.0f, y = 0.0f, z = 0.0f;
-    };
-    struct PsTarget {                  // a tagged enemy
-        ZActor* actor;
-        ZSpatialEntity* anchor;
-        float x, y, z;                 // last known world position (for the on-screen marker)
-    };
-    struct PsKill {                    // a "shot landed" marker that fades out
-        float x, y, z, age;
-    };
-
-    bool FindAimedActor(AimHit& p_Hit);
-    void TryTagTarget(bool p_Click, float p_Dt);
-    void FirePointShot();
-    void RefreshTargetPositions();
-    size_t PsTargetCount();
-    void PlayShotSound();
-    void DrawPsOverlay(float p_Dt);
-    bool DrawKeyBinder(const char* p_Id, int& p_Key, bool& p_Binding, bool& p_Armed);
 
     // Game-level input blocking: the game asks ZInputAction_Digital "is action X pressed?" for every
     // action each frame. While Instinct is unusable we answer "no" for the Instinct action(s).
@@ -123,21 +99,6 @@ private:
     uint32_t m_Rng = 0x1234567u;
     float Rand01();
 
-    // --- Point shooting state ---
-    enum PsStateId : int { PS_IDLE = 0, PS_AIMING = 1, PS_EXECUTING = 2 };
-    std::atomic<int> m_PsState{PS_IDLE};
-    std::atomic<int> m_PsTagCount{0};  // tagged targets still waiting to be shot (for the HUD pips)
-    std::mutex m_PsMutex;              // guards m_PsTargets and m_PsKills (game thread writes, UI thread draws)
-    std::vector<PsTarget> m_PsTargets;
-    std::vector<PsKill> m_PsKills;
-    bool m_PsPrevDown = false;
-    bool m_PsPrevClick = false;
-    float m_PsShotTimer = 0.0f;
-    ZActor* m_PsHoverActor = nullptr;  // actor currently under the crosshair
-    float m_PsHoverTime = 0.0f;        // how long it has been there (seconds)
-    std::atomic<float> m_PsHoverProgress{0.0f}; // 0..1, fills while hovering to tag
-    std::atomic<float> m_PsFlash{0.0f};         // muzzle flash, fades out
-
     // --- Game-level input block state ---
     std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
     std::atomic<bool> m_CaptureNames{false};   // detour records action names (Debug section open)
@@ -159,20 +120,8 @@ private:
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
 
-    bool m_PsEnabled = true;         // point shooting on/off
-    int m_PsKey = 0x05;              // VK_XBUTTON1 (mouse 4): hold to point shoot
-    float m_PsScale = 0.20f;         // time scale while point shooting
-    float m_PsTagCost = 0.10f;       // meter used up per tagged target (0..1)
-    int m_PsMaxTags = 6;             // most targets that can be tagged at once
-    float m_PsShotDelay = 0.15f;     // real seconds between the shots
-    float m_PsDrainMul = 0.5f;       // meter drain while aiming, compared to normal Instinct
-    bool m_PsClickTag = true;        // left click tags the target under the crosshair
-    float m_PsDwell = 0.35f;         // hover this long (seconds) to tag automatically; 0 = off
-    bool m_PsShotSound = true;       // play a shot sound for every point shot
-    float m_PsShotVolume = 0.7f;
-
-    bool m_HipAssist = true;         // during Instinct, hold short left clicks a bit longer so hip fire registers
-    int m_HipMinMs = 120;            // minimum click length (real milliseconds)
+    bool m_HipAssist = true;         // during Instinct, hold left clicks until they lasted long enough in game time (hip fire)
+    int m_HipGameMs = 200;           // minimum click length in GAME milliseconds (real time = this / time scale)
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
@@ -210,8 +159,6 @@ private:
     bool m_ShowUI = false;
     bool m_Binding = false;
     bool m_BindArmed = false;
-    bool m_BindingPs = false;
-    bool m_BindArmedPs = false;
 };
 
 DECLARE_ZHM_PLUGIN(BetterInstinct)
