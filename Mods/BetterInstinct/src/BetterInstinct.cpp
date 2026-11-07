@@ -95,6 +95,32 @@ std::atomic<uint32_t> g_MouseEvents{0};
 std::atomic<int> g_LastVk{0};
 constexpr ULONG_PTR kOurMarker = 0x464F4341; // tags the key events we inject ourselves, so the hook can ignore them
 
+std::atomic<bool> g_PsSwallowLmb{false};  // point shooting: left clicks are used for tagging, the game must not see them
+std::atomic<bool> g_LSwallowed{false};    // the current left-button press was swallowed (so its release is swallowed too)
+std::atomic<bool> g_HipAssist{false};     // Instinct is active: short left clicks get held a little longer
+std::atomic<int> g_HipMinMs{120};
+std::atomic<ULONGLONG> g_LDownTick{0};
+std::atomic<UINT_PTR> g_HipTimer{0};      // pending "left button release" timer (0 = none)
+
+void SendKey(int p_Vk, bool p_Up);
+
+// Ends a held-over left click: stops the timer and (optionally) sends the release the game is still waiting for.
+void CancelHipTimer(bool p_SendUp) {
+    const UINT_PTR s_Id = g_HipTimer.exchange(0);
+    if (s_Id != 0) {
+        KillTimer(nullptr, s_Id);
+        if (p_SendUp) SendKey(VK_LBUTTON, true);
+    }
+}
+
+VOID CALLBACK HipTimerProc(HWND, UINT, UINT_PTR p_Id, DWORD) {
+    if (g_HipTimer.load() == p_Id) {
+        CancelHipTimer(true);
+    } else {
+        KillTimer(nullptr, p_Id);
+    }
+}
+
 bool MatchesKey(int p_Configured, int p_Vk) {
     if (p_Configured == p_Vk) return true;
     switch (p_Configured) {
@@ -163,6 +189,35 @@ LRESULT CALLBACK MouseProc(int p_Code, WPARAM p_W, LPARAM p_L) {
             if (s_Vk != 0) {
                 ++g_MouseEvents;
                 g_Phys[s_Vk] = s_Down;
+
+                if (s_Vk == VK_LBUTTON) {
+                    if (s_Down) {
+                        CancelHipTimer(true); // new click while a held-over release is pending: finish the old one first
+                        g_LDownTick = GetTickCount64();
+                        if (g_PsSwallowLmb.load() && GameIsForeground()) {
+                            g_LSwallowed = true; // point shooting uses the click for tagging; the game never sees it
+                            return 1;
+                        }
+                        g_LSwallowed = false;
+                    } else {
+                        if (g_LSwallowed.exchange(false)) {
+                            return 1;
+                        }
+                        // Hip fire during Instinct: a short click can be missed in slowed time, so hold it a bit longer.
+                        if (g_HipAssist.load() && GameIsForeground() && !g_Phys[VK_RBUTTON].load()) {
+                            const ULONGLONG s_Held = GetTickCount64() - g_LDownTick.load();
+                            const ULONGLONG s_Min = static_cast<ULONGLONG>(std::max(0, g_HipMinMs.load()));
+                            if (s_Held < s_Min) {
+                                const UINT_PTR s_Id = SetTimer(nullptr, 0, static_cast<UINT>(s_Min - s_Held), HipTimerProc);
+                                if (s_Id != 0) {
+                                    g_HipTimer = s_Id;
+                                    return 1; // swallow the release; the timer sends it later
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (s_Down && g_Block.load() && g_Key.load() == s_Vk && GameIsForeground()) {
                     return 1;
                 }
@@ -193,6 +248,7 @@ DWORD WINAPI HookThreadProc(LPVOID p_Param) {
         DispatchMessageW(&s_Msg);
     }
 
+    CancelHipTimer(true); // never leave the left button stuck down
     if (s_Kb) UnhookWindowsHookEx(s_Kb);
     if (s_Ms) UnhookWindowsHookEx(s_Ms);
 
@@ -407,6 +463,21 @@ std::string OneLine(std::string p_Str) { // values are stored one per line
     return p_Str;
 }
 
+Samples PresetGunshot() { // 0.4 s: noise crack + low thump (used by point shooting)
+    const uint32_t n = static_cast<uint32_t>(kRate * 0.4f);
+    Samples s(n);
+    uint32_t s_Seed = 12345u;
+    for (uint32_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kRate;
+        s_Seed = s_Seed * 1664525u + 1013904223u;
+        const float s_Noise = (static_cast<float>(s_Seed >> 8) / 16777216.0f) * 2.0f - 1.0f;
+        const float s_Crack = s_Noise * std::exp(-t * 38.0f);
+        const float s_Thump = std::sin(2 * kPi * (95.0f - 55.0f * std::min(t / 0.25f, 1.0f)) * t) * std::exp(-t * 14.0f);
+        s[i] = std::clamp(0.8f * s_Crack + 0.7f * s_Thump, -1.0f, 1.0f);
+    }
+    return s;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -420,6 +491,9 @@ BetterInstinct::~BetterInstinct() {
 
     m_InputBlock = false;
     m_CaptureNames = false;
+    g_PsSwallowLmb = false;
+    g_HipAssist = false;
+    mciSendStringW(L"close pointshot", nullptr, 0, nullptr);
 
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
@@ -685,6 +759,12 @@ bool BetterInstinct::SaveConfigFile() {
         s_Int("ps_max_tags", m_PsMaxTags);
         s_Flt("ps_shot_delay", m_PsShotDelay);
         s_Flt("ps_drain_mul", m_PsDrainMul);
+        s_Bool("ps_click_tag", m_PsClickTag);
+        s_Flt("ps_dwell", m_PsDwell);
+        s_Bool("ps_shot_sound", m_PsShotSound);
+        s_Flt("ps_shot_volume", m_PsShotVolume);
+        s_Bool("hip_assist", m_HipAssist);
+        s_Int("hip_min_ms", m_HipMinMs);
 
         s_Bool("hud_enabled", m_HudEnabled);
         s_Bool("hud_always", m_HudAlways);
@@ -784,6 +864,12 @@ bool BetterInstinct::LoadConfigFile() {
     s_Int("ps_max_tags", m_PsMaxTags, 1, 12);
     s_Flt("ps_shot_delay", m_PsShotDelay, 0.05f, 1.0f);
     s_Flt("ps_drain_mul", m_PsDrainMul, 0.0f, 2.0f);
+    s_Bool("ps_click_tag", m_PsClickTag);
+    s_Flt("ps_dwell", m_PsDwell, 0.0f, 1.5f);
+    s_Bool("ps_shot_sound", m_PsShotSound);
+    s_Flt("ps_shot_volume", m_PsShotVolume, 0.0f, 1.0f);
+    s_Bool("hip_assist", m_HipAssist);
+    s_Int("hip_min_ms", m_HipMinMs, 0, 400);
 
     s_Bool("hud_enabled", m_HudEnabled);
     s_Bool("hud_always", m_HudAlways);
@@ -835,6 +921,18 @@ void BetterInstinct::EnsurePresets() {
         std::error_code s_Ec;
         if (!fs::exists(s_Path, s_Ec)) {
             WriteWav(s_Path, s_Preset.Make(), 0.6f);
+        }
+    }
+
+    // Point shooting shot sound: kept in its own subfolder so it isn't listed as an Instinct sound.
+    // Replace "Point Shot.wav" with your own sound if you like.
+    {
+        std::error_code s_Ec;
+        const fs::path s_Dir = fs::path(m_SoundDir) / L"Effects";
+        fs::create_directories(s_Dir, s_Ec);
+        const fs::path s_Path = s_Dir / L"Point Shot.wav";
+        if (!fs::exists(s_Path, s_Ec)) {
+            WriteWav(s_Path, PresetGunshot(), 0.8f);
         }
     }
 }
@@ -1035,15 +1133,17 @@ std::string BetterInstinct::KeyName(int p_Vk) {
 // Point shooting
 // ---------------------------------------------------------------------------
 
-// Raycasts from the middle of the screen (the game camera) and returns the actor that is being aimed at, if any.
-ZActor* BetterInstinct::FindAimedActor() {
+// Raycasts from the middle of the screen (the game camera) and finds the actor that is being aimed at, if any.
+bool BetterInstinct::FindAimedActor(AimHit& p_Hit) {
+    p_Hit = AimHit();
+
     if (!Globals::CollisionManager || !*Globals::CollisionManager) {
-        return nullptr;
+        return false;
     }
 
     const auto s_Camera = Functions::GetCurrentCamera->Call();
     if (!s_Camera) {
-        return nullptr;
+        return false;
     }
 
     const SMatrix s_CamMatrix = s_Camera->GetObjectToWorldMatrix();
@@ -1072,64 +1172,144 @@ ZActor* BetterInstinct::FindAimedActor() {
         ZRayQueryOutput s_Output {};
 
         if (!(*Globals::CollisionManager)->RayCastClosestHit(s_Input, &s_Output)) {
-            return nullptr;
+            return false;
         }
         if (!s_Output.m_pBlockingSpatialEntity.m_pInterfaceRef) {
-            return nullptr;
+            return false;
         }
 
         ZEntityRef s_Parent = s_Output.m_pBlockingSpatialEntity.m_entityRef.GetLogicalParent();
         if (ZActor* s_Actor = s_Parent.QueryInterface<ZActor>()) {
-            return s_Actor;
+            p_Hit.actor = s_Actor;
+            p_Hit.anchor = s_Output.m_pBlockingSpatialEntity.m_pInterfaceRef;
+            p_Hit.x = s_Output.m_vPosition.x;
+            p_Hit.y = s_Output.m_vPosition.y;
+            p_Hit.z = s_Output.m_vPosition.z;
+            return true;
         }
 
         // Something that isn't an actor was hit. Only look through it when it's right next to Agent 47 (his own body).
         if (!s_HavePlayer) {
-            return nullptr;
+            return false;
         }
         const float s_Dx = s_Output.m_vPosition.x - s_PlayerX;
         const float s_Dy = s_Output.m_vPosition.y - s_PlayerY;
         const float s_Dz = s_Output.m_vPosition.z - s_PlayerZ;
         if (s_Dx * s_Dx + s_Dy * s_Dy + s_Dz * s_Dz > 4.0f) {
-            return nullptr;
+            return false;
         }
         s_From = s_Output.m_vPosition + s_Dir * 0.3f;
     }
 
-    return nullptr;
+    return false;
 }
 
-void BetterInstinct::TryTagTarget() {
+size_t BetterInstinct::PsTargetCount() {
+    std::lock_guard<std::mutex> s_Lock(m_PsMutex);
+    return m_PsTargets.size();
+}
+
+// Keeps the on-screen markers glued to the tagged enemies.
+void BetterInstinct::RefreshTargetPositions() {
+    std::lock_guard<std::mutex> s_Lock(m_PsMutex);
+    for (PsTarget& s_Target : m_PsTargets) {
+        if (!s_Target.anchor) continue;
+        const SMatrix s_Matrix = s_Target.anchor->GetObjectToWorldMatrix();
+        s_Target.x = s_Matrix.Trans.x;
+        s_Target.y = s_Matrix.Trans.y;
+        s_Target.z = s_Matrix.Trans.z;
+    }
+}
+
+// Called every frame while aiming. Tags the enemy under the crosshair when you click, or after hovering over it for a moment.
+void BetterInstinct::TryTagTarget(bool p_Click, float p_Dt) {
+    AimHit s_Hit;
+    const bool s_HasHit = FindAimedActor(s_Hit);
+
+    // Track how long the same enemy has been under the crosshair.
+    if (!s_HasHit || s_Hit.actor != m_PsHoverActor) {
+        m_PsHoverActor = s_HasHit ? s_Hit.actor : nullptr;
+        m_PsHoverTime = 0.0f;
+    } else {
+        m_PsHoverTime += p_Dt;
+    }
+
+    m_PsHoverProgress = 0.0f;
+    if (!s_HasHit) return;
+
+    std::lock_guard<std::mutex> s_Lock(m_PsMutex);
+
+    for (const PsTarget& s_Tagged : m_PsTargets) {
+        if (s_Tagged.actor == s_Hit.actor) return; // already tagged
+    }
+
+    const bool s_UseDwell = m_PsDwell > 0.0f;
+    if (s_UseDwell) {
+        m_PsHoverProgress = std::clamp(m_PsHoverTime / m_PsDwell, 0.0f, 1.0f);
+    }
+
+    const bool s_Tag = (p_Click && m_PsClickTag) || (s_UseDwell && m_PsHoverTime >= m_PsDwell);
+    if (!s_Tag) return;
     if (static_cast<int>(m_PsTargets.size()) >= m_PsMaxTags) return;
     if (m_Meter < m_PsTagCost) return;
 
-    ZActor* s_Actor = FindAimedActor();
-    if (!s_Actor) return;
+    PsTarget s_New {};
+    s_New.actor = s_Hit.actor;
+    s_New.anchor = s_Hit.anchor;
+    s_New.x = s_Hit.x;
+    s_New.y = s_Hit.y;
+    s_New.z = s_Hit.z;
+    m_PsTargets.push_back(s_New);
 
-    for (const ZActor* s_Tagged : m_PsTargets) {
-        if (s_Tagged == s_Actor) return; // already tagged
-    }
-
-    m_PsTargets.push_back(s_Actor);
     m_PsTagCount = static_cast<int>(m_PsTargets.size());
     m_Meter = std::max(0.0f, m_Meter - m_PsTagCost);
+    m_PsHoverTime = 0.0f;
+    m_PsHoverProgress = 0.0f;
 }
 
-// Shoots the next tagged target.
+// Shoots the next tagged target (in the order they were tagged).
 void BetterInstinct::FirePointShot() {
-    if (m_PsTargets.empty()) return;
+    PsTarget s_Target {};
 
-    ZActor* s_Actor = m_PsTargets.front();
-    m_PsTargets.erase(m_PsTargets.begin());
-    m_PsTagCount = static_cast<int>(m_PsTargets.size());
-    if (!s_Actor) return;
+    {
+        std::lock_guard<std::mutex> s_Lock(m_PsMutex);
+        if (m_PsTargets.empty()) return;
+
+        s_Target = m_PsTargets.front();
+        m_PsTargets.erase(m_PsTargets.begin());
+        m_PsTagCount = static_cast<int>(m_PsTargets.size());
+
+        m_PsKills.push_back(PsKill {s_Target.x, s_Target.y, s_Target.z, 0.0f}); // "hit" marker where it stood
+    }
+
+    m_PsFlash = 1.0f;
+    PlayShotSound();
+
+    if (!s_Target.actor) return;
 
     TEntityRef<IItem> s_Item;
     TEntityRef<ZSetpieceEntity> s_SetPieceEntity;
 
     Functions::ZActor_KillActor->Call(
-        s_Actor, s_Item, s_SetPieceEntity, EDamageEvent::eDE_UNDEFINED, EDeathBehavior::eDB_IMPACT_ANIM
+        s_Target.actor, s_Item, s_SetPieceEntity, EDamageEvent::eDE_UNDEFINED, EDeathBehavior::eDB_IMPACT_ANIM
     );
+}
+
+void BetterInstinct::PlayShotSound() {
+    if (!m_PsShotSound) return;
+
+    const fs::path s_Path = fs::path(m_SoundDir) / L"Effects" / L"Point Shot.wav";
+    std::error_code s_Ec;
+    if (!fs::exists(s_Path, s_Ec)) return;
+
+    mciSendStringW(L"close pointshot", nullptr, 0, nullptr);
+    const std::wstring s_Open = L"open \"" + s_Path.wstring() + L"\" type mpegvideo alias pointshot";
+    if (mciSendStringW(s_Open.c_str(), nullptr, 0, nullptr) != 0) return;
+
+    const int s_Vol = std::clamp(static_cast<int>(m_PsShotVolume * 1000.0f), 0, 1000);
+    const std::wstring s_VolCmd = L"setaudio pointshot volume to " + std::to_wstring(s_Vol);
+    mciSendStringW(s_VolCmd.c_str(), nullptr, 0, nullptr);
+    mciSendStringW(L"play pointshot from 0", nullptr, 0, nullptr);
 }
 
 // A "click to change" key button (same behaviour as the Instinct key button). Returns true when the key changed.
@@ -1204,9 +1384,15 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         g_Block = false;
         m_PrevDown = false;
         m_PsState = PS_IDLE;
-        m_PsTargets.clear();
+        {
+            std::lock_guard<std::mutex> s_PsLock(m_PsMutex);
+            m_PsTargets.clear();
+            m_PsKills.clear();
+        }
         m_PsTagCount = 0;
         m_PsPrevDown = false;
+        g_PsSwallowLmb = false;
+        g_HipAssist = false;
 
         if (m_NoPlayerTime > 1.0f) { // really out of the mission (not just a short gap): start the next one fresh
             m_Meter = 1.0f;
@@ -1268,11 +1454,21 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     // Hold the key: time slows and whatever you aim at gets tagged (each tag costs some meter).
     // Release the key (or run out of meter): all tagged targets are shot one after another.
     const bool s_PsKeyDown = m_PsEnabled && s_GameFocused && m_PsKey != 0 && PhysKeyDown(m_PsKey);
+    if (m_PsState.load() != PS_IDLE) {
+        RefreshTargetPositions();
+    }
     switch (m_PsState.load()) {
         case PS_IDLE:
             if (s_PsKeyDown && !m_PsPrevDown && !m_Blocked) {
-                m_PsTargets.clear();
+                {
+                    std::lock_guard<std::mutex> s_PsLock(m_PsMutex);
+                    m_PsTargets.clear();
+                }
                 m_PsTagCount = 0;
+                m_PsHoverActor = nullptr;
+                m_PsHoverTime = 0.0f;
+                m_PsHoverProgress = 0.0f;
+                m_PsPrevClick = PhysKeyDown(VK_LBUTTON); // a click that was already down doesn't count
                 m_PsState = PS_AIMING;
             }
             break;
@@ -1282,14 +1478,18 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
                 if (m_Meter <= 0.0f) {
                     m_Locked = true; // ran dry
                 }
-                if (m_PsTargets.empty()) {
+                m_PsHoverProgress = 0.0f;
+                if (PsTargetCount() == 0) {
                     m_PsState = PS_IDLE;
                 } else {
-                    m_PsShotTimer = 0.05f;
+                    m_PsShotTimer = 0.12f; // short beat before the first shot
                     m_PsState = PS_EXECUTING;
                 }
             } else {
-                TryTagTarget();
+                const bool s_ClickNow = PhysKeyDown(VK_LBUTTON);
+                const bool s_ClickEdge = s_ClickNow && !m_PsPrevClick;
+                m_PsPrevClick = s_ClickNow;
+                TryTagTarget(s_ClickEdge, s_Dt);
             }
             break;
 
@@ -1298,7 +1498,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
             if (m_PsShotTimer <= 0.0f) {
                 FirePointShot();
                 m_PsShotTimer = m_PsShotDelay;
-                if (m_PsTargets.empty()) {
+                if (PsTargetCount() == 0) {
                     m_PsState = PS_IDLE;
                 }
             }
@@ -1308,6 +1508,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
             break;
     }
     m_PsPrevDown = s_PsKeyDown;
+    g_PsSwallowLmb = m_PsClickTag && m_PsState.load() == PS_AIMING; // while aiming, left click tags instead of shooting
 
     // Does the player want Instinct right now?
     bool s_Want;
@@ -1346,6 +1547,8 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     }
 
     m_Active.store(s_Want);
+    g_HipMinMs = m_HipMinMs;
+    g_HipAssist = m_HipAssist && s_Want;
 
     // Meter: drains while active, recharges (after a short delay) otherwise.
     const int s_PsNow = m_PsState.load();
@@ -1570,6 +1773,109 @@ void BetterInstinct::DrawHud() {
     s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
 }
 
+// Point shooting overlay: target markers, hover progress, muzzle flash and hit markers.
+void BetterInstinct::DrawPsOverlay(float p_Dt) {
+    std::vector<PsTarget> s_Targets;
+    std::vector<PsKill> s_Kills;
+    {
+        std::lock_guard<std::mutex> s_Lock(m_PsMutex);
+        for (PsKill& s_Kill : m_PsKills) s_Kill.age += p_Dt;
+        m_PsKills.erase(std::remove_if(m_PsKills.begin(), m_PsKills.end(), [](const PsKill& k) { return k.age > 0.8f; }),
+                        m_PsKills.end());
+        if (!m_InPlay) m_PsKills.clear();
+        s_Targets = m_PsTargets;
+        s_Kills = m_PsKills;
+    }
+
+    m_PsFlash = std::max(0.0f, m_PsFlash.load() - p_Dt * 5.0f);
+
+    const int s_State = m_PsState.load();
+    if (!m_InPlay || (s_State == PS_IDLE && s_Kills.empty() && m_PsFlash.load() <= 0.0f)) {
+        return;
+    }
+
+    const ImVec2 s_Screen = ImGui::GetIO().DisplaySize;
+    const float s_Ui = (s_Screen.y / 1080.0f) * m_HudScale;
+    const float s_Thick = std::max(1.0f, std::round(s_Ui));
+    const float s_Time = std::chrono::duration<float>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    ImDrawList* s_Dl = ImGui::GetBackgroundDrawList();
+
+    auto s_Col = [](float r, float g, float b, float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, std::clamp(a, 0.0f, 1.0f)));
+    };
+
+    auto s_Project = [&](float x, float y, float z, ImVec2& p_Out) {
+        SVector3 s_World;
+        s_World.x = x;
+        s_World.y = y;
+        s_World.z = z;
+        SVector2 s_Screen2D;
+        if (!SDK()->WorldToScreen(s_World, s_Screen2D)) return false;
+        p_Out = ImVec2(s_Screen2D.x, s_Screen2D.y);
+        return true;
+    };
+
+    // Muzzle flash: a faint warm wash over the whole screen.
+    const float s_Flash = m_PsFlash.load();
+    if (s_Flash > 0.0f) {
+        s_Dl->AddRectFilled(ImVec2(0.0f, 0.0f), s_Screen, s_Col(1.0f, 0.95f, 0.8f, 0.10f * s_Flash));
+    }
+
+    // Aiming reticle in the middle of the screen, with the "hover to tag" ring filling up.
+    if (s_State == PS_AIMING) {
+        const ImVec2 s_Center(s_Screen.x * 0.5f, s_Screen.y * 0.5f);
+        const float s_Radius = 14.0f * s_Ui;
+        s_Dl->AddCircle(s_Center, s_Radius, s_Col(1.0f, 0.86f, 0.45f, 0.35f), 32, s_Thick);
+        s_Dl->AddCircleFilled(s_Center, std::max(1.5f, 2.0f * s_Ui), s_Col(1.0f, 0.9f, 0.6f, 0.9f), 8);
+
+        const float s_Progress = m_PsHoverProgress.load();
+        if (s_Progress > 0.0f) {
+            s_Dl->PathArcTo(s_Center, s_Radius, -1.5707963f, -1.5707963f + 6.2831853f * s_Progress, 32);
+            s_Dl->PathStroke(s_Col(1.0f, 0.78f, 0.28f, 0.95f), 0, s_Thick * 2.0f);
+        }
+    }
+
+    // Markers on the tagged enemies (the next one to be shot turns red).
+    ImFont* s_Font = ImGui::GetFont();
+    const float s_FontSize = std::max(10.0f, ImGui::GetFontSize() * 0.75f * s_Ui);
+    for (size_t i = 0; i < s_Targets.size(); ++i) {
+        ImVec2 s_P;
+        if (!s_Project(s_Targets[i].x, s_Targets[i].y, s_Targets[i].z, s_P)) continue;
+
+        const bool s_Next = s_State == PS_EXECUTING && i == 0;
+        const float s_Pulse = 0.85f + 0.15f * std::sin(s_Time * 9.0f + static_cast<float>(i));
+        const float s_R = (s_Next ? 20.0f : 15.0f) * s_Ui * s_Pulse;
+        const ImU32 s_MarkCol = s_Next ? s_Col(1.0f, 0.25f, 0.2f, 0.95f) : s_Col(1.0f, 0.82f, 0.35f, 0.95f);
+
+        s_Dl->AddQuad(ImVec2(s_P.x, s_P.y - s_R), ImVec2(s_P.x + s_R, s_P.y), ImVec2(s_P.x, s_P.y + s_R),
+                      ImVec2(s_P.x - s_R, s_P.y), s_MarkCol, s_Thick * 1.5f);
+        s_Dl->AddCircleFilled(s_P, std::max(1.5f, 2.2f * s_Ui), s_MarkCol, 8);
+
+        char s_Num[8];
+        std::snprintf(s_Num, sizeof(s_Num), "%d", static_cast<int>(i) + 1);
+        s_Dl->AddText(s_Font, s_FontSize, ImVec2(s_P.x + s_R + 3.0f * s_Ui, s_P.y - s_R), s_MarkCol, s_Num);
+    }
+
+    // Hit markers: an expanding ring and a cross where a shot landed.
+    for (const PsKill& s_Kill : s_Kills) {
+        ImVec2 s_P;
+        if (!s_Project(s_Kill.x, s_Kill.y, s_Kill.z, s_P)) continue;
+
+        const float s_T = std::clamp(s_Kill.age / 0.8f, 0.0f, 1.0f);
+        const float s_Fade = 1.0f - s_T;
+        const float s_R = (10.0f + 26.0f * s_T) * s_Ui;
+        const float s_X = 9.0f * s_Ui;
+        const ImU32 s_Red = s_Col(1.0f, 0.3f, 0.22f, 0.9f * s_Fade);
+
+        s_Dl->AddCircle(s_P, s_R, s_Red, 24, s_Thick * 1.5f);
+        s_Dl->AddLine(ImVec2(s_P.x - s_X, s_P.y - s_X), ImVec2(s_P.x + s_X, s_P.y + s_X), s_Red, s_Thick * 2.0f);
+        s_Dl->AddLine(ImVec2(s_P.x - s_X, s_P.y + s_X), ImVec2(s_P.x + s_X, s_P.y - s_X), s_Red, s_Thick * 2.0f);
+        if (s_T < 0.5f) {
+            s_Dl->AddCircleFilled(s_P, 7.0f * s_Ui * (1.0f - s_T * 2.0f), s_Col(1.0f, 0.97f, 0.88f, 0.9f * (1.0f - s_T * 2.0f)), 12);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -1582,6 +1888,7 @@ void BetterInstinct::OnDrawMenu() {
 
 void BetterInstinct::OnDrawUI(bool p_HasFocus) {
     DrawHud();
+    DrawPsOverlay(m_LastHudDt);
     UpdateSound(m_LastHudDt, m_InPlay);
 
     // Outside a mission the game loop doesn't run, so never leave the game-level block switched on.
@@ -1648,6 +1955,11 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::TextDisabled("(match your in-game Instinct setting)");
 
         if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
+        if (ImGui::Checkbox("Hip-fire assist (experimental)", &m_HipAssist)) s_Changed = true;
+        ImGui::TextDisabled("During Instinct, short left clicks are held a little longer so un-aimed shots register.");
+        ImGui::BeginDisabled(!m_HipAssist);
+        if (ImGui::SliderInt("Minimum click length", &m_HipMinMs, 0, 400, "%d ms")) s_Changed = true;
+        ImGui::EndDisabled();
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
 
         if (ImGui::InputText("Instinct action name(s)", m_ActionPatterns, sizeof(m_ActionPatterns))) {
@@ -1720,6 +2032,13 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::SliderInt("Max targets", &m_PsMaxTags, 1, 12)) s_Changed = true;
         if (ImGui::SliderFloat("Time between shots", &m_PsShotDelay, 0.05f, 1.0f, "%.2f s")) s_Changed = true;
         if (ImGui::SliderFloat("Meter drain while aiming", &m_PsDrainMul, 0.0f, 2.0f, "%.2fx")) s_Changed = true;
+        if (ImGui::Checkbox("Left click tags the target", &m_PsClickTag)) s_Changed = true;
+        if (ImGui::SliderFloat("Hover to tag (0 = off)", &m_PsDwell, 0.0f, 1.5f, "%.2f s")) s_Changed = true;
+        if (ImGui::Checkbox("Shot sound", &m_PsShotSound)) s_Changed = true;
+        if (m_PsShotSound) {
+            if (ImGui::SliderFloat("Shot volume", &m_PsShotVolume, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+            ImGui::TextDisabled("Replace mods\\InstinctSounds\\Effects\\Point Shot.wav to use your own sound.");
+        }
         ImGui::EndDisabled();
 
         ImGui::Separator();
