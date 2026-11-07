@@ -26,7 +26,13 @@
 #include "Functions.h"
 #include "Hooks.h"
 
+#include "Glacier/ZActor.h"
+#include "Glacier/ZCameraEntity.h"
+#include "Glacier/ZCollision.h"
+#include "Glacier/ZEntity.h"
 #include "Glacier/ZGameLoopManager.h"
+#include "Glacier/ZHitman5.h"
+#include "Glacier/ZObject.h"
 #include "Glacier/ZGameTime.h"
 #include "Glacier/ZInput.h"
 
@@ -166,50 +172,75 @@ LRESULT CALLBACK MouseProc(int p_Code, WPARAM p_W, LPARAM p_L) {
     return CallNextHookEx(nullptr, p_Code, p_W, p_L);
 }
 
+// Runs on its own thread: installs the hooks and pumps messages until it gets WM_QUIT.
+// The thread holds its own reference to this DLL and ends with FreeLibraryAndExitThread, so unloading the mod never
+// has to wait for it (waiting for a thread while the mod unloads is what could freeze the game).
+DWORD WINAPI HookThreadProc(LPVOID p_Param) {
+    HMODULE s_Module = static_cast<HMODULE>(p_Param);
+
+    MSG s_Msg;
+    PeekMessageW(&s_Msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); // make sure this thread has a message queue
+    const DWORD s_MyId = GetCurrentThreadId();
+    g_HookThreadId = s_MyId;
+
+    HHOOK s_Kb = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, s_Module, 0);
+    HHOOK s_Ms = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, s_Module, 0);
+    g_HookOk = s_Kb != nullptr && s_Ms != nullptr;
+    g_HookReady = true;
+
+    while (GetMessageW(&s_Msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&s_Msg);
+        DispatchMessageW(&s_Msg);
+    }
+
+    if (s_Kb) UnhookWindowsHookEx(s_Kb);
+    if (s_Ms) UnhookWindowsHookEx(s_Ms);
+
+    if (g_HookThreadId.load() == s_MyId) {
+        g_HookOk = false;
+        g_HookReady = false;
+        g_HookThreadId = 0;
+    }
+
+    FreeLibraryAndExitThread(s_Module, 0); // drops our DLL reference and ends the thread without returning into DLL code
+    return 0;
+}
+
 class InputGuard {
 public:
     InputGuard() {
         g_Pid = GetCurrentProcessId();
         for (auto& s_Key : g_Phys) s_Key = false;
-        m_Thread = std::thread([this] { Run(); });
+
+        // A hook thread from a previous load of the mod may still be finishing: give it a moment.
+        for (int i = 0; i < 100 && g_HookThreadId.load() != 0; ++i) Sleep(5);
+        g_HookReady = false;
+        g_HookOk = false;
+
+        HMODULE s_Module = nullptr; // (no UNCHANGED_REFCOUNT flag: this takes a reference for the thread)
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&HookThreadProc), &s_Module) ||
+            s_Module == nullptr) {
+            return;
+        }
+
+        HANDLE s_Thread = CreateThread(nullptr, 0, HookThreadProc, s_Module, 0, nullptr);
+        if (s_Thread == nullptr) {
+            FreeLibrary(s_Module);
+            return;
+        }
+        CloseHandle(s_Thread);
+
         for (int i = 0; i < 200 && !g_HookReady.load(); ++i) Sleep(5); // wait (max ~1s) for the hooks to be installed
     }
 
     ~InputGuard() {
+        // Only ask the thread to stop; it unhooks and exits on its own. Never wait for it here.
         g_Block = false;
-        if (g_HookReady.load()) {
-            PostThreadMessageW(g_HookThreadId.load(), WM_QUIT, 0, 0);
+        const DWORD s_Id = g_HookThreadId.load();
+        if (g_HookReady.load() && s_Id != 0) {
+            PostThreadMessageW(s_Id, WM_QUIT, 0, 0);
         }
-        if (m_Thread.joinable()) m_Thread.join();
-        g_HookOk = false;
-        g_HookReady = false;
     }
-
-private:
-    void Run() {
-        MSG s_Msg;
-        PeekMessageW(&s_Msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); // make sure this thread has a message queue
-        g_HookThreadId = GetCurrentThreadId();
-
-        HMODULE s_Module = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&KeyboardProc), &s_Module);
-
-        HHOOK s_Kb = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, s_Module, 0);
-        HHOOK s_Ms = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, s_Module, 0);
-        g_HookOk = s_Kb != nullptr && s_Ms != nullptr;
-        g_HookReady = true;
-
-        while (GetMessageW(&s_Msg, nullptr, 0, 0) > 0) {
-            TranslateMessage(&s_Msg);
-            DispatchMessageW(&s_Msg);
-        }
-
-        if (s_Kb) UnhookWindowsHookEx(s_Kb);
-        if (s_Ms) UnhookWindowsHookEx(s_Ms);
-    }
-
-    std::thread m_Thread;
 };
 
 std::unique_ptr<InputGuard> g_Guard;
@@ -647,6 +678,14 @@ bool FocusForAll::SaveConfigFile() {
         s_Flt("recharge_seconds", m_RechargeSeconds);
         s_Flt("recharge_delay", m_RechargeDelay);
 
+        s_Bool("ps_enabled", m_PsEnabled);
+        s_Int("ps_key", m_PsKey);
+        s_Flt("ps_scale", m_PsScale);
+        s_Flt("ps_tag_cost", m_PsTagCost);
+        s_Int("ps_max_tags", m_PsMaxTags);
+        s_Flt("ps_shot_delay", m_PsShotDelay);
+        s_Flt("ps_drain_mul", m_PsDrainMul);
+
         s_Bool("hud_enabled", m_HudEnabled);
         s_Bool("hud_always", m_HudAlways);
         s_Flt("hud_width", m_HudWidth);
@@ -737,6 +776,14 @@ bool FocusForAll::LoadConfigFile() {
     s_Flt("drain_seconds", m_DrainSeconds, 2.0f, 120.0f);
     s_Flt("recharge_seconds", m_RechargeSeconds, 2.0f, 300.0f);
     s_Flt("recharge_delay", m_RechargeDelay, 0.0f, 10.0f);
+
+    s_Bool("ps_enabled", m_PsEnabled);
+    s_Int("ps_key", m_PsKey, 1, 254);
+    s_Flt("ps_scale", m_PsScale, 0.05f, 0.95f);
+    s_Flt("ps_tag_cost", m_PsTagCost, 0.0f, 0.5f);
+    s_Int("ps_max_tags", m_PsMaxTags, 1, 12);
+    s_Flt("ps_shot_delay", m_PsShotDelay, 0.05f, 1.0f);
+    s_Flt("ps_drain_mul", m_PsDrainMul, 0.0f, 2.0f);
 
     s_Bool("hud_enabled", m_HudEnabled);
     s_Bool("hud_always", m_HudAlways);
@@ -897,7 +944,7 @@ void FocusForAll::StopSound() {
 
 // Runs every frame from the UI callback, so sound also stops cleanly when you leave the mission.
 void FocusForAll::UpdateSound(float p_Dt, bool p_InPlay) {
-    const bool s_Wanted = m_SoundEnabled && ((m_Active.load() && p_InPlay) || m_Testing);
+    const bool s_Wanted = m_SoundEnabled && (((m_Active.load() || m_PsState.load() != PS_IDLE) && p_InPlay) || m_Testing);
 
     if (s_Wanted && !m_SoundWasWanted) {
         StartSound();
@@ -985,6 +1032,148 @@ std::string FocusForAll::KeyName(int p_Vk) {
 }
 
 // ---------------------------------------------------------------------------
+// Point shooting
+// ---------------------------------------------------------------------------
+
+// Raycasts from the middle of the screen (the game camera) and returns the actor that is being aimed at, if any.
+ZActor* FocusForAll::FindAimedActor() {
+    if (!Globals::CollisionManager || !*Globals::CollisionManager) {
+        return nullptr;
+    }
+
+    const auto s_Camera = Functions::GetCurrentCamera->Call();
+    if (!s_Camera) {
+        return nullptr;
+    }
+
+    const SMatrix s_CamMatrix = s_Camera->GetObjectToWorldMatrix();
+    const float4 s_Dir = float4(-s_CamMatrix.ZAxis.x, -s_CamMatrix.ZAxis.y, -s_CamMatrix.ZAxis.z, -s_CamMatrix.ZAxis.w);
+
+    // Agent 47's own position: in third person the camera ray first hits him, so we look through him.
+    bool s_HavePlayer = false;
+    float s_PlayerX = 0.0f, s_PlayerY = 0.0f, s_PlayerZ = 0.0f;
+    if (auto s_LocalHitman = SDK()->GetLocalPlayer()) {
+        if (auto* s_Spatial = s_LocalHitman.m_entityRef.QueryInterface<ZSpatialEntity>()) {
+            const SMatrix s_PlayerMatrix = s_Spatial->GetObjectToWorldMatrix();
+            s_PlayerX = s_PlayerMatrix.Trans.x;
+            s_PlayerY = s_PlayerMatrix.Trans.y;
+            s_PlayerZ = s_PlayerMatrix.Trans.z;
+            s_HavePlayer = true;
+        }
+    }
+
+    float4 s_From = s_CamMatrix.Trans;
+
+    for (int s_Try = 0; s_Try < 3; ++s_Try) {
+        ZRayQueryInput s_Input {
+            .m_vFrom = s_From,
+            .m_vTo = s_From + s_Dir * 500.f,
+        };
+        ZRayQueryOutput s_Output {};
+
+        if (!(*Globals::CollisionManager)->RayCastClosestHit(s_Input, &s_Output)) {
+            return nullptr;
+        }
+        if (!s_Output.m_pBlockingSpatialEntity.m_pInterfaceRef) {
+            return nullptr;
+        }
+
+        ZEntityRef s_Parent = s_Output.m_pBlockingSpatialEntity.m_entityRef.GetLogicalParent();
+        if (ZActor* s_Actor = s_Parent.QueryInterface<ZActor>()) {
+            return s_Actor;
+        }
+
+        // Something that isn't an actor was hit. Only look through it when it's right next to Agent 47 (his own body).
+        if (!s_HavePlayer) {
+            return nullptr;
+        }
+        const float s_Dx = s_Output.m_vPosition.x - s_PlayerX;
+        const float s_Dy = s_Output.m_vPosition.y - s_PlayerY;
+        const float s_Dz = s_Output.m_vPosition.z - s_PlayerZ;
+        if (s_Dx * s_Dx + s_Dy * s_Dy + s_Dz * s_Dz > 4.0f) {
+            return nullptr;
+        }
+        s_From = s_Output.m_vPosition + s_Dir * 0.3f;
+    }
+
+    return nullptr;
+}
+
+void FocusForAll::TryTagTarget() {
+    if (static_cast<int>(m_PsTargets.size()) >= m_PsMaxTags) return;
+    if (m_Meter < m_PsTagCost) return;
+
+    ZActor* s_Actor = FindAimedActor();
+    if (!s_Actor) return;
+
+    for (const ZActor* s_Tagged : m_PsTargets) {
+        if (s_Tagged == s_Actor) return; // already tagged
+    }
+
+    m_PsTargets.push_back(s_Actor);
+    m_PsTagCount = static_cast<int>(m_PsTargets.size());
+    m_Meter = std::max(0.0f, m_Meter - m_PsTagCost);
+}
+
+// Shoots the next tagged target.
+void FocusForAll::FirePointShot() {
+    if (m_PsTargets.empty()) return;
+
+    ZActor* s_Actor = m_PsTargets.front();
+    m_PsTargets.erase(m_PsTargets.begin());
+    m_PsTagCount = static_cast<int>(m_PsTargets.size());
+    if (!s_Actor) return;
+
+    TEntityRef<IItem> s_Item;
+    TEntityRef<ZSetpieceEntity> s_SetPieceEntity;
+
+    Functions::ZActor_KillActor->Call(
+        s_Actor, s_Item, s_SetPieceEntity, EDamageEvent::eDE_UNDEFINED, EDeathBehavior::eDB_IMPACT_ANIM
+    );
+}
+
+// A "click to change" key button (same behaviour as the Instinct key button). Returns true when the key changed.
+bool FocusForAll::DrawKeyBinder(const char* p_Id, int& p_Key, bool& p_Binding, bool& p_Armed) {
+    bool s_Changed = false;
+    ImGui::PushID(p_Id);
+
+    if (p_Binding) {
+        ImGui::Button("Press a key or mouse button... (Esc cancels)", ImVec2(-1, 0));
+
+        bool s_AnyDown = false;
+        for (int vk = 1; vk < 255; ++vk) {
+            if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
+            if (IsKeyDown(vk)) { s_AnyDown = true; break; }
+        }
+
+        if (!p_Armed) {
+            p_Armed = !s_AnyDown; // wait for the click that started binding to be released
+        } else {
+            for (int vk = 1; vk < 255; ++vk) {
+                if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
+                if (!IsKeyDown(vk)) continue;
+
+                if (vk != VK_ESCAPE) {
+                    p_Key = vk;
+                    s_Changed = true;
+                }
+                p_Binding = false;
+                break;
+            }
+        }
+    } else {
+        const std::string s_Text = KeyName(p_Key) + "  (click to change)";
+        if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
+            p_Binding = true;
+            p_Armed = false;
+        }
+    }
+
+    ImGui::PopID();
+    return s_Changed;
+}
+
+// ---------------------------------------------------------------------------
 // Game loop
 // ---------------------------------------------------------------------------
 
@@ -1014,6 +1203,10 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         m_InputBlock = false;
         g_Block = false;
         m_PrevDown = false;
+        m_PsState = PS_IDLE;
+        m_PsTargets.clear();
+        m_PsTagCount = 0;
+        m_PsPrevDown = false;
 
         if (m_NoPlayerTime > 1.0f) { // really out of the mission (not just a short gap): start the next one fresh
             m_Meter = 1.0f;
@@ -1037,14 +1230,14 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &s_ForegroundPid);
-    const bool s_GameFocused = s_ForegroundPid == GetCurrentProcessId() && !m_Binding;
+    const bool s_GameFocused = s_ForegroundPid == GetCurrentProcessId() && !m_Binding && !m_BindingPs;
     const bool s_KeyDown = s_GameFocused && InstinctKeyDown();
     const bool s_PressEdge = s_KeyDown && !m_PrevDown;
 
     g_Key = m_InstinctKey;
 
     // Is Instinct usable right now? Not if the meter ran dry (until it recovers) or is below the start minimum.
-    const bool s_WasActive = m_Active.load();
+    const bool s_WasActive = m_Active.load() || m_PsState.load() != PS_IDLE;
     m_Blocked = m_Locked || (!s_WasActive && m_Meter < kMinStart);
 
     // Block the key at the input level while unusable, so the game can't switch its own Instinct on either.
@@ -1071,6 +1264,51 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         m_NeedRelease = true;
     }
 
+    // --- Point shooting ---
+    // Hold the key: time slows and whatever you aim at gets tagged (each tag costs some meter).
+    // Release the key (or run out of meter): all tagged targets are shot one after another.
+    const bool s_PsKeyDown = m_PsEnabled && s_GameFocused && m_PsKey != 0 && PhysKeyDown(m_PsKey);
+    switch (m_PsState.load()) {
+        case PS_IDLE:
+            if (s_PsKeyDown && !m_PsPrevDown && !m_Blocked) {
+                m_PsTargets.clear();
+                m_PsTagCount = 0;
+                m_PsState = PS_AIMING;
+            }
+            break;
+
+        case PS_AIMING:
+            if (!s_PsKeyDown || m_Meter <= 0.0f) {
+                if (m_Meter <= 0.0f) {
+                    m_Locked = true; // ran dry
+                }
+                if (m_PsTargets.empty()) {
+                    m_PsState = PS_IDLE;
+                } else {
+                    m_PsShotTimer = 0.05f;
+                    m_PsState = PS_EXECUTING;
+                }
+            } else {
+                TryTagTarget();
+            }
+            break;
+
+        case PS_EXECUTING:
+            m_PsShotTimer -= s_Dt;
+            if (m_PsShotTimer <= 0.0f) {
+                FirePointShot();
+                m_PsShotTimer = m_PsShotDelay;
+                if (m_PsTargets.empty()) {
+                    m_PsState = PS_IDLE;
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+    m_PsPrevDown = s_PsKeyDown;
+
     // Does the player want Instinct right now?
     bool s_Want;
     if (m_ToggleMode) {
@@ -1086,6 +1324,12 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         s_Want = s_KeyDown && !m_NeedRelease && !m_Blocked;
     }
     m_PrevDown = s_KeyDown;
+
+    // Point shooting takes over completely while it is running.
+    if (m_PsState.load() != PS_IDLE) {
+        s_Want = false;
+        m_ToggleState = false;
+    }
 
     // Ran dry while in use: lock Instinct and make the game drop it too.
     if (s_Want && m_Meter <= 0.0f) {
@@ -1104,8 +1348,14 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     m_Active.store(s_Want);
 
     // Meter: drains while active, recharges (after a short delay) otherwise.
+    const int s_PsNow = m_PsState.load();
     if (s_Want) {
         m_Meter -= s_Dt / m_DrainSeconds;
+        m_RechargeWait = m_RechargeDelay;
+    } else if (s_PsNow == PS_AIMING) {
+        m_Meter -= s_Dt / m_DrainSeconds * m_PsDrainMul;
+        m_RechargeWait = m_RechargeDelay;
+    } else if (s_PsNow == PS_EXECUTING) {
         m_RechargeWait = m_RechargeDelay;
     } else if (m_RechargeWait > 0.0f) {
         m_RechargeWait -= s_Dt;
@@ -1125,11 +1375,12 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     }
 
     // Time scale.
-    const float s_Target = s_Want ? m_FocusScale : 1.0f;
+    const bool s_PsSlow = m_PsState.load() != PS_IDLE;
+    const float s_Target = s_PsSlow ? m_PsScale : (s_Want ? m_FocusScale : 1.0f);
     const float s_T = std::clamp(m_BlendSpeed * s_Dt, 0.0f, 1.0f);
     m_CurrentScale += (s_Target - m_CurrentScale) * s_T;
 
-    if (s_Want || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
+    if (s_Want || s_PsSlow || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
         Globals::GameTimeManager->m_fGameTimeMultiplier = m_CurrentScale;
         m_Touched = true;
     } else if (m_Touched) {
@@ -1163,7 +1414,7 @@ void FocusForAll::DrawHud() {
     m_LastHudDt = s_Dt;
     const bool s_Preview = m_ShowUI; // while the settings window is open, always show the meter so it can be positioned
 
-    const bool s_Active = m_Active.load();
+    const bool s_Active = m_Active.load() || m_PsState.load() != PS_IDLE;
 
     float s_TargetAlpha = 0.0f;
     if (m_HudEnabled && (s_InPlay || s_Preview)) {
@@ -1210,7 +1461,7 @@ void FocusForAll::DrawHud() {
     }
 
     // Label above the bar.
-    const char* s_Label = m_Blocked ? "RECHARGING" : "INSTINCT";
+    const char* s_Label = m_PsState.load() != PS_IDLE ? "POINT SHOOTING" : (m_Blocked ? "RECHARGING" : "INSTINCT");
     ImFont* s_Font = ImGui::GetFont();
     const float s_FontSize = std::max(10.0f, ImGui::GetFontSize() * 0.8f * s_Ui);
     const ImVec2 s_TextSize = s_Font->CalcTextSizeA(s_FontSize, FLT_MAX, 0.0f, s_Label);
@@ -1294,6 +1545,26 @@ void FocusForAll::DrawHud() {
         s_Dl->AddLine(ImVec2(s_HeadX, s_MidY - s_Len * 0.8f), ImVec2(s_HeadX, s_MidY + s_Len * 0.8f), s_Star, s_Thick);
     }
 
+    // Point shooting: one pip per possible target below the bar, filled for every tagged one.
+    if (m_PsState.load() != PS_IDLE) {
+        const int s_MaxTags = std::max(1, m_PsMaxTags);
+        const int s_Tagged = m_PsTagCount.load();
+        const float s_PipR = std::max(2.0f, 3.5f * s_Ui);
+        const float s_Gap = s_PipR * 3.0f;
+        const float s_TotalW = s_Gap * static_cast<float>(s_MaxTags - 1);
+        const float s_PipY = s_Bottom + s_PipR * 2.6f;
+
+        for (int i = 0; i < s_MaxTags; ++i) {
+            const ImVec2 s_C(s_Cx - s_TotalW * 0.5f + s_Gap * static_cast<float>(i), s_PipY);
+            if (i < s_Tagged) {
+                s_Dl->AddCircleFilled(s_C, s_PipR * 1.9f, s_Col(1.0f, 0.78f, 0.28f, 0.18f * s_A), 14);
+                s_Dl->AddCircleFilled(s_C, s_PipR, s_Col(1.0f, 0.86f, 0.45f, 0.95f * s_A), 12);
+            } else {
+                s_Dl->AddCircle(s_C, s_PipR, s_Col(1.0f, 0.9f, 0.65f, 0.35f * s_A), 12, s_Thick);
+            }
+        }
+    }
+
     // Thin outline, a little brighter while Instinct is active.
     const float s_Border = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
     s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
@@ -1323,6 +1594,7 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
 
     if (!m_ShowUI) {
         m_Binding = false;
+        m_BindingPs = false;
         m_ForceBlockTest = false;
         if (m_Testing) {
             m_Testing = false;
@@ -1434,6 +1706,21 @@ void FocusForAll::OnDrawUI(bool p_HasFocus) {
         } else {
             m_ForceBlockTest = false;
         }
+
+        ImGui::Separator();
+
+        // --- Point shooting ---
+        if (ImGui::Checkbox("Point shooting (Absolution style)", &m_PsEnabled)) s_Changed = true;
+        ImGui::BeginDisabled(!m_PsEnabled);
+        ImGui::TextUnformatted("Point shooting key");
+        if (DrawKeyBinder("psbind", m_PsKey, m_BindingPs, m_BindArmedPs)) s_Changed = true;
+        ImGui::TextDisabled("Hold it and aim at enemies to tag them. Release it and they all get shot.");
+        if (ImGui::SliderFloat("PS time scale", &m_PsScale, 0.05f, 0.95f, "%.2fx")) s_Changed = true;
+        if (ImGui::SliderFloat("Meter per tagged target", &m_PsTagCost, 0.0f, 0.5f, "%.2f")) s_Changed = true;
+        if (ImGui::SliderInt("Max targets", &m_PsMaxTags, 1, 12)) s_Changed = true;
+        if (ImGui::SliderFloat("Time between shots", &m_PsShotDelay, 0.05f, 1.0f, "%.2f s")) s_Changed = true;
+        if (ImGui::SliderFloat("Meter drain while aiming", &m_PsDrainMul, 0.0f, 2.0f, "%.2fx")) s_Changed = true;
+        ImGui::EndDisabled();
 
         ImGui::Separator();
 
