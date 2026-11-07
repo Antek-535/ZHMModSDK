@@ -3,10 +3,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "IPluginInterface.h"
+#include "Hooks.h"
+
+#include <Glacier/ZInput.h>
 
 // Ultimate Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
@@ -14,6 +19,7 @@ class FocusForAll : public IPluginInterface {
 public:
     ~FocusForAll() override;
 
+    void Init() override;
     void OnEngineInitialized() override;
     void OnDrawMenu() override;
     void OnDrawUI(bool p_HasFocus) override;
@@ -41,6 +47,13 @@ private:
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
 
+    // Game-level input blocking: the game asks ZInputAction_Digital "is action X pressed?" for every
+    // action each frame. While Instinct is unusable we answer "no" for the Instinct action(s).
+    void RebuildPatterns();
+    bool ActionMatches(const char* p_Name);
+
+    DECLARE_PLUGIN_DETOUR(FocusForAll, bool, ZInputAction_Digital, ZInputAction* th, int32_t controllerId);
+
     static bool IsKeyDown(int p_Vk);
     static std::string KeyName(int p_Vk);
 
@@ -63,6 +76,17 @@ private:
     std::chrono::steady_clock::time_point m_HudLast = std::chrono::steady_clock::now();
     std::atomic<uint32_t> m_FrameCount{0};
     std::atomic<int64_t> m_LastUpdateTicks{0}; // last time the game loop ran (lets the HUD hide in menus)
+
+    // --- Game-level input block state ---
+    std::atomic<bool> m_InputBlock{false};     // detour answers "not pressed" for matching actions
+    std::atomic<bool> m_CaptureNames{false};   // detour records action names (Debug section open)
+    std::atomic<uint32_t> m_BlockedPolls{0};   // how many times the detour actually blocked something
+    bool m_ForceBlockTest = false;             // debug: block regardless of the meter
+    char m_ActionPatterns[256] = "instinct,focus"; // comma-separated, case-insensitive parts of action names
+    char m_NameFilter[64] = {};
+    std::mutex m_NameMutex;
+    std::vector<std::string> m_Patterns;       // lowercase, parsed from m_ActionPatterns
+    std::set<std::string> m_SeenNames;         // every action name the game has polled (debug)
 
     // --- Settings (persisted) ---
     int m_InstinctKey = 0x10;        // VK_SHIFT: set this to your in-game Instinct key
