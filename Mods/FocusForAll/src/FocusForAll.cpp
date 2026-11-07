@@ -9,10 +9,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -360,6 +362,20 @@ bool ContainsNoCase(const char* p_Hay, const std::string& p_NeedleLower) {
     return false;
 }
 
+// Stable, always-writable place for our own settings file (independent of where the DLL is loaded from).
+std::wstring ConfigDir() {
+    wchar_t s_Buf[MAX_PATH] = {};
+    const DWORD s_Len = GetEnvironmentVariableW(L"APPDATA", s_Buf, MAX_PATH);
+    if (s_Len == 0 || s_Len >= MAX_PATH) return L"";
+    return std::wstring(s_Buf) + L"\\FocusForAll\\";
+}
+
+std::string OneLine(std::string p_Str) { // values are stored one per line
+    p_Str.erase(std::remove(p_Str.begin(), p_Str.end(), '\r'), p_Str.end());
+    p_Str.erase(std::remove(p_Str.begin(), p_Str.end(), '\n'), p_Str.end());
+    return p_Str;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -367,6 +383,10 @@ bool ContainsNoCase(const char* p_Hay, const std::string& p_NeedleLower) {
 // ---------------------------------------------------------------------------
 
 FocusForAll::~FocusForAll() {
+    if (m_ConfigReady) {
+        SaveConfigFile();
+    }
+
     m_InputBlock = false;
     m_CaptureNames = false;
 
@@ -405,6 +425,16 @@ void FocusForAll::OnEngineInitialized() {
     } catch (...) {
         m_SoundStatus = "Couldn't prepare the sound folder.";
     }
+
+    // Our own settings file wins over everything loaded above (first run: it gets created from the current values).
+    bool s_ConfigFound = false;
+    try {
+        s_ConfigFound = LoadConfigFile();
+        if (s_ConfigFound) ScanSounds(); // re-select the saved sound
+    } catch (...) {
+    }
+    if (!s_ConfigFound) SaveConfigFile();
+    m_ConfigReady = true;
 
     try {
         g_Key = m_InstinctKey;
@@ -508,6 +538,13 @@ void FocusForAll::LoadSettings() {
     m_LowColor[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_g", m_LowColor[1])), 0.0f, 1.0f);
     m_LowColor[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_b", m_LowColor[2])), 0.0f, 1.0f);
 
+    // Older versions saved a plain white meter colour: switch to the new gold look once.
+    if (GetSettingInt(kSection, "hud_style", 0) < 2) {
+        m_FillColor[0] = 1.00f;
+        m_FillColor[1] = 0.78f;
+        m_FillColor[2] = 0.28f;
+    }
+
     m_SoundEnabled = GetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     m_SoundSource = std::clamp(static_cast<int>(GetSettingInt(kSection, "sound_source", m_SoundSource)), 0, 1);
     m_SoundVolume = std::clamp(static_cast<float>(GetSettingDouble(kSection, "sound_volume", m_SoundVolume)), 0.0f, 1.0f);
@@ -519,6 +556,7 @@ void FocusForAll::LoadSettings() {
 
 void FocusForAll::SaveSettings() {
     SetSettingInt(kSection, "instinct_key", m_InstinctKey);
+    SetSettingInt(kSection, "hud_style", 2);
     SetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     SetSettingBool(kSection, "block_enabled", m_BlockEnabled);
     SetSettingDouble(kSection, "focus_scale", m_FocusScale);
@@ -549,6 +587,7 @@ void FocusForAll::SaveSettings() {
     SetSettingDouble(kSection, "fade_in_ms", m_FadeInMs);
 
     SaveSoundText();
+    SaveConfigFile();
 }
 
 // The text values (selected file name, custom path, Instinct action name(s)) live in a small text file next to the DLL.
@@ -577,6 +616,159 @@ void FocusForAll::SaveSoundText() {
     if (s_File) {
         s_File << m_PresetName << "\n" << m_CustomPath << "\n" << m_ActionPatterns << "\n";
     }
+}
+
+bool FocusForAll::SaveConfigFile() {
+    std::wstring s_Dir = ConfigDir();
+    if (s_Dir.empty()) s_Dir = m_ModDir;
+    if (s_Dir.empty()) return false;
+
+    std::error_code s_Ec;
+    fs::create_directories(fs::path(s_Dir), s_Ec);
+
+    const fs::path s_Final = fs::path(s_Dir) / L"FocusForAll.cfg";
+    const fs::path s_Tmp = fs::path(s_Dir) / L"FocusForAll.cfg.tmp";
+
+    {
+        std::ofstream s_File(s_Tmp, std::ios::trunc);
+        if (!s_File) return false;
+
+        auto s_Int = [&](const char* k, long long v) { s_File << k << "=" << v << "\n"; };
+        auto s_Flt = [&](const char* k, float v) { s_File << k << "=" << std::to_string(v) << "\n"; };
+        auto s_Bool = [&](const char* k, bool v) { s_File << k << "=" << (v ? 1 : 0) << "\n"; };
+        auto s_Str = [&](const char* k, const std::string& v) { s_File << k << "=" << OneLine(v) << "\n"; };
+
+        s_Int("instinct_key", m_InstinctKey);
+        s_Bool("toggle_mode", m_ToggleMode);
+        s_Bool("block_enabled", m_BlockEnabled);
+        s_Flt("focus_scale", m_FocusScale);
+        s_Flt("blend_speed", m_BlendSpeed);
+        s_Flt("drain_seconds", m_DrainSeconds);
+        s_Flt("recharge_seconds", m_RechargeSeconds);
+        s_Flt("recharge_delay", m_RechargeDelay);
+
+        s_Bool("hud_enabled", m_HudEnabled);
+        s_Bool("hud_always", m_HudAlways);
+        s_Flt("hud_width", m_HudWidth);
+        s_Flt("hud_y", m_HudYOffset);
+        s_Flt("hud_scale", m_HudScale);
+        s_Flt("hud_opacity", m_HudOpacity);
+        s_Flt("fill_r", m_FillColor[0]);
+        s_Flt("fill_g", m_FillColor[1]);
+        s_Flt("fill_b", m_FillColor[2]);
+        s_Flt("low_r", m_LowColor[0]);
+        s_Flt("low_g", m_LowColor[1]);
+        s_Flt("low_b", m_LowColor[2]);
+
+        s_Bool("sound_enabled", m_SoundEnabled);
+        s_Int("sound_source", m_SoundSource);
+        s_Flt("sound_volume", m_SoundVolume);
+        s_Bool("fade_out_on", m_FadeOutOn);
+        s_Flt("fade_out_ms", m_FadeOutMs);
+        s_Bool("fade_in_on", m_FadeInOn);
+        s_Flt("fade_in_ms", m_FadeInMs);
+
+        s_Str("preset_name", m_PresetName);
+        s_Str("custom_path", m_CustomPath);
+        s_Str("action_patterns", m_ActionPatterns);
+
+        s_File.flush();
+        if (!s_File.good()) return false;
+    }
+
+    fs::rename(s_Tmp, s_Final, s_Ec);
+    if (s_Ec) {
+        s_Ec.clear();
+        fs::copy_file(s_Tmp, s_Final, fs::copy_options::overwrite_existing, s_Ec);
+        std::error_code s_Ec2;
+        fs::remove(s_Tmp, s_Ec2);
+    }
+    return !s_Ec;
+}
+
+bool FocusForAll::LoadConfigFile() {
+    std::wstring s_Dir = ConfigDir();
+    if (s_Dir.empty()) s_Dir = m_ModDir;
+    if (s_Dir.empty()) return false;
+
+    std::ifstream s_File(fs::path(s_Dir) / L"FocusForAll.cfg");
+    if (!s_File) return false;
+
+    std::map<std::string, std::string> s_Map;
+    std::string s_Line;
+    while (std::getline(s_File, s_Line)) {
+        while (!s_Line.empty() && (s_Line.back() == '\r' || s_Line.back() == '\n')) s_Line.pop_back();
+        const size_t s_Eq = s_Line.find('=');
+        if (s_Eq == std::string::npos || s_Eq == 0) continue;
+        s_Map[s_Line.substr(0, s_Eq)] = s_Line.substr(s_Eq + 1);
+    }
+    if (s_Map.empty()) return false;
+
+    auto s_Find = [&](const char* k) -> const std::string* {
+        const auto s_It = s_Map.find(k);
+        return s_It == s_Map.end() ? nullptr : &s_It->second;
+    };
+    auto s_Flt = [&](const char* k, float& v, float lo, float hi) {
+        if (const std::string* p = s_Find(k)) {
+            char* s_End = nullptr;
+            const double s_D = std::strtod(p->c_str(), &s_End);
+            if (s_End != p->c_str()) v = std::clamp(static_cast<float>(s_D), lo, hi);
+        }
+    };
+    auto s_Int = [&](const char* k, int& v, int lo, int hi) {
+        if (const std::string* p = s_Find(k)) {
+            char* s_End = nullptr;
+            const long s_L = std::strtol(p->c_str(), &s_End, 10);
+            if (s_End != p->c_str()) v = std::clamp(static_cast<int>(s_L), lo, hi);
+        }
+    };
+    auto s_Bool = [&](const char* k, bool& v) {
+        if (const std::string* p = s_Find(k)) v = (*p == "1");
+    };
+    auto s_Str = [&](const char* k, char* dst, size_t cap) {
+        if (const std::string* p = s_Find(k)) std::snprintf(dst, cap, "%s", p->c_str());
+    };
+
+    s_Int("instinct_key", m_InstinctKey, 1, 254);
+    s_Bool("toggle_mode", m_ToggleMode);
+    s_Bool("block_enabled", m_BlockEnabled);
+    s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
+    s_Flt("blend_speed", m_BlendSpeed, 1.0f, 30.0f);
+    s_Flt("drain_seconds", m_DrainSeconds, 2.0f, 120.0f);
+    s_Flt("recharge_seconds", m_RechargeSeconds, 2.0f, 300.0f);
+    s_Flt("recharge_delay", m_RechargeDelay, 0.0f, 10.0f);
+
+    s_Bool("hud_enabled", m_HudEnabled);
+    s_Bool("hud_always", m_HudAlways);
+    s_Flt("hud_width", m_HudWidth, 0.05f, 0.5f);
+    s_Flt("hud_y", m_HudYOffset, 0.0f, 600.0f);
+    s_Flt("hud_scale", m_HudScale, 0.5f, 3.0f);
+    s_Flt("hud_opacity", m_HudOpacity, 0.1f, 1.0f);
+    s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
+    s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
+    s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
+    s_Flt("low_r", m_LowColor[0], 0.0f, 1.0f);
+    s_Flt("low_g", m_LowColor[1], 0.0f, 1.0f);
+    s_Flt("low_b", m_LowColor[2], 0.0f, 1.0f);
+
+    s_Bool("sound_enabled", m_SoundEnabled);
+    s_Int("sound_source", m_SoundSource, 0, 1);
+    s_Flt("sound_volume", m_SoundVolume, 0.0f, 1.0f);
+    s_Bool("fade_out_on", m_FadeOutOn);
+    s_Flt("fade_out_ms", m_FadeOutMs, 0.0f, 3000.0f);
+    s_Bool("fade_in_on", m_FadeInOn);
+    s_Flt("fade_in_ms", m_FadeInMs, 0.0f, 3000.0f);
+
+    if (const std::string* p = s_Find("preset_name")) m_PresetName = *p;
+    s_Str("custom_path", m_CustomPath, sizeof(m_CustomPath));
+    s_Str("action_patterns", m_ActionPatterns, sizeof(m_ActionPatterns));
+    if (m_ActionPatterns[0] == '\0') {
+        std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", "instinct,focus");
+    }
+    RebuildPatterns();
+
+    g_Key = m_InstinctKey;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +1001,39 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     m_LastUpdateTicks.store(s_Now.time_since_epoch().count());
     ++m_FrameCount;
 
+    // Only run the Instinct logic while Agent 47 actually exists, so nothing happens in the main menu / hub screens.
+    bool s_HasPlayer = false;
+    if (auto s_LocalHitman = SDK()->GetLocalPlayer()) {
+        s_HasPlayer = true;
+    }
+    m_HasPlayer = s_HasPlayer;
+
+    if (!s_HasPlayer) {
+        m_NoPlayerTime += s_Dt;
+        m_Active.store(false);
+        m_InputBlock = false;
+        g_Block = false;
+        m_PrevDown = false;
+
+        if (m_NoPlayerTime > 1.0f) { // really out of the mission (not just a short gap): start the next one fresh
+            m_Meter = 1.0f;
+            m_Locked = false;
+            m_Blocked = false;
+            m_NeedRelease = false;
+            m_ToggleState = false;
+            m_RechargeWait = 0.0f;
+            m_HoldVisible = 0.0f;
+
+            if (m_Touched) {
+                Globals::GameTimeManager->m_fGameTimeMultiplier = 1.0f;
+                m_CurrentScale = 1.0f;
+                m_Touched = false;
+            }
+        }
+        return;
+    }
+    m_NoPlayerTime = 0.0f;
+
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &s_ForegroundPid);
@@ -919,15 +1144,21 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 // HUD meter
 // ---------------------------------------------------------------------------
 
+float FocusForAll::Rand01() {
+    m_Rng = m_Rng * 1664525u + 1013904223u;
+    return static_cast<float>(m_Rng >> 8) * (1.0f / 16777216.0f);
+}
+
 void FocusForAll::DrawHud() {
     using clock = std::chrono::steady_clock;
     const auto s_Now = clock::now();
     const float s_Dt = std::min(std::chrono::duration<float>(s_Now - m_HudLast).count(), 0.1f);
     m_HudLast = s_Now;
 
-    // The game loop only runs during play, so no recent update = menu / loading screen: hide the HUD.
+    // In play = the game loop ran recently AND Agent 47 exists. Menus and loading screens hide the meter.
     const int64_t s_SinceUpdate = s_Now.time_since_epoch().count() - m_LastUpdateTicks.load();
-    const bool s_InPlay = std::chrono::duration_cast<std::chrono::milliseconds>(clock::duration(s_SinceUpdate)).count() < 250;
+    const bool s_InPlay = m_HasPlayer.load() &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::duration(s_SinceUpdate)).count() < 250;
     m_InPlay = s_InPlay;
     m_LastHudDt = s_Dt;
     const bool s_Preview = m_ShowUI; // while the settings window is open, always show the meter so it can be positioned
@@ -942,6 +1173,7 @@ void FocusForAll::DrawHud() {
     }
     m_HudAlpha += (s_TargetAlpha - m_HudAlpha) * std::clamp(8.0f * s_Dt, 0.0f, 1.0f);
     if (m_HudAlpha < 0.01f) {
+        m_Particles.clear();
         return;
     }
 
@@ -949,7 +1181,7 @@ void FocusForAll::DrawHud() {
     const float s_Ui = (s_Screen.y / 1080.0f) * m_HudScale;
     const float s_Thick = std::max(1.0f, std::round(s_Ui));
     const float s_W = s_Screen.x * m_HudWidth * m_HudScale;
-    const float s_H = std::max(4.0f, 7.0f * s_Ui);
+    const float s_H = std::max(5.0f, 9.0f * s_Ui);
     const float s_Cx = s_Screen.x * 0.5f;
     const float s_Bottom = s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f);
     const float s_Top = s_Bottom - s_H;
@@ -960,15 +1192,21 @@ void FocusForAll::DrawHud() {
     const float s_A = m_HudAlpha * m_HudOpacity;
     ImDrawList* s_Dl = ImGui::GetBackgroundDrawList();
 
-    // Fill color: light normally, blends to the "low" color when nearly empty, pulses while blocked.
+    auto s_Col = [](float r, float g, float b, float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, std::clamp(a, 0.0f, 1.0f)));
+    };
+
+    // Fill color: gold normally, blends to the "low" color when nearly empty, pulses while recharging.
     const float s_Low = 1.0f - std::clamp(m_Meter / kLowLevel, 0.0f, 1.0f);
-    ImVec4 s_Fill(
-        m_FillColor[0] + (m_LowColor[0] - m_FillColor[0]) * s_Low,
-        m_FillColor[1] + (m_LowColor[1] - m_FillColor[1]) * s_Low,
-        m_FillColor[2] + (m_LowColor[2] - m_FillColor[2]) * s_Low,
-        s_A);
+    float s_R = m_FillColor[0] + (m_LowColor[0] - m_FillColor[0]) * s_Low;
+    float s_G = m_FillColor[1] + (m_LowColor[1] - m_FillColor[1]) * s_Low;
+    float s_B = m_FillColor[2] + (m_LowColor[2] - m_FillColor[2]) * s_Low;
+    float s_FillA = s_A;
     if (m_Blocked) {
-        s_Fill = ImVec4(m_LowColor[0], m_LowColor[1], m_LowColor[2], s_A * (0.55f + 0.35f * std::sin(s_Time * 8.0f)));
+        s_R = m_LowColor[0];
+        s_G = m_LowColor[1];
+        s_B = m_LowColor[2];
+        s_FillA = s_A * (0.55f + 0.35f * std::sin(s_Time * 8.0f));
     }
 
     // Label above the bar.
@@ -976,37 +1214,89 @@ void FocusForAll::DrawHud() {
     ImFont* s_Font = ImGui::GetFont();
     const float s_FontSize = std::max(10.0f, ImGui::GetFontSize() * 0.8f * s_Ui);
     const ImVec2 s_TextSize = s_Font->CalcTextSizeA(s_FontSize, FLT_MAX, 0.0f, s_Label);
-    const ImVec2 s_TextPos(s_Cx - s_TextSize.x * 0.5f, s_Top - s_TextSize.y - 5.0f * s_Ui);
+    const ImVec2 s_TextPos(s_Cx - s_TextSize.x * 0.5f, s_Top - s_TextSize.y - 6.0f * s_Ui);
     s_Dl->AddText(s_Font, s_FontSize, ImVec2(s_TextPos.x + 1.0f, s_TextPos.y + 1.0f), IM_COL32(0, 0, 0, static_cast<int>(160 * s_A)), s_Label);
-    s_Dl->AddText(s_Font, s_FontSize, s_TextPos, ImGui::ColorConvertFloat4ToU32(ImVec4(0.95f, 0.95f, 0.95f, 0.8f * s_A)), s_Label);
+    s_Dl->AddText(s_Font, s_FontSize, s_TextPos, s_Col(1.0f, 0.93f, 0.75f, 0.85f * s_A), s_Label);
 
-    // Dark translucent backing.
-    s_Dl->AddRectFilled(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), IM_COL32(0, 0, 0, static_cast<int>(130 * s_A)));
-
-    // Fill grows outward from the center.
+    // Dark backing, then the grey "empty" track.
     const float s_Inset = s_Thick * 2.0f;
-    const float s_Half = std::max(0.0f, (s_W * 0.5f - s_Inset) * m_Meter);
-    if (s_Half > 0.5f) {
-        const ImU32 s_FillCol = ImGui::ColorConvertFloat4ToU32(s_Fill);
-        s_Dl->AddRectFilled(ImVec2(s_Cx - s_Half, s_Top + s_Inset), ImVec2(s_Cx + s_Half, s_Bottom - s_Inset), s_FillCol);
+    const float s_InnerL = s_Left + s_Inset;
+    const float s_InnerR = s_Right - s_Inset;
+    const float s_InnerT = s_Top + s_Inset;
+    const float s_InnerB = s_Bottom - s_Inset;
+    const float s_MidY = (s_InnerT + s_InnerB) * 0.5f;
+
+    s_Dl->AddRectFilled(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), IM_COL32(10, 10, 12, static_cast<int>(170 * s_A)));
+    s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_InnerR, s_InnerB), IM_COL32(88, 88, 92, static_cast<int>(120 * s_A)));
+
+    // Gold fill: darker at the start, brighter toward the tip.
+    const float s_HeadX = s_InnerL + (s_InnerR - s_InnerL) * m_Meter;
+    if (s_HeadX - s_InnerL > 0.5f) {
+        const ImU32 s_Dim = s_Col(s_R * 0.50f, s_G * 0.50f, s_B * 0.50f, s_FillA);
+        const ImU32 s_Bright = s_Col(s_R + (1.0f - s_R) * 0.35f, s_G + (1.0f - s_G) * 0.35f, s_B + (1.0f - s_B) * 0.35f, s_FillA);
+        s_Dl->AddRectFilledMultiColor(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerB), s_Dim, s_Bright, s_Bright, s_Dim);
 
         // Thin highlight along the top of the fill.
-        s_Dl->AddRectFilled(ImVec2(s_Cx - s_Half, s_Top + s_Inset), ImVec2(s_Cx + s_Half, s_Top + s_Inset + s_Thick),
+        s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerT + s_Thick),
                             IM_COL32(255, 255, 255, static_cast<int>(70 * s_A)));
     }
 
-    // Quarter ticks.
-    for (int i = 1; i <= 3; ++i) {
-        const float s_Off = (s_W * 0.5f - s_Inset) * (static_cast<float>(i) / 4.0f);
-        const ImU32 s_TickCol = IM_COL32(0, 0, 0, static_cast<int>(150 * s_A));
-        s_Dl->AddLine(ImVec2(s_Cx - s_Off, s_Top + s_Inset), ImVec2(s_Cx - s_Off, s_Bottom - s_Inset), s_TickCol, s_Thick);
-        s_Dl->AddLine(ImVec2(s_Cx + s_Off, s_Top + s_Inset), ImVec2(s_Cx + s_Off, s_Bottom - s_Inset), s_TickCol, s_Thick);
+    // Sparkle particles: spawn at the tip while Instinct is in use, drift up and fade out.
+    if (s_Active && m_Meter > 0.004f) {
+        m_EmitAcc += s_Dt * 60.0f;
+        while (m_EmitAcc >= 1.0f) {
+            m_EmitAcc -= 1.0f;
+            if (m_Particles.size() >= 160) break;
+
+            Particle s_P;
+            s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
+            s_P.y = s_InnerT + Rand01() * (s_InnerB - s_InnerT);
+            s_P.vx = (Rand01() - 0.5f) * 70.0f * s_Ui;
+            s_P.vy = -(12.0f + 55.0f * Rand01()) * s_Ui;
+            s_P.maxLife = 0.35f + 0.65f * Rand01();
+            s_P.life = s_P.maxLife;
+            s_P.size = (0.8f + 1.8f * Rand01()) * std::max(1.0f, s_Ui);
+            m_Particles.push_back(s_P);
+        }
+    } else {
+        m_EmitAcc = 0.0f;
     }
 
-    // Thin outline, brighter and gently pulsing while Instinct is active.
-    const float s_Border = s_Active ? 0.75f + 0.25f * std::sin(s_Time * 6.0f) : 0.45f;
-    s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom),
-                  ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, s_Border * s_A)), 0.0f, 0, s_Thick);
+    for (auto& s_P : m_Particles) {
+        s_P.life -= s_Dt;
+        s_P.x += s_P.vx * s_Dt;
+        s_P.y += s_P.vy * s_Dt;
+        s_P.vy += 40.0f * s_Ui * s_Dt; // slight pull down so the sparks arc
+    }
+    m_Particles.erase(std::remove_if(m_Particles.begin(), m_Particles.end(), [](const Particle& p) { return p.life <= 0.0f; }),
+                      m_Particles.end());
+
+    for (const auto& s_P : m_Particles) {
+        const float s_K = s_P.life / s_P.maxLife;
+        s_Dl->AddCircleFilled(ImVec2(s_P.x, s_P.y), s_P.size * (0.5f + 0.5f * s_K),
+                              s_Col(s_R + (1.0f - s_R) * 0.55f, s_G + (1.0f - s_G) * 0.55f, s_B + (1.0f - s_B) * 0.55f, s_K * s_A), 6);
+    }
+
+    // Bright spark at the tip of the fill (stronger while Instinct is in use).
+    if (m_Meter > 0.004f) {
+        const float s_Pulse = s_Active ? 0.85f + 0.15f * std::sin(s_Time * 14.0f) : 0.5f;
+        const float s_Rad = s_H * (s_Active ? 0.95f : 0.7f);
+
+        for (int i = 0; i < 4; ++i) { // soft glow
+            const float s_Rr = s_Rad * (2.6f - 0.6f * static_cast<float>(i));
+            s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_MidY), s_Rr, s_Col(s_R, s_G, s_B, (0.06f + 0.05f * static_cast<float>(i)) * s_Pulse * s_A), 20);
+        }
+        s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_MidY), s_Rad * 0.5f, s_Col(1.0f, 0.97f, 0.88f, 0.95f * s_Pulse * s_A), 12);
+
+        const float s_Len = s_Rad * (2.3f + (s_Active ? 0.6f * std::sin(s_Time * 10.0f) : 0.0f));
+        const ImU32 s_Star = s_Col(1.0f, 0.97f, 0.88f, 0.8f * s_Pulse * s_A);
+        s_Dl->AddLine(ImVec2(s_HeadX - s_Len, s_MidY), ImVec2(s_HeadX + s_Len, s_MidY), s_Star, s_Thick);
+        s_Dl->AddLine(ImVec2(s_HeadX, s_MidY - s_Len * 0.8f), ImVec2(s_HeadX, s_MidY + s_Len * 0.8f), s_Star, s_Thick);
+    }
+
+    // Thin outline, a little brighter while Instinct is active.
+    const float s_Border = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
+    s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
 }
 
 // ---------------------------------------------------------------------------
