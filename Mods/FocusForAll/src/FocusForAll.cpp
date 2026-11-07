@@ -814,6 +814,7 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     GetWindowThreadProcessId(GetForegroundWindow(), &s_ForegroundPid);
     const bool s_GameFocused = s_ForegroundPid == GetCurrentProcessId() && !m_Binding;
     const bool s_KeyDown = s_GameFocused && InstinctKeyDown();
+    const bool s_PressEdge = s_KeyDown && !m_PrevDown;
 
     g_Key = m_InstinctKey;
 
@@ -825,6 +826,18 @@ void FocusForAll::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     g_Block = m_BlockEnabled && m_Blocked;
     // Same at the game level: the game is told the Instinct action is not pressed.
     m_InputBlock = (m_BlockEnabled && m_Blocked) || m_ForceBlockTest;
+
+    // Safety net that doesn't depend on knowing the game's action name: while Instinct is unusable and the
+    // player presses/holds the key, undo it the same way as when the meter runs dry (inject a key release).
+    //  - Hold mode: release every frame while the key is held (also beats key auto-repeat).
+    //  - Toggle mode: tap once on the press, which flips the game's Instinct straight back off.
+    if (m_BlockEnabled && m_Blocked && s_KeyDown) {
+        if (m_ToggleMode) {
+            if (s_PressEdge) ForceReleaseInstinct();
+        } else {
+            ForceReleaseInstinct();
+        }
+    }
 
     // A key press that happened while blocked (or that we force-released) must be released before Instinct can start again.
     if (!s_KeyDown) {
