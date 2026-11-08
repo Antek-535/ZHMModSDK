@@ -24,31 +24,7 @@
 
 // Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
-// Full scene search (finds everything Instinct changes). Plain data, kept at namespace level so the cpp helpers can use it.
-struct SFullRec {                // one recorded value (compact: millions of these can exist)
-    uintptr_t m_Key = 0;         // entity address
-    const SPropertyData* m_Prop = nullptr;
-    uint32_t m_Id = 0;           // property id
-    float m_V[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    uint8_t m_Comps = 1;
-    uint8_t m_Kind = 0;          // 0 = float-like, 1 = bool, 2 = int32
-};
-struct SFullDiffItem {           // one value that changed during Instinct
-    ZEntityRef m_Entity;
-    const SPropertyData* m_Prop = nullptr;
-    uint32_t m_Id = 0;
-    uint8_t m_Comps = 1;
-    uint8_t m_Kind = 0;
-    float m_Before[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // the normal value
-    size_t m_Group = 0;
-};
-struct SFullGroup {              // entries with the same entity type + property are shown as one line
-    std::string m_Text;
-    std::string m_Label;
-    int m_Count = 0;
-    bool m_Pinnable = true;
-    bool m_Pinned = false;       // switched on = held at its normal value while Instinct is active
-};
+struct SLutGpu; // GPU-side state of the Instinct color-grading texture (defined in the cpp)
 
 class BetterInstinct : public IPluginInterface {
 public:
@@ -71,93 +47,26 @@ private:
     bool m_ConfigReady = false;
     void DrawHud();
 
-    // Instinct color tint: a smooth 0..1 blend follows Instinct on/off and is handed to the engine layer.
-    // The tint is a multiplier on the world's color grading (white = unchanged). It is never an ImGui
-    // overlay, so the game's own UI, menus and map are not affected.
+    // Custom Instinct color. The grey Instinct look is a color-grading lookup table (LUT) texture of the scene render.
+    // We recolor a copy of the game's own LUT and write it into that texture, so the grey is replaced, not mixed, and
+    // the UI, menus and map are never affected (it is not an overlay).
     void UpdateTint(float p_Dt, bool p_Active);
-    void ApplyTint(float p_Blend);
     void RestoreTint();
-
-    // Engine layer: finds the post-filter entities of the loaded scene and drives one color property on them.
-    // Everything here runs on the game-loop thread; the settings window only reads counters and the report.
-    struct STintTarget {
-        ZEntityRef m_Entity;
-        uint32_t m_PropertyId = 0;
-        decltype(SPropertyInfo::m_Type) m_Type = nullptr; // the property's own reflection type (SColorRGB / SColorRGBA / SVector3)
-        int m_Components = 3;                             // 3 = RGB, 4 = RGBA (alpha is kept as it was)
-        float m_Original[4] = {1.0f, 1.0f, 1.0f, 1.0f};   // value found at scan time, restored when the tint ends
-    };
-    struct STintReportItem {
-        std::string m_Text; // "EntityType.propertyName : valueType"
-        std::string m_Prop; // just the property name (what the picker stores)
-    };
-    void ScanTintTargets();
-    bool WriteTintTarget(STintTarget& p_Target, const float* p_Rgb);
-    std::vector<STintTarget> m_TintTargets;
-    bool m_TintScanDone = false;
-    int m_TintScanTries = 0;
-    float m_TintScanCooldown = 2.0f;
-    float m_TintLastWritten[3] = {1.0f, 1.0f, 1.0f};
-    bool m_TintWritten = false;
-    std::atomic<bool> m_TintRescan{false};
-    std::atomic<int> m_TintTargetCount{0};
-    std::atomic<int> m_TintMatchedEntities{0};
-    std::atomic<int> m_TintScanned{0};
-    bool m_TintForceTest = false;                    // debug: show the tint without Instinct, to check the hook
-    std::mutex m_TintReportMutex;
-    std::vector<STintReportItem> m_TintReport;
-
-    // "Find what Instinct changes": records the post-filter values in the normal look and during Instinct, lists what
-    // differs, and can hold chosen properties at their normal value while Instinct is active (removes the grey).
-    struct SSnapItem {
-        STintTarget m_Target;        // entity + property + type; m_Original = the value that was recorded
-        uintptr_t m_Key = 0;         // entity address (to match the same entity in both recordings)
-        size_t m_Offset = 0;         // where the value lives inside the entity
-        std::string m_Label;         // "EntityType.property : valueType"
-        std::string m_PropName;
-        bool m_Pinnable = true;      // false for bool / int values (listed only)
-    };
-    void RecordPostfilter(std::vector<SSnapItem>& p_Out);
-    void BuildInstinctDiff(const std::vector<SSnapItem>& p_Now);
-    void RebuildPins();
-    void WritePins();
-    std::vector<SSnapItem> m_SnapNormal;
-    std::vector<SSnapItem> m_Pins;                 // the part of m_SnapNormal whose property name matches m_PinPropPattern
-    std::atomic<bool> m_SnapNormalReq{false};
-    std::atomic<bool> m_SnapInstinctArmed{false};
-    std::atomic<bool> m_SnapHaveNormal{false};
-    std::atomic<bool> m_PinRebuild{false};
-    std::atomic<int> m_SnapNormalCount{0};
-    std::atomic<int> m_SnapChangedCount{-1};       // -1 = no Instinct recording yet
-    float m_SnapHoldTime = 0.0f;
-    float m_SnapAutoCooldown = 3.0f;
-    std::vector<STintReportItem> m_DiffReport;     // guarded by m_TintReportMutex
-    char m_PinPropPattern[128] = {};               // comma-separated parts of property names held at their normal value
-
-    // --- Full scene search ---
-    void UpdateFullSearch(float p_Dt, bool p_Instinct);
-    void WriteFullPins();
-    bool WriteFullRec(const SFullDiffItem& p_Item, const float* p_Values);
-    void SaveFullReport();
-    std::vector<SFullRec> m_FullA;                 // first normal recording (dropped once the noise is known)
-    std::vector<SFullRec> m_FullB;                 // second normal recording (compared against Instinct)
-    std::vector<std::pair<uintptr_t, uint32_t>> m_FullNoise; // values that moved on their own, sorted
-    std::vector<SFullDiffItem> m_FullDiff;         // game thread only
-    std::vector<SFullGroup> m_FullGroups;          // guarded by m_TintReportMutex
-    int m_FullPhase = 0;                           // 0 idle, 1 waiting for the second normal recording, 2 normal look ready
-    float m_FullTimer = 0.0f;
-    float m_FullHold = 0.0f;
-    bool m_FullUseGetters = false;                 // also read properties that sit behind getter functions (riskier)
-    std::atomic<bool> m_FullRecordReq{false};
-    std::atomic<bool> m_FullInstinctArmed{false};
-    std::atomic<bool> m_FullSaveReq{false};
-    std::atomic<int> m_FullStatus{0};              // 0 nothing, 1 normal look recorded, 2 Instinct compared
-    std::atomic<int> m_FullRecCount{0};
-    std::atomic<int> m_FullNoiseCount{0};
-    std::atomic<int> m_FullChangedCount{-1};
-    std::atomic<int> m_FullEntities{0};
-    std::atomic<int> m_FullReportSaved{0};         // 1 = saved, -1 = could not write the file
-    std::atomic<float> m_FullWait{0.0f};
+    bool EnsureLut();
+    bool LutStillValid() const;
+    void ReleaseLut();
+    void SetLutStatus(int p_State, const std::string& p_Text);
+    SLutGpu* m_Lut = nullptr;
+    bool m_LutApplied = false;                     // our recolored LUT is currently in the texture
+    uint32_t m_LutAppliedSig = 0;                  // settings the texture currently reflects
+    std::atomic<uint32_t> m_LutFailSig{0};         // settings that failed to write (not retried until they change)
+    float m_LutPoll = 0.0f;
+    float m_LutCooldown = 0.0f;
+    std::atomic<bool> m_LutReread{false};
+    std::atomic<int> m_LutState{0};                // 0 idle, 1 not found yet, 2 error, 3 ready, 4 active
+    std::atomic<uint32_t> m_LutWrites{0};
+    std::string m_LutStatus;                       // guarded by m_LutMutex
+    std::mutex m_LutMutex;
 
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
     void LoadSoundText();
@@ -223,11 +132,6 @@ private:
     bool m_InPlay = false;
     float m_LastHudDt = 0.016f;
 
-    // --- Instinct tint runtime state ---
-    std::atomic<float> m_TintBlend{0.0f};           // 0 = no tint, 1 = full tint (follows Instinct smoothly)
-    float m_TintMultiplier[3] = {1.0f, 1.0f, 1.0f}; // what the engine layer should apply (white = neutral)
-    bool m_TintApplied = false;                     // true while non-neutral values are pushed to the engine
-    bool m_TintHookReady = false;                   // true once ApplyTint really reaches the engine
     std::chrono::steady_clock::time_point m_LastFrame = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point m_HudLast = std::chrono::steady_clock::now();
     std::atomic<uint32_t> m_FrameCount{0};
@@ -377,11 +281,11 @@ private:
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
 
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
-    float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color Instinct tints the world with
-    float m_TintStrength = 0.70f;    // 0 = no visible tint, 1 = the full chosen color
-    bool m_TintKeepBrightness = true; // keep the picture as bright as vanilla Instinct (a plain color multiply makes it much darker)
-    char m_TintTypePattern[64] = "postfilter"; // entities whose type name contains this (case-insensitive) are searched
-    char m_TintPropPattern[128] = {};          // comma-separated parts of the color property name to drive (pick one in the list)
+    float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color that replaces Instinct's grey
+    float m_TintStrength = 1.00f;    // 1 = the grey is completely replaced, lower keeps part of the vanilla look
+    float m_TintBrightness = 1.00f;  // brightness of the replacement color
+    bool m_TintKeepBrightness = true; // keep the picture about as bright as vanilla Instinct (dark colors would be much darker)
+    int m_LutBarrier = 0;            // GPU state the texture is in while the game isn't using it: 0 = shader resource, 1 = common
 
     bool m_SoundEnabled = true;
     int m_SoundSource = 0;           // 0 = preset / folder, 1 = custom file
