@@ -15,19 +15,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
-#include <queue>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include <imgui.h>
+#include <wrl/client.h>
 
 #include "Functions.h"
 #include "Hooks.h"
@@ -760,8 +761,9 @@ void BetterInstinct::LoadSettings() {
     m_InstinctTint[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_r", m_InstinctTint[0])), 0.0f, 1.0f);
     m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
     m_InstinctTint[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_b", m_InstinctTint[2])), 0.0f, 1.0f);
-    m_TintStrength = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_strength", m_TintStrength)), 0.0f, 1.0f);
+    m_TintStrength = std::clamp(static_cast<float>(GetSettingDouble(kSection, "lut_strength", m_TintStrength)), 0.0f, 1.0f);
     m_TintKeepBrightness = GetSettingBool(kSection, "tint_keep_brightness", m_TintKeepBrightness);
+    m_TintBrightness = std::clamp(static_cast<float>(GetSettingDouble(kSection, "lut_brightness", m_TintBrightness)), 0.25f, 3.0f);
 
     // Older versions saved a plain white meter colour: switch to the new gold look once.
     if (GetSettingInt(kSection, "hud_style", 0) < 2) {
@@ -809,8 +811,9 @@ void BetterInstinct::SaveSettings() {
     SetSettingDouble(kSection, "tint_r", m_InstinctTint[0]);
     SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
     SetSettingDouble(kSection, "tint_b", m_InstinctTint[2]);
-    SetSettingDouble(kSection, "tint_strength", m_TintStrength);
+    SetSettingDouble(kSection, "lut_strength", m_TintStrength);
     SetSettingBool(kSection, "tint_keep_brightness", m_TintKeepBrightness);
+    SetSettingDouble(kSection, "lut_brightness", m_TintBrightness);
 
     SetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     SetSettingInt(kSection, "sound_source", m_SoundSource);
@@ -932,8 +935,10 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("tint_r", m_InstinctTint[0]);
         s_Flt("tint_g", m_InstinctTint[1]);
         s_Flt("tint_b", m_InstinctTint[2]);
-        s_Flt("tint_strength", m_TintStrength);
+        s_Flt("lut_strength", m_TintStrength);
         s_Bool("tint_keep_brightness", m_TintKeepBrightness);
+        s_Flt("lut_brightness", m_TintBrightness);
+        s_Int("lut_barrier", m_LutBarrier);
 
         s_Bool("sound_enabled", m_SoundEnabled);
         s_Int("sound_source", m_SoundSource);
@@ -946,9 +951,6 @@ bool BetterInstinct::SaveConfigFile() {
         s_Str("preset_name", m_PresetName);
         s_Str("custom_path", m_CustomPath);
         s_Str("action_patterns", m_ActionPatterns);
-        s_Str("tint_type_pattern", m_TintTypePattern);
-        s_Str("tint_prop_pattern", m_TintPropPattern);
-        s_Str("pin_prop_pattern", m_PinPropPattern);
 
         s_File.flush();
         if (!s_File.good()) return false;
@@ -1067,8 +1069,10 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("tint_r", m_InstinctTint[0], 0.0f, 1.0f);
     s_Flt("tint_g", m_InstinctTint[1], 0.0f, 1.0f);
     s_Flt("tint_b", m_InstinctTint[2], 0.0f, 1.0f);
-    s_Flt("tint_strength", m_TintStrength, 0.0f, 1.0f);
+    s_Flt("lut_strength", m_TintStrength, 0.0f, 1.0f);
     s_Bool("tint_keep_brightness", m_TintKeepBrightness);
+    s_Flt("lut_brightness", m_TintBrightness, 0.25f, 3.0f);
+    s_Int("lut_barrier", m_LutBarrier, 0, 1);
 
     s_Bool("sound_enabled", m_SoundEnabled);
     s_Int("sound_source", m_SoundSource, 0, 1);
@@ -1081,10 +1085,6 @@ bool BetterInstinct::LoadConfigFile() {
     if (const std::string* p = s_Find("preset_name")) m_PresetName = *p;
     s_Str("custom_path", m_CustomPath, sizeof(m_CustomPath));
     s_Str("action_patterns", m_ActionPatterns, sizeof(m_ActionPatterns));
-    s_Str("tint_type_pattern", m_TintTypePattern, sizeof(m_TintTypePattern));
-    s_Str("tint_prop_pattern", m_TintPropPattern, sizeof(m_TintPropPattern));
-    s_Str("pin_prop_pattern", m_PinPropPattern, sizeof(m_PinPropPattern));
-    if (m_TintTypePattern[0] == '\0') std::snprintf(m_TintTypePattern, sizeof(m_TintTypePattern), "%s", "postfilter");
     if (m_ActionPatterns[0] == '\0') {
         std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", "instinct,focus");
     }
@@ -2755,1012 +2755,657 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// Instinct color tint
+// Instinct color (replaces the grey Instinct color-grading LUT)
 // ---------------------------------------------------------------------------
-
-// Runs every frame (also outside missions, with p_Active = false, so the tint always fades out and is restored).
-void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
-    const bool s_InPlay = m_HasPlayer.load();
-
-    // Entities of an unloaded scene are gone: forget them without touching them.
-    if (!s_InPlay) {
-        if (m_NoPlayerTime > 0.25f && (!m_TintTargets.empty() || m_TintScanDone || m_TintApplied)) {
-            m_TintTargets.clear();
-            m_TintTargetCount = 0;
-            m_TintScanDone = false;
-            m_TintScanTries = 0;
-            m_TintScanCooldown = 2.0f;
-            m_TintWritten = false;
-            m_TintApplied = false;
-            m_TintHookReady = false;
-            m_TintBlend.store(0.0f);
-            m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
-        }
-        if (m_NoPlayerTime > 0.25f && (m_FullPhase != 0 || !m_FullDiff.empty() || !m_FullB.empty() || m_FullStatus.load() != 0)) {
-            m_FullA.clear();
-            m_FullB.clear();
-            m_FullNoise.clear();
-            m_FullDiff.clear();
-            {
-                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
-                m_FullGroups.clear();
-            }
-            m_FullPhase = 0;
-            m_FullStatus = 0;
-            m_FullChangedCount = -1;
-            m_FullInstinctArmed = false;
-            m_FullRecordReq = false;
-        }
-        if (m_NoPlayerTime > 0.25f && (m_SnapHaveNormal.load() || !m_SnapNormal.empty())) {
-            m_SnapNormal.clear();
-            m_Pins.clear();
-            m_SnapHaveNormal = false;
-            m_SnapAutoCooldown = 3.0f;
-            m_SnapHoldTime = 0.0f;
-        }
-        return;
-    }
-
-    // Find the post-filter properties once per mission (a few retries, because parts of the scene stream in later).
-    if (m_TintRescan.exchange(false)) {
-        RestoreTint();
-        m_TintScanDone = false;
-        m_TintScanTries = 0;
-        m_TintScanCooldown = 0.0f;
-    }
-    if (m_TintEnabled && !m_TintScanDone) {
-        m_TintScanCooldown -= p_Dt;
-        if (m_TintScanCooldown <= 0.0f) {
-            ScanTintTargets();
-            ++m_TintScanTries;
-            m_TintScanCooldown = 3.0f;
-            if (!m_TintTargets.empty() || m_TintScanTries >= 4) m_TintScanDone = true;
-        }
-    }
-
-    // --- Find what Instinct changes / hold the grey at its normal value ---
-    const bool s_Instinct = p_Active;
-    if (m_PinPropPattern[0] != '\0' && !m_SnapHaveNormal.load() && !s_Instinct && m_TintBlend.load() <= 0.0f) {
-        m_SnapAutoCooldown -= p_Dt; // once per mission, a few seconds after the scene is up
-        if (m_SnapAutoCooldown <= 0.0f) m_SnapNormalReq = true;
-    }
-    if (m_SnapNormalReq.load() && !s_Instinct && m_TintBlend.load() <= 0.0f) {
-        m_SnapNormalReq = false;
-        RecordPostfilter(m_SnapNormal);
-        m_SnapHaveNormal = !m_SnapNormal.empty();
-        m_SnapNormalCount = static_cast<int>(m_SnapNormal.size());
-        m_SnapAutoCooldown = 3.0f;
-        m_PinRebuild = true;
-    }
-    if (m_SnapInstinctArmed.load()) {
-        if (s_Instinct && m_SnapHaveNormal.load()) {
-            m_SnapHoldTime += p_Dt; // wait until Instinct has fully faded in
-            if (m_SnapHoldTime >= 0.8f) {
-                std::vector<SSnapItem> s_Now;
-                RecordPostfilter(s_Now);
-                BuildInstinctDiff(s_Now);
-                m_SnapInstinctArmed = false;
-                m_SnapHoldTime = 0.0f;
-            }
-        } else {
-            m_SnapHoldTime = 0.0f;
-        }
-    }
-    if (m_PinRebuild.exchange(false)) RebuildPins();
-    if (s_Instinct && !m_Pins.empty() && !m_SnapInstinctArmed.load()) WritePins();
-    UpdateFullSearch(p_Dt, s_Instinct);
-
-    const float s_Target = (m_TintEnabled && !m_SnapInstinctArmed.load() && !m_FullInstinctArmed.load() && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
-
-    float s_Blend = m_TintBlend.load();
-    s_Blend += (s_Target - s_Blend) * std::clamp(m_BlendSpeed * p_Dt, 0.0f, 1.0f);
-    if (std::abs(s_Target - s_Blend) < 0.002f) s_Blend = s_Target;
-    m_TintBlend.store(s_Blend);
-
-    if (s_Blend > 0.0f) {
-        ApplyTint(s_Blend);
-    } else if (m_TintApplied) {
-        RestoreTint();
-    }
-}
-
-void BetterInstinct::ApplyTint(float p_Blend) {
-    // A multiplier on the world's colors: 1 = unchanged, so blend 0 or strength 0 is exactly the vanilla look.
-    const float s_Amount = std::clamp(p_Blend * m_TintStrength, 0.0f, 1.0f);
-
-    float s_Color[3];
-    for (int i = 0; i < 3; ++i) s_Color[i] = std::clamp(m_InstinctTint[i], 0.0f, 1.0f);
-
-    // Instinct's own grey look is already in the picture, and multiplying grey by a color (e.g. red = 1, 0, 0) throws
-    // away most of its brightness, so the result looks dark and still grey. With "keep brightness" the color is scaled
-    // so its perceived brightness equals the untinted picture: the world gets the hue without getting darker.
-    if (m_TintKeepBrightness) {
-        const float s_Luma = 0.2126f * s_Color[0] + 0.7152f * s_Color[1] + 0.0722f * s_Color[2];
-        const float s_Gain = std::min(1.0f / std::max(s_Luma, 0.001f), 6.0f);
-        for (int i = 0; i < 3; ++i) s_Color[i] *= s_Gain;
-    }
-
-    for (int i = 0; i < 3; ++i) {
-        m_TintMultiplier[i] = 1.0f + (s_Color[i] - 1.0f) * s_Amount;
-    }
-    m_TintApplied = true;
-
-    if (m_TintTargets.empty()) {
-        m_TintHookReady = false;
-        return;
-    }
-
-    // Only touch the engine when the value really moved (each write runs the entity's change handlers).
-    bool s_Moved = !m_TintWritten;
-    for (int i = 0; i < 3; ++i) {
-        if (std::abs(m_TintMultiplier[i] - m_TintLastWritten[i]) > 0.002f) s_Moved = true;
-    }
-    if (!s_Moved) return;
-
-    // ENGINE LAYER: the post-filter is part of the 3D scene render, so the UI, menus and map stay untouched.
-    // The written value is (original value) * (tint multiplier), so a white original becomes exactly the tint.
-    bool s_AnyOk = false;
-    for (auto& s_Target : m_TintTargets) {
-        const float s_Value[3] = {
-            s_Target.m_Original[0] * m_TintMultiplier[0],
-            s_Target.m_Original[1] * m_TintMultiplier[1],
-            s_Target.m_Original[2] * m_TintMultiplier[2],
-        };
-        if (WriteTintTarget(s_Target, s_Value)) s_AnyOk = true;
-    }
-
-    for (int i = 0; i < 3; ++i) m_TintLastWritten[i] = m_TintMultiplier[i];
-    m_TintWritten = true;
-    m_TintHookReady = s_AnyOk;
-}
-
-void BetterInstinct::RestoreTint() {
-    // Put back exactly what was found at scan time (only while the scene's entities are alive).
-    if (m_TintWritten && m_HasPlayer.load()) {
-        for (auto& s_Target : m_TintTargets) {
-            WriteTintTarget(s_Target, s_Target.m_Original);
-        }
-    }
-
-    m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
-    m_TintLastWritten[0] = m_TintLastWritten[1] = m_TintLastWritten[2] = 1.0f;
-    m_TintWritten = false;
-    m_TintApplied = false;
-}
-
-bool BetterInstinct::WriteTintTarget(STintTarget& p_Target, const float* p_Rgb) {
-    if (!p_Target.m_Entity.GetEntity() || !p_Target.m_Type) return false;
-
-    // Same pattern the SDK's Editor uses: wrap a raw value in a ZObjectRef of the property's own type.
-    float s_Buffer[4] = {p_Rgb[0], p_Rgb[1], p_Rgb[2], p_Target.m_Components == 4 ? p_Target.m_Original[3] : 0.0f};
-    ZObjectRef s_Value;
-    s_Value.Assign(p_Target.m_Type, s_Buffer);
-    return p_Target.m_Entity.SetProperty(p_Target.m_PropertyId, s_Value, true);
-}
-
-// Walks every loaded brick the way the SDK's Editor builds its entity tree, looking for entities whose type name matches
-// m_TintTypePattern. Their color-typed properties go into the report (for the picker); the ones whose name matches
-// m_TintPropPattern become tint targets.
-void BetterInstinct::ScanTintTargets() {
-    m_TintTargets.clear();
-    m_TintTargetCount = 0;
-    m_TintMatchedEntities = 0;
-    m_TintScanned = 0;
-
-    std::vector<STintReportItem> s_Report;
-    std::set<std::string> s_ReportSeen;
-
-    auto s_Lower = [](std::string s_Text) {
-        std::transform(s_Text.begin(), s_Text.end(), s_Text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        return s_Text;
-    };
-    auto s_Split = [&](const char* p_Text) {
-        std::vector<std::string> s_Out;
-        std::string s_Cur;
-        auto s_Flush = [&]() {
-            const size_t a = s_Cur.find_first_not_of(" \t");
-            if (a != std::string::npos) s_Out.push_back(s_Lower(s_Cur.substr(a, s_Cur.find_last_not_of(" \t") - a + 1)));
-            s_Cur.clear();
-        };
-        for (const char* p = p_Text; *p; ++p) {
-            if (*p == ',') s_Flush(); else s_Cur += *p;
-        }
-        s_Flush();
-        return s_Out;
-    };
-
-    const std::string s_TypePattern = s_Lower(m_TintTypePattern);
-    const std::vector<std::string> s_PropPatterns = s_Split(m_TintPropPattern);
-
-    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
-    if (s_TypePattern.empty() || !s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) {
-        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-        m_TintReport.clear();
-        return;
-    }
-
-    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
-    std::unordered_set<ZEntityRef> s_Visited;
-    std::unordered_set<ZEntityRef> s_Expanded;
-
-    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
-        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
-            s_Queue.emplace(p_Factory, p_Root);
-        }
-    };
-
-    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
-        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
-        if (!s_BrickEntity) continue;
-        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
-    }
-
-    int s_Scanned = 0;
-    int s_Matched = 0;
-    constexpr int kMaxEntities = 600000; // safety cap
-
-    while (!s_Queue.empty() && s_Scanned < kMaxEntities) {
-        const auto [s_Factory, s_Root] = s_Queue.front();
-        s_Queue.pop();
-
-        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
-        for (int i = 0; i < s_SubCount && s_Scanned < kMaxEntities; ++i) {
-            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
-            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
-
-            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
-            if (!s_Visited.insert(s_Sub).second) {
-                s_Enqueue(s_SubFactory, s_Sub);
-                continue;
-            }
-            ++s_Scanned;
-            s_Enqueue(s_SubFactory, s_Sub);
-
-            const auto* s_Type = s_Sub->GetType();
-            if (!s_Type->m_pInterfaceData || !s_Type->m_pPropertyData) continue;
-
-            std::string s_TypeName;
-            for (const auto& s_Interface : *s_Type->m_pInterfaceData) {
-                if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
-                const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
-                if (s_Name && ContainsNoCase(s_Name, s_TypePattern)) {
-                    s_TypeName = s_Name;
-                    break;
-                }
-            }
-            if (s_TypeName.empty()) continue;
-            ++s_Matched;
-
-            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
-                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
-                const auto* s_Info = s_Property->GetPropertyInfo();
-                if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) continue;
-
-                const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
-                if (!s_ValueType) continue;
-                const bool s_IsRgb = std::strcmp(s_ValueType, "SColorRGB") == 0 || std::strcmp(s_ValueType, "SVector3") == 0;
-                const bool s_IsRgba = std::strcmp(s_ValueType, "SColorRGBA") == 0;
-                if (!s_IsRgb && !s_IsRgba) continue;
-
-                char s_Hex[16];
-                std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", s_Property->m_nPropertyID);
-                const std::string s_PropName = (s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
-
-                const std::string s_Line = s_TypeName + "." + s_PropName + " : " + s_ValueType;
-                if (s_ReportSeen.insert(s_Line).second && s_Report.size() < 400) {
-                    s_Report.push_back({s_Line, s_PropName});
-                }
-
-                // Is this the property the player picked?
-                bool s_Wanted = false;
-                const std::string s_PropLower = s_Lower(s_PropName);
-                for (const auto& s_Pattern : s_PropPatterns) {
-                    if (s_PropLower.find(s_Pattern) != std::string::npos) { s_Wanted = true; break; }
-                }
-                if (!s_Wanted) continue;
-
-                // Plain data members only: properties behind a getter/setter can't be read back safely here.
-                if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
-
-                STintTarget s_Target;
-                s_Target.m_Entity = s_Sub;
-                s_Target.m_PropertyId = s_Property->m_nPropertyID;
-                s_Target.m_Type = s_Info->m_propertyInfo.m_Type;
-                s_Target.m_Components = s_IsRgba ? 4 : 3;
-
-                const float* s_Raw = reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(s_Sub.m_pObj) + s_Property->m_nPropertyOffset);
-                bool s_Sane = true;
-                for (int k = 0; k < s_Target.m_Components; ++k) {
-                    s_Target.m_Original[k] = s_Raw[k];
-                    if (!std::isfinite(s_Raw[k]) || std::abs(s_Raw[k]) > 1000.0f) s_Sane = false;
-                }
-                if (s_Sane) m_TintTargets.push_back(std::move(s_Target));
-            }
-        }
-    }
-
-    m_TintScanned = s_Scanned;
-    m_TintMatchedEntities = s_Matched;
-    m_TintTargetCount = static_cast<int>(m_TintTargets.size());
-    m_TintWritten = false;
-
-    std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-    m_TintReport = std::move(s_Report);
-}
-
-// Reads every plain number-like property (float, vectors, colors, bool, int) of the post-filter entities.
-void BetterInstinct::RecordPostfilter(std::vector<SSnapItem>& p_Out) {
-    p_Out.clear();
-
-    auto s_Lower = [](std::string s_Text) {
-        std::transform(s_Text.begin(), s_Text.end(), s_Text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        return s_Text;
-    };
-    const std::string s_TypePattern = s_Lower(m_TintTypePattern);
-
-    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
-    if (s_TypePattern.empty() || !s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) {
-        return;
-    }
-
-    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
-    std::unordered_set<ZEntityRef> s_Visited;
-    std::unordered_set<ZEntityRef> s_Expanded;
-
-    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
-        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
-            s_Queue.emplace(p_Factory, p_Root);
-        }
-    };
-
-    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
-        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
-        if (!s_BrickEntity) continue;
-        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
-    }
-
-    int s_Scanned = 0;
-    int s_Matched = 0;
-    constexpr int kMaxEntities = 600000; // safety cap
-
-    while (!s_Queue.empty() && s_Scanned < kMaxEntities) {
-        const auto [s_Factory, s_Root] = s_Queue.front();
-        s_Queue.pop();
-
-        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
-        for (int i = 0; i < s_SubCount && s_Scanned < kMaxEntities; ++i) {
-            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
-            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
-
-            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
-            if (!s_Visited.insert(s_Sub).second) {
-                s_Enqueue(s_SubFactory, s_Sub);
-                continue;
-            }
-            ++s_Scanned;
-            s_Enqueue(s_SubFactory, s_Sub);
-
-            const auto* s_Type = s_Sub->GetType();
-            if (!s_Type->m_pInterfaceData || !s_Type->m_pPropertyData) continue;
-
-            std::string s_TypeName;
-            for (const auto& s_Interface : *s_Type->m_pInterfaceData) {
-                if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
-                const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
-                if (s_Name && ContainsNoCase(s_Name, s_TypePattern)) {
-                    s_TypeName = s_Name;
-                    break;
-                }
-            }
-            if (s_TypeName.empty()) continue;
-            ++s_Matched;
-
-            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
-                if (p_Out.size() >= 80000) break;
-
-                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
-                const auto* s_Info = s_Property->GetPropertyInfo();
-                if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) continue;
-                if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
-
-                const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
-                if (!s_ValueType) continue;
-
-                int s_Comps = 0;
-                bool s_Pinnable = true;
-                bool s_IsBool = false;
-                bool s_IsInt = false;
-                if (std::strcmp(s_ValueType, "float32") == 0 || std::strcmp(s_ValueType, "float") == 0) s_Comps = 1;
-                else if (std::strcmp(s_ValueType, "SVector2") == 0) s_Comps = 2;
-                else if (std::strcmp(s_ValueType, "SVector3") == 0 || std::strcmp(s_ValueType, "SColorRGB") == 0) s_Comps = 3;
-                else if (std::strcmp(s_ValueType, "SVector4") == 0 || std::strcmp(s_ValueType, "SColorRGBA") == 0) s_Comps = 4;
-                else if (std::strcmp(s_ValueType, "bool") == 0) { s_Comps = 1; s_Pinnable = false; s_IsBool = true; }
-                else if (std::strcmp(s_ValueType, "int32") == 0) { s_Comps = 1; s_Pinnable = false; s_IsInt = true; }
-                else continue;
-
-                const uintptr_t s_Address = reinterpret_cast<uintptr_t>(s_Sub.m_pObj) + s_Property->m_nPropertyOffset;
-                float s_Values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                if (s_IsBool) {
-                    s_Values[0] = *reinterpret_cast<const uint8_t*>(s_Address) ? 1.0f : 0.0f;
-                } else if (s_IsInt) {
-                    s_Values[0] = static_cast<float>(*reinterpret_cast<const int32_t*>(s_Address));
-                } else {
-                    const float* s_Raw = reinterpret_cast<const float*>(s_Address);
-                    bool s_Sane = true;
-                    for (int k = 0; k < s_Comps; ++k) {
-                        s_Values[k] = s_Raw[k];
-                        if (!std::isfinite(s_Raw[k]) || std::abs(s_Raw[k]) > 100000.0f) s_Sane = false;
-                    }
-                    if (!s_Sane) continue;
-                }
-
-                char s_Hex[16];
-                std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", s_Property->m_nPropertyID);
-                const std::string s_PropName = (s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
-
-                SSnapItem s_Item;
-                s_Item.m_Target.m_Entity = s_Sub;
-                s_Item.m_Target.m_PropertyId = s_Property->m_nPropertyID;
-                s_Item.m_Target.m_Type = s_Info->m_propertyInfo.m_Type;
-                s_Item.m_Target.m_Components = s_Comps;
-                for (int k = 0; k < 4; ++k) s_Item.m_Target.m_Original[k] = s_Values[k];
-                s_Item.m_Key = reinterpret_cast<uintptr_t>(s_Sub.m_pObj);
-                s_Item.m_Offset = static_cast<size_t>(s_Property->m_nPropertyOffset);
-                s_Item.m_Label = s_TypeName + "." + s_PropName + " : " + s_ValueType;
-                s_Item.m_PropName = s_PropName;
-                s_Item.m_Pinnable = s_Pinnable;
-                p_Out.push_back(std::move(s_Item));
-            }
-        }
-    }
-}
-
-// Compares the Instinct recording with the normal one and lists the properties that differ (grouped by property).
-void BetterInstinct::BuildInstinctDiff(const std::vector<SSnapItem>& p_Now) {
-    std::map<std::pair<uintptr_t, uint32_t>, const SSnapItem*> s_Before;
-    for (const auto& s_Item : m_SnapNormal) {
-        s_Before[{s_Item.m_Key, s_Item.m_Target.m_PropertyId}] = &s_Item;
-    }
-
-    struct SGroup {
-        std::string m_Label;
-        std::string m_Prop;
-        int m_Count = 0;
-        int m_Comps = 1;
-        float m_A[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float m_B[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        bool m_Pinnable = true;
-    };
-    std::vector<SGroup> s_Groups;
-    std::map<std::string, size_t> s_GroupIndex;
-    int s_Changed = 0;
-
-    for (const auto& s_After : p_Now) {
-        const auto s_It = s_Before.find({s_After.m_Key, s_After.m_Target.m_PropertyId});
-        if (s_It == s_Before.end()) continue;
-        const SSnapItem& s_Was = *s_It->second;
-
-        bool s_Differs = false;
-        for (int k = 0; k < s_After.m_Target.m_Components; ++k) {
-            if (std::abs(s_After.m_Target.m_Original[k] - s_Was.m_Target.m_Original[k]) > 0.001f) s_Differs = true;
-        }
-        if (!s_Differs) continue;
-        ++s_Changed;
-
-        auto s_Slot = s_GroupIndex.find(s_After.m_Label);
-        if (s_Slot == s_GroupIndex.end()) {
-            SGroup s_Group;
-            s_Group.m_Label = s_After.m_Label;
-            s_Group.m_Prop = s_After.m_PropName;
-            s_Group.m_Comps = s_After.m_Target.m_Components;
-            s_Group.m_Pinnable = s_After.m_Pinnable;
-            for (int k = 0; k < 4; ++k) {
-                s_Group.m_A[k] = s_Was.m_Target.m_Original[k];
-                s_Group.m_B[k] = s_After.m_Target.m_Original[k];
-            }
-            s_Groups.push_back(s_Group);
-            s_Slot = s_GroupIndex.emplace(s_After.m_Label, s_Groups.size() - 1).first;
-        }
-        ++s_Groups[s_Slot->second].m_Count;
-    }
-
-    std::stable_sort(s_Groups.begin(), s_Groups.end(), [](const SGroup& p_L, const SGroup& p_R) { return p_L.m_Count > p_R.m_Count; });
-
-    auto s_Fmt = [](const float* p_Values, int p_Count) {
-        std::string s_Out = "(";
-        for (int k = 0; k < p_Count; ++k) {
-            char s_Buf[32];
-            std::snprintf(s_Buf, sizeof(s_Buf), "%.2f", p_Values[k]);
-            if (k > 0) s_Out += ", ";
-            s_Out += s_Buf;
-        }
-        return s_Out + ")";
-    };
-
-    std::vector<STintReportItem> s_Report;
-    for (const auto& s_Group : s_Groups) {
-        if (s_Report.size() >= 300) break;
-        std::string s_Line = s_Group.m_Label + "   x" + std::to_string(s_Group.m_Count) + "   " +
-            s_Fmt(s_Group.m_A, s_Group.m_Comps) + " -> " + s_Fmt(s_Group.m_B, s_Group.m_Comps);
-        if (!s_Group.m_Pinnable) s_Line += "   (can't be changed)";
-        s_Report.push_back({s_Line, s_Group.m_Prop});
-    }
-
-    {
-        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-        m_DiffReport = std::move(s_Report);
-    }
-    m_SnapChangedCount = s_Changed;
-}
-
-// The properties to hold at their normal value: every recorded property whose name contains one of the patterns.
-void BetterInstinct::RebuildPins() {
-    m_Pins.clear();
-    if (!m_SnapHaveNormal.load() || m_PinPropPattern[0] == '\0') return;
-
-    std::vector<std::string> s_Patterns;
-    std::string s_Cur;
-    auto s_Flush = [&]() {
-        const size_t a = s_Cur.find_first_not_of(" \t");
-        if (a != std::string::npos) {
-            std::string s_Part = s_Cur.substr(a, s_Cur.find_last_not_of(" \t") - a + 1);
-            std::transform(s_Part.begin(), s_Part.end(), s_Part.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-            s_Patterns.push_back(s_Part);
-        }
-        s_Cur.clear();
-    };
-    for (const char* p = m_PinPropPattern; *p; ++p) {
-        if (*p == ',') s_Flush(); else s_Cur += *p;
-    }
-    s_Flush();
-
-    for (const auto& s_Item : m_SnapNormal) {
-        if (!s_Item.m_Pinnable) continue;
-        std::string s_Name = s_Item.m_PropName;
-        std::transform(s_Name.begin(), s_Name.end(), s_Name.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        for (const auto& s_Pattern : s_Patterns) {
-            if (s_Name.find(s_Pattern) != std::string::npos) {
-                m_Pins.push_back(s_Item);
-                break;
-            }
-        }
-    }
-}
-
-// Runs every frame while Instinct is active: puts a value back whenever the game moved it away from its normal value.
-void BetterInstinct::WritePins() {
-    for (auto& s_Pin : m_Pins) {
-        if (!s_Pin.m_Target.m_Entity.GetEntity()) continue;
-        const float* s_Current = reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(s_Pin.m_Target.m_Entity.m_pObj) + s_Pin.m_Offset);
-
-        bool s_Differs = false;
-        for (int k = 0; k < s_Pin.m_Target.m_Components; ++k) {
-            if (!std::isfinite(s_Current[k]) || std::abs(s_Current[k] - s_Pin.m_Target.m_Original[k]) > 0.001f) s_Differs = true;
-        }
-        if (s_Differs) WriteTintTarget(s_Pin.m_Target, s_Pin.m_Target.m_Original);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Full scene search: finds EVERYTHING Instinct changes in the loaded scene (not only post-filter entities).
-//   1) Record the normal look twice, a moment apart: whatever differs between the two moves on its own (noise).
-//   2) Record during Instinct: whatever differs from the normal look and is not noise is listed.
-//   3) Each list entry has a switch that holds it at its normal value while Instinct is active, so you can find out
-//      which one is the grey just by flipping switches and looking at the screen.
-// ---------------------------------------------------------------------------
+//
+// The grey Instinct look is not a post-filter color value: it is a 64x64 color-grading lookup table (LUT) texture,
+// resource 008C1F5C7305A978 (the same texture the "Alternate Instinct Overlay" mod replaces). Every texel says
+// "input color -> output color", and the game blends it in while Instinct is on. So we:
+//   1. find that texture in the game's resource container and its ID3D12Resource,
+//   2. read the vanilla (grey) LUT back from the GPU once (and cache it next to the config file),
+//   3. build a recolored copy: monochrome in the player's color, mixed with the vanilla LUT by "Strength",
+//   4. write the copy into the texture's GPU memory. It only changes when a setting changes.
+// Because it is the scene's own color grading, the UI, menus and map are never affected, and since the vanilla grey
+// is replaced (not mixed with anything), only the chosen color remains.
 
 namespace {
 
-constexpr int kFullMaxRecords = 2000000; // safety cap on recorded values
-constexpr int kFullMaxDiffItems = 20000;
+constexpr uint64_t kInstinctLutId = 0x008C1F5C7305A978ULL;
+constexpr UINT kLutDim = 64;
 
-struct SFullValue {
-    uint8_t m_Kind = 0;  // 0 = float-like, 1 = bool, 2 = int32
-    uint8_t m_Comps = 1;
-    float m_V[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-};
-
-// Reads one property as plain numbers. Returns false for anything that is not a simple number-like value.
-bool FullReadProperty(const ZEntityRef& p_Entity, const SPropertyData* p_Prop, bool p_AllowGetters, SFullValue& p_Out) {
-    const auto* s_Info = p_Prop->GetPropertyInfo();
-    if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) return false;
-
-    const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
-    if (!s_ValueType) return false;
-
-    uint8_t s_Kind = 0;
-    uint8_t s_Comps = 0;
-    if (std::strcmp(s_ValueType, "float32") == 0 || std::strcmp(s_ValueType, "float") == 0) s_Comps = 1;
-    else if (std::strcmp(s_ValueType, "SVector2") == 0) s_Comps = 2;
-    else if (std::strcmp(s_ValueType, "SVector3") == 0 || std::strcmp(s_ValueType, "SColorRGB") == 0) s_Comps = 3;
-    else if (std::strcmp(s_ValueType, "SVector4") == 0 || std::strcmp(s_ValueType, "SColorRGBA") == 0) s_Comps = 4;
-    else if (std::strcmp(s_ValueType, "bool") == 0) { s_Kind = 1; s_Comps = 1; }
-    else if (std::strcmp(s_ValueType, "int32") == 0) { s_Kind = 2; s_Comps = 1; }
-    else return false;
-
-    const uintptr_t s_Address = reinterpret_cast<uintptr_t>(p_Entity.m_pObj) + p_Prop->m_nPropertyOffset;
-    alignas(16) uint8_t s_Raw[32] = {};
-    const size_t s_Size = s_Kind == 1 ? 1 : (s_Kind == 2 ? 4 : static_cast<size_t>(s_Comps) * 4);
-
-    if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) {
-        // Same call the SDK's own GetProperty makes. Optional, because a getter on an odd entity could misbehave.
-        if (!p_AllowGetters || !s_Info->m_propertyInfo.m_PropertyGetter) return false;
-        s_Info->m_propertyInfo.m_PropertyGetter(reinterpret_cast<void*>(s_Address), s_Raw, s_Info->m_propertyInfo.m_nExtraData);
-    } else {
-        std::memcpy(s_Raw, reinterpret_cast<const void*>(s_Address), s_Size);
-    }
-
-    p_Out.m_Kind = s_Kind;
-    p_Out.m_Comps = s_Comps;
-    for (int k = 0; k < 4; ++k) p_Out.m_V[k] = 0.0f;
-
-    if (s_Kind == 1) {
-        p_Out.m_V[0] = s_Raw[0] ? 1.0f : 0.0f;
-    } else if (s_Kind == 2) {
-        int32_t s_Int = 0;
-        std::memcpy(&s_Int, s_Raw, sizeof(s_Int));
-        p_Out.m_V[0] = static_cast<float>(s_Int);
-    } else {
-        float s_Floats[4] = {};
-        std::memcpy(s_Floats, s_Raw, s_Size);
-        for (int k = 0; k < s_Comps; ++k) {
-            if (!std::isfinite(s_Floats[k]) || std::abs(s_Floats[k]) > 100000.0f) return false;
-            p_Out.m_V[k] = s_Floats[k];
-        }
-    }
-    return true;
-}
-
-// Visits every number-like property of every entity of every loaded brick.
-template <typename F>
-void FullWalkScene(bool p_AllowGetters, F&& p_Fn, int& p_EntityCount) {
-    p_EntityCount = 0;
-
-    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
-    if (!s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) return;
-
-    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
-    std::unordered_set<ZEntityRef> s_Visited;
-    std::unordered_set<ZEntityRef> s_Expanded;
-
-    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
-        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
-            s_Queue.emplace(p_Factory, p_Root);
-        }
-    };
-
-    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
-        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
-        if (!s_BrickEntity) continue;
-        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
-    }
-
-    int s_Records = 0;
-    constexpr int kMaxEntities = 600000;
-
-    while (!s_Queue.empty() && p_EntityCount < kMaxEntities && s_Records < kFullMaxRecords) {
-        const auto [s_Factory, s_Root] = s_Queue.front();
-        s_Queue.pop();
-
-        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
-        for (int i = 0; i < s_SubCount && p_EntityCount < kMaxEntities && s_Records < kFullMaxRecords; ++i) {
-            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
-            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
-
-            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
-            if (!s_Visited.insert(s_Sub).second) {
-                s_Enqueue(s_SubFactory, s_Sub);
-                continue;
-            }
-            ++p_EntityCount;
-            s_Enqueue(s_SubFactory, s_Sub);
-
-            const auto* s_Type = s_Sub->GetType();
-            if (!s_Type->m_pPropertyData) continue;
-
-            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
-                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
-                SFullValue s_Value;
-                if (!FullReadProperty(s_Sub, s_Property, p_AllowGetters, s_Value)) continue;
-                p_Fn(s_Sub, s_Property, s_Value);
-                ++s_Records;
-            }
-        }
+bool LutSafeReadPtr(const void* p_Addr, void** p_Out) {
+    __try {
+        *p_Out = *reinterpret_cast<void* const*>(p_Addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
-// "EntityType.propertyName : valueType"
-std::string FullLabel(const ZEntityRef& p_Entity, const SPropertyData* p_Prop) {
-    std::string s_Type = "?";
-    const auto* s_T = p_Entity.GetEntity() ? p_Entity->GetType() : nullptr;
-    if (s_T && s_T->m_pInterfaceData) {
-        bool s_Found = false;
-        for (const auto& s_Interface : *s_T->m_pInterfaceData) {
-            if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
-            const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
-            if (!s_Name) continue;
-            if (!s_Found || (s_Name[0] == 'Z' && s_Type[0] != 'Z')) {
-                s_Type = s_Name;
-                s_Found = true;
+// True when the object's vtable lives inside a d3d12 module (cheap check before calling QueryInterface on it).
+bool LutIsD3DObject(void* p_Obj) {
+    void* s_Vtbl = nullptr;
+    if (!LutSafeReadPtr(p_Obj, &s_Vtbl) || !s_Vtbl) return false;
+
+    HMODULE s_Module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(s_Vtbl), &s_Module) || !s_Module) {
+        return false;
+    }
+
+    wchar_t s_Name[MAX_PATH] = {};
+    if (!GetModuleFileNameW(s_Module, s_Name, MAX_PATH)) return false;
+    for (wchar_t* c = s_Name; *c; ++c) *c = static_cast<wchar_t>(std::towlower(*c));
+    return std::wcsstr(s_Name, L"d3d12") != nullptr;
+}
+
+ID3D12Resource* LutSafeQuery(void* p_Obj) {
+    __try {
+        ID3D12Resource* s_Res = nullptr;
+        if (SUCCEEDED(reinterpret_cast<IUnknown*>(p_Obj)->QueryInterface(__uuidof(ID3D12Resource),
+                                                                         reinterpret_cast<void**>(&s_Res)))) {
+            return s_Res;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return nullptr;
+}
+
+// Returns an AddRef'd ID3D12Resource when p_Cand is the 64x64 2D texture we are looking for.
+ID3D12Resource* LutTryCandidate(void* p_Cand) {
+    if (!p_Cand || (reinterpret_cast<uintptr_t>(p_Cand) & 7) || reinterpret_cast<uintptr_t>(p_Cand) < 0x10000) return nullptr;
+    if (!LutIsD3DObject(p_Cand)) return nullptr;
+
+    ID3D12Resource* s_Res = LutSafeQuery(p_Cand);
+    if (!s_Res) return nullptr;
+
+    const D3D12_RESOURCE_DESC s_Desc = s_Res->GetDesc();
+    if (s_Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && s_Desc.Width == kLutDim && s_Desc.Height == kLutDim &&
+        s_Desc.DepthOrArraySize == 1) {
+        return s_Res;
+    }
+
+    s_Res->Release();
+    return nullptr;
+}
+
+// The loaded TEXT resource wraps the GPU texture somewhere inside it; look through the object (and one level of
+// pointers inside it) without needing to know the exact layout.
+ID3D12Resource* LutProbe(void* p_Data, std::string& p_How) {
+    if (!p_Data) return nullptr;
+
+    if (ID3D12Resource* s_Res = LutTryCandidate(p_Data)) {
+        p_How = "resource data is the texture";
+        return s_Res;
+    }
+
+    char s_Buf[96];
+    for (size_t s_Off = 0; s_Off < 0x100; s_Off += 8) {
+        void* s_Q = nullptr;
+        if (!LutSafeReadPtr(static_cast<char*>(p_Data) + s_Off, &s_Q)) break;
+        if (ID3D12Resource* s_Res = LutTryCandidate(s_Q)) {
+            std::snprintf(s_Buf, sizeof(s_Buf), "texture at resource data + 0x%zX", s_Off);
+            p_How = s_Buf;
+            return s_Res;
+        }
+    }
+
+    for (size_t s_Off = 0; s_Off < 0x100; s_Off += 8) {
+        void* s_Q = nullptr;
+        if (!LutSafeReadPtr(static_cast<char*>(p_Data) + s_Off, &s_Q)) break;
+        if (!s_Q || (reinterpret_cast<uintptr_t>(s_Q) & 7) || reinterpret_cast<uintptr_t>(s_Q) < 0x10000) continue;
+
+        for (size_t s_Off2 = 0; s_Off2 < 0x100; s_Off2 += 8) {
+            void* s_Q2 = nullptr;
+            if (!LutSafeReadPtr(static_cast<char*>(s_Q) + s_Off2, &s_Q2)) break;
+            if (ID3D12Resource* s_Res = LutTryCandidate(s_Q2)) {
+                std::snprintf(s_Buf, sizeof(s_Buf), "texture at resource data + 0x%zX -> + 0x%zX", s_Off, s_Off2);
+                p_How = s_Buf;
+                return s_Res;
             }
         }
     }
 
-    const auto* s_Info = p_Prop->GetPropertyInfo();
-    char s_Hex[16];
-    std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", p_Prop->m_nPropertyID);
-    const std::string s_PropName = (s_Info && s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
-    const char* s_ValueType = (s_Info && s_Info->m_propertyInfo.m_Type && s_Info->m_propertyInfo.m_Type->GetTypeInfo() &&
-                               s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName)
-        ? s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName : "?";
-    return s_Type + "." + s_PropName + " : " + s_ValueType;
-}
-
-std::string FullFormat(const float* p_Values, int p_Count) {
-    std::string s_Out = "(";
-    for (int k = 0; k < p_Count; ++k) {
-        char s_Buf[32];
-        std::snprintf(s_Buf, sizeof(s_Buf), "%.3f", p_Values[k]);
-        if (k > 0) s_Out += ", ";
-        s_Out += s_Buf;
-    }
-    return s_Out + ")";
-}
-
-bool FullDiffers(const float* p_A, const float* p_B, int p_Comps) {
-    for (int k = 0; k < p_Comps; ++k) {
-        if (std::abs(p_A[k] - p_B[k]) > 0.001f) return true;
-    }
-    return false;
-}
-
-const SFullRec* FullFind(const std::vector<SFullRec>& p_Sorted, uintptr_t p_Key, uint32_t p_Id) {
-    const auto s_It = std::lower_bound(p_Sorted.begin(), p_Sorted.end(), std::make_pair(p_Key, p_Id),
-        [](const SFullRec& p_Rec, const std::pair<uintptr_t, uint32_t>& p_Want) {
-            return p_Rec.m_Key != p_Want.first ? p_Rec.m_Key < p_Want.first : p_Rec.m_Id < p_Want.second;
-        });
-    if (s_It == p_Sorted.end() || s_It->m_Key != p_Key || s_It->m_Id != p_Id) return nullptr;
-    return &*s_It;
-}
-
-bool FullIsNoise(const std::vector<std::pair<uintptr_t, uint32_t>>& p_Sorted, uintptr_t p_Key, uint32_t p_Id) {
-    return std::binary_search(p_Sorted.begin(), p_Sorted.end(), std::make_pair(p_Key, p_Id));
+    return nullptr;
 }
 
 } // namespace
 
-bool BetterInstinct::WriteFullRec(const SFullDiffItem& p_Item, const float* p_Values) {
-    if (!p_Item.m_Entity.GetEntity() || !p_Item.m_Prop) return false;
-    const auto* s_Info = p_Item.m_Prop->GetPropertyInfo();
-    if (!s_Info || !s_Info->m_propertyInfo.m_Type) return false;
+// GPU-side state for the LUT texture (kept out of the header so it doesn't need the D3D12 headers).
+struct SLutGpu {
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_Res;
+    Microsoft::WRL::ComPtr<ID3D12Device> m_Dev;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_Queue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_Alloc;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_List;
+    Microsoft::WRL::ComPtr<ID3D12Fence> m_Fence;
+    HANDLE m_Event = nullptr;
+    UINT64 m_FenceValue = 0;
+    D3D12_RESOURCE_DESC m_Desc{};
+    uint32_t m_Index = 0;      // index in the resource container
+    void* m_Data = nullptr;    // resourceData pointer at the time we found it (changes when the game reloads it)
+    std::vector<uint8_t> m_Base; // vanilla LUT, mip 0, always RGBA order
+    bool m_Bgra = false;
+    bool m_NoAlpha = false;
+    std::string m_How;
 
-    alignas(16) uint8_t s_Buffer[32] = {};
-    if (p_Item.m_Kind == 1) {
-        s_Buffer[0] = p_Values[0] > 0.5f ? 1 : 0;
-    } else if (p_Item.m_Kind == 2) {
-        const int32_t s_Int = static_cast<int32_t>(std::lround(p_Values[0]));
-        std::memcpy(s_Buffer, &s_Int, sizeof(s_Int));
-    } else {
-        float s_Floats[4] = {p_Values[0], p_Values[1], p_Values[2], p_Values[3]};
-        std::memcpy(s_Buffer, s_Floats, static_cast<size_t>(p_Item.m_Comps) * 4);
+    ~SLutGpu() {
+        if (m_Event) CloseHandle(m_Event);
     }
+};
 
-    ZObjectRef s_Value;
-    s_Value.Assign(s_Info->m_propertyInfo.m_Type, s_Buffer);
-    ZEntityRef s_Entity = p_Item.m_Entity; // SetProperty is not const
-    return s_Entity.SetProperty(p_Item.m_Id, s_Value, true);
+namespace {
+
+bool LutFormatInfo(DXGI_FORMAT p_Format, bool& p_Bgra, bool& p_NoAlpha) {
+    p_NoAlpha = false;
+    switch (p_Format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        p_Bgra = false;
+        return true;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        p_Bgra = true;
+        return true;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        p_Bgra = true;
+        p_NoAlpha = true;
+        return true;
+    default:
+        return false;
+    }
 }
 
-// Puts every switched-on entry back to its normal value whenever the game moved it away (runs while Instinct is active).
-void BetterInstinct::WriteFullPins() {
-    std::vector<char> s_Pinned;
-    {
-        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-        s_Pinned.reserve(m_FullGroups.size());
-        for (const auto& s_Group : m_FullGroups) s_Pinned.push_back(s_Group.m_Pinned && s_Group.m_Pinnable ? 1 : 0);
-    }
-
-    for (const auto& s_Item : m_FullDiff) {
-        if (s_Item.m_Group >= s_Pinned.size() || !s_Pinned[s_Item.m_Group]) continue;
-        if (!s_Item.m_Entity.GetEntity()) continue;
-
-        SFullValue s_Current;
-        const bool s_Read = FullReadProperty(s_Item.m_Entity, s_Item.m_Prop, m_FullUseGetters, s_Current);
-        if (s_Read && !FullDiffers(s_Current.m_V, s_Item.m_Before, s_Item.m_Comps)) continue;
-        WriteFullRec(s_Item, s_Item.m_Before);
-    }
+bool LutBegin(SLutGpu& p_Gpu) {
+    return SUCCEEDED(p_Gpu.m_Alloc->Reset()) && SUCCEEDED(p_Gpu.m_List->Reset(p_Gpu.m_Alloc.Get(), nullptr));
 }
 
-void BetterInstinct::UpdateFullSearch(float p_Dt, bool p_Instinct) {
-    // --- Step 1: record the normal look twice (the difference between the two is noise) ---
-    if (m_FullRecordReq.load()) {
-        if (!p_Instinct && m_TintBlend.load() <= 0.0f && m_FullPhase == 0) {
-            m_FullRecordReq = false;
-            m_FullA.clear();
-            m_FullB.clear();
-            m_FullNoise.clear();
-            m_FullDiff.clear();
-            {
-                std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-                m_FullGroups.clear();
-            }
-            m_FullStatus = 0;
-            m_FullChangedCount = -1;
+// Submits the recorded list on our own queue and waits for it (the LUT is tiny, so this is well under a millisecond).
+bool LutRun(SLutGpu& p_Gpu) {
+    if (FAILED(p_Gpu.m_List->Close())) return false;
 
-            int s_Entities = 0;
-            FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
-                SFullRec s_Rec;
-                s_Rec.m_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
-                s_Rec.m_Prop = p_Prop;
-                s_Rec.m_Id = p_Prop->m_nPropertyID;
-                s_Rec.m_Comps = p_Value.m_Comps;
-                s_Rec.m_Kind = p_Value.m_Kind;
-                for (int k = 0; k < 4; ++k) s_Rec.m_V[k] = p_Value.m_V[k];
-                m_FullA.push_back(s_Rec);
-            }, s_Entities);
-            std::sort(m_FullA.begin(), m_FullA.end(), [](const SFullRec& a, const SFullRec& b) {
-                return a.m_Key != b.m_Key ? a.m_Key < b.m_Key : a.m_Id < b.m_Id;
-            });
-            m_FullEntities = s_Entities;
-            m_FullRecCount = static_cast<int>(m_FullA.size());
-            m_FullPhase = 1;
-            m_FullTimer = 1.5f;
-        } else if (p_Instinct) {
-            m_FullRecordReq = false; // can't record the normal look during Instinct
+    ID3D12CommandList* s_Lists[] = {p_Gpu.m_List.Get()};
+    p_Gpu.m_Queue->ExecuteCommandLists(1, s_Lists);
+
+    const UINT64 s_Value = ++p_Gpu.m_FenceValue;
+    if (FAILED(p_Gpu.m_Queue->Signal(p_Gpu.m_Fence.Get(), s_Value))) return false;
+
+    if (p_Gpu.m_Fence->GetCompletedValue() < s_Value) {
+        if (FAILED(p_Gpu.m_Fence->SetEventOnCompletion(s_Value, p_Gpu.m_Event))) return false;
+        if (WaitForSingleObject(p_Gpu.m_Event, 3000) != WAIT_OBJECT_0) return false;
+    }
+    return true;
+}
+
+D3D12_RESOURCE_BARRIER LutBarrier(ID3D12Resource* p_Res, D3D12_RESOURCE_STATES p_From, D3D12_RESOURCE_STATES p_To) {
+    D3D12_RESOURCE_BARRIER s_Barrier{};
+    s_Barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    s_Barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    s_Barrier.Transition.pResource = p_Res;
+    s_Barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_Barrier.Transition.StateBefore = p_From;
+    s_Barrier.Transition.StateAfter = p_To;
+    return s_Barrier;
+}
+
+// State the game leaves the texture in. 0 = shader resource (normal), 1 = common (if the first doesn't work).
+D3D12_RESOURCE_STATES LutRestState(int p_Mode) {
+    return p_Mode == 0 ? D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+}
+
+D3D12_RESOURCE_DESC LutBufferDesc(UINT64 p_Size) {
+    D3D12_RESOURCE_DESC s_Desc{};
+    s_Desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    s_Desc.Width = p_Size;
+    s_Desc.Height = 1;
+    s_Desc.DepthOrArraySize = 1;
+    s_Desc.MipLevels = 1;
+    s_Desc.Format = DXGI_FORMAT_UNKNOWN;
+    s_Desc.SampleDesc.Count = 1;
+    s_Desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return s_Desc;
+}
+
+bool LutInit(SLutGpu& p_Gpu, ID3D12Resource* p_Res, std::string& p_Err) {
+    p_Gpu.m_Res.Attach(p_Res); // takes the reference LutTryCandidate gave us
+    p_Gpu.m_Desc = p_Res->GetDesc();
+
+    if (!LutFormatInfo(p_Gpu.m_Desc.Format, p_Gpu.m_Bgra, p_Gpu.m_NoAlpha)) {
+        p_Err = "the LUT texture has an unsupported pixel format (DXGI " + std::to_string(static_cast<int>(p_Gpu.m_Desc.Format)) + ")";
+        return false;
+    }
+
+    if (FAILED(p_Res->GetDevice(IID_PPV_ARGS(&p_Gpu.m_Dev))) || !p_Gpu.m_Dev) {
+        p_Err = "could not get the D3D12 device of the LUT texture";
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC s_QueueDesc{};
+    s_QueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(p_Gpu.m_Dev->CreateCommandQueue(&s_QueueDesc, IID_PPV_ARGS(&p_Gpu.m_Queue))) ||
+        FAILED(p_Gpu.m_Dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p_Gpu.m_Alloc))) ||
+        FAILED(p_Gpu.m_Dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p_Gpu.m_Alloc.Get(), nullptr,
+                                              IID_PPV_ARGS(&p_Gpu.m_List))) ||
+        FAILED(p_Gpu.m_Dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p_Gpu.m_Fence)))) {
+        p_Err = "could not create the D3D12 copy objects";
+        return false;
+    }
+    p_Gpu.m_List->Close();
+
+    p_Gpu.m_Event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!p_Gpu.m_Event) {
+        p_Err = "could not create a wait event";
+        return false;
+    }
+    return true;
+}
+
+// Reads mip 0 of the texture into m_Base (RGBA order).
+bool LutReadback(SLutGpu& p_Gpu, int p_State, std::string& p_Err) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT s_Fp{};
+    UINT s_Rows = 0;
+    UINT64 s_RowSize = 0, s_Total = 0;
+    p_Gpu.m_Dev->GetCopyableFootprints(&p_Gpu.m_Desc, 0, 1, 0, &s_Fp, &s_Rows, &s_RowSize, &s_Total);
+    if (s_Total == 0) {
+        p_Err = "texture footprint is empty";
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES s_Heap{};
+    s_Heap.Type = D3D12_HEAP_TYPE_READBACK;
+    s_Heap.CreationNodeMask = 1;
+    s_Heap.VisibleNodeMask = 1;
+    const D3D12_RESOURCE_DESC s_BufDesc = LutBufferDesc(s_Total);
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> s_Readback;
+    if (FAILED(p_Gpu.m_Dev->CreateCommittedResource(&s_Heap, D3D12_HEAP_FLAG_NONE, &s_BufDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    nullptr, IID_PPV_ARGS(&s_Readback)))) {
+        p_Err = "could not create the readback buffer";
+        return false;
+    }
+
+    const D3D12_RESOURCE_STATES s_Rest = LutRestState(p_State);
+    if (!LutBegin(p_Gpu)) {
+        p_Err = "could not start the copy command list";
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER s_Barrier = LutBarrier(p_Gpu.m_Res.Get(), s_Rest, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    p_Gpu.m_List->ResourceBarrier(1, &s_Barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION s_Dst{};
+    s_Dst.pResource = s_Readback.Get();
+    s_Dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    s_Dst.PlacedFootprint = s_Fp;
+    D3D12_TEXTURE_COPY_LOCATION s_Src{};
+    s_Src.pResource = p_Gpu.m_Res.Get();
+    s_Src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s_Src.SubresourceIndex = 0;
+    p_Gpu.m_List->CopyTextureRegion(&s_Dst, 0, 0, 0, &s_Src, nullptr);
+
+    s_Barrier = LutBarrier(p_Gpu.m_Res.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, s_Rest);
+    p_Gpu.m_List->ResourceBarrier(1, &s_Barrier);
+
+    if (!LutRun(p_Gpu)) {
+        p_Err = "the GPU copy did not finish";
+        return false;
+    }
+
+    void* s_Mapped = nullptr;
+    const D3D12_RANGE s_Range{0, static_cast<SIZE_T>(s_Total)};
+    if (FAILED(s_Readback->Map(0, &s_Range, &s_Mapped)) || !s_Mapped) {
+        p_Err = "could not read the readback buffer";
+        return false;
+    }
+
+    const uint32_t s_W = static_cast<uint32_t>(p_Gpu.m_Desc.Width);
+    const uint32_t s_H = p_Gpu.m_Desc.Height;
+    p_Gpu.m_Base.assign(static_cast<size_t>(s_W) * s_H * 4, 255);
+    for (uint32_t y = 0; y < s_H; ++y) {
+        const uint8_t* s_Row = static_cast<const uint8_t*>(s_Mapped) + s_Fp.Offset + static_cast<size_t>(y) * s_Fp.Footprint.RowPitch;
+        uint8_t* s_Out = &p_Gpu.m_Base[static_cast<size_t>(y) * s_W * 4];
+        for (uint32_t x = 0; x < s_W; ++x) {
+            const uint8_t* s_Px = s_Row + x * 4;
+            s_Out[x * 4 + 0] = p_Gpu.m_Bgra ? s_Px[2] : s_Px[0];
+            s_Out[x * 4 + 1] = s_Px[1];
+            s_Out[x * 4 + 2] = p_Gpu.m_Bgra ? s_Px[0] : s_Px[2];
+            s_Out[x * 4 + 3] = p_Gpu.m_NoAlpha ? 255 : s_Px[3];
         }
     }
 
-    if (m_FullPhase == 1) {
-        if (p_Instinct) {
-            m_FullPhase = 0;
-            std::vector<SFullRec>().swap(m_FullA);
-            m_FullWait = 0.0f;
-        } else {
-            m_FullTimer -= p_Dt;
-            m_FullWait = std::max(0.0f, m_FullTimer);
-            if (m_FullTimer <= 0.0f) {
-                int s_Entities = 0;
-                FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
-                    SFullRec s_Rec;
-                    s_Rec.m_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
-                    s_Rec.m_Prop = p_Prop;
-                    s_Rec.m_Id = p_Prop->m_nPropertyID;
-                    s_Rec.m_Comps = p_Value.m_Comps;
-                    s_Rec.m_Kind = p_Value.m_Kind;
-                    for (int k = 0; k < 4; ++k) s_Rec.m_V[k] = p_Value.m_V[k];
-                    m_FullB.push_back(s_Rec);
+    const D3D12_RANGE s_NoWrite{0, 0};
+    s_Readback->Unmap(0, &s_NoWrite);
+    return true;
+}
 
-                    if (const SFullRec* s_Was = FullFind(m_FullA, s_Rec.m_Key, s_Rec.m_Id)) {
-                        if (FullDiffers(s_Was->m_V, s_Rec.m_V, s_Rec.m_Comps)) m_FullNoise.emplace_back(s_Rec.m_Key, s_Rec.m_Id);
+// Writes an RGBA image (mip 0) into the texture; lower mips (if the texture has any) are box-filtered from it.
+bool LutWrite(SLutGpu& p_Gpu, int p_State, const std::vector<uint8_t>& p_Rgba, std::string& p_Err) {
+    const UINT s_Mips = p_Gpu.m_Desc.MipLevels ? p_Gpu.m_Desc.MipLevels : 1;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> s_Fp(s_Mips);
+    std::vector<UINT> s_Rows(s_Mips);
+    std::vector<UINT64> s_RowSize(s_Mips);
+    UINT64 s_Total = 0;
+    p_Gpu.m_Dev->GetCopyableFootprints(&p_Gpu.m_Desc, 0, s_Mips, 0, s_Fp.data(), s_Rows.data(), s_RowSize.data(), &s_Total);
+    if (s_Total == 0) {
+        p_Err = "texture footprint is empty";
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES s_Heap{};
+    s_Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    s_Heap.CreationNodeMask = 1;
+    s_Heap.VisibleNodeMask = 1;
+    const D3D12_RESOURCE_DESC s_BufDesc = LutBufferDesc(s_Total);
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> s_Upload;
+    if (FAILED(p_Gpu.m_Dev->CreateCommittedResource(&s_Heap, D3D12_HEAP_FLAG_NONE, &s_BufDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                    nullptr, IID_PPV_ARGS(&s_Upload)))) {
+        p_Err = "could not create the upload buffer";
+        return false;
+    }
+
+    void* s_Mapped = nullptr;
+    const D3D12_RANGE s_NoRead{0, 0};
+    if (FAILED(s_Upload->Map(0, &s_NoRead, &s_Mapped)) || !s_Mapped) {
+        p_Err = "could not map the upload buffer";
+        return false;
+    }
+
+    uint32_t s_Mw = static_cast<uint32_t>(p_Gpu.m_Desc.Width);
+    uint32_t s_Mh = p_Gpu.m_Desc.Height;
+    std::vector<uint8_t> s_Cur = p_Rgba;
+    for (UINT m = 0; m < s_Mips; ++m) {
+        if (m > 0) {
+            const uint32_t s_Pw = s_Mw, s_Ph = s_Mh;
+            s_Mw = std::max(1u, s_Pw / 2);
+            s_Mh = std::max(1u, s_Ph / 2);
+            std::vector<uint8_t> s_Next(static_cast<size_t>(s_Mw) * s_Mh * 4);
+            for (uint32_t y = 0; y < s_Mh; ++y) {
+                for (uint32_t x = 0; x < s_Mw; ++x) {
+                    const uint32_t s_X0 = std::min(x * 2, s_Pw - 1), s_X1 = std::min(x * 2 + 1, s_Pw - 1);
+                    const uint32_t s_Y0 = std::min(y * 2, s_Ph - 1), s_Y1 = std::min(y * 2 + 1, s_Ph - 1);
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t s_Sum = s_Cur[(static_cast<size_t>(s_Y0) * s_Pw + s_X0) * 4 + c] +
+                                               s_Cur[(static_cast<size_t>(s_Y0) * s_Pw + s_X1) * 4 + c] +
+                                               s_Cur[(static_cast<size_t>(s_Y1) * s_Pw + s_X0) * 4 + c] +
+                                               s_Cur[(static_cast<size_t>(s_Y1) * s_Pw + s_X1) * 4 + c];
+                        s_Next[(static_cast<size_t>(y) * s_Mw + x) * 4 + c] = static_cast<uint8_t>((s_Sum + 2) / 4);
                     }
-                }, s_Entities);
-                std::sort(m_FullB.begin(), m_FullB.end(), [](const SFullRec& a, const SFullRec& b) {
-                    return a.m_Key != b.m_Key ? a.m_Key < b.m_Key : a.m_Id < b.m_Id;
-                });
-                std::sort(m_FullNoise.begin(), m_FullNoise.end());
-                std::vector<SFullRec>().swap(m_FullA);
+                }
+            }
+            s_Cur = std::move(s_Next);
+        }
 
-                m_FullNoiseCount = static_cast<int>(m_FullNoise.size());
-                m_FullRecCount = static_cast<int>(m_FullB.size());
-                m_FullEntities = s_Entities;
-                m_FullPhase = 2;
-                m_FullStatus = 1;
-                m_FullWait = 0.0f;
+        for (uint32_t y = 0; y < s_Mh; ++y) {
+            uint8_t* s_Row = static_cast<uint8_t*>(s_Mapped) + s_Fp[m].Offset + static_cast<size_t>(y) * s_Fp[m].Footprint.RowPitch;
+            for (uint32_t x = 0; x < s_Mw; ++x) {
+                const uint8_t* s_Px = &s_Cur[(static_cast<size_t>(y) * s_Mw + x) * 4];
+                s_Row[x * 4 + 0] = p_Gpu.m_Bgra ? s_Px[2] : s_Px[0];
+                s_Row[x * 4 + 1] = s_Px[1];
+                s_Row[x * 4 + 2] = p_Gpu.m_Bgra ? s_Px[0] : s_Px[2];
+                s_Row[x * 4 + 3] = p_Gpu.m_NoAlpha ? 255 : s_Px[3];
             }
         }
     }
+    s_Upload->Unmap(0, nullptr);
 
-    // --- Step 2: record during Instinct and list what changed (and is not noise) ---
-    if (m_FullInstinctArmed.load()) {
-        if (m_FullPhase == 2 && p_Instinct) {
-            m_FullHold += p_Dt; // wait until Instinct has fully faded in
-            if (m_FullHold >= 0.8f) {
-                m_FullHold = 0.0f;
-                m_FullInstinctArmed = false;
-                m_FullDiff.clear();
-
-                std::map<std::string, size_t> s_GroupIndex;
-                std::vector<SFullGroup> s_Groups;
-
-                int s_Entities = 0;
-                FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
-                    if (static_cast<int>(m_FullDiff.size()) >= kFullMaxDiffItems) return;
-                    const uintptr_t s_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
-                    const SFullRec* s_Was = FullFind(m_FullB, s_Key, p_Prop->m_nPropertyID);
-                    if (!s_Was || !FullDiffers(s_Was->m_V, p_Value.m_V, p_Value.m_Comps)) return;
-                    if (FullIsNoise(m_FullNoise, s_Key, p_Prop->m_nPropertyID)) return;
-
-                    const std::string s_Label = FullLabel(p_Entity, p_Prop);
-                    auto s_Slot = s_GroupIndex.find(s_Label);
-                    if (s_Slot == s_GroupIndex.end()) {
-                        SFullGroup s_Group;
-                        s_Group.m_Label = s_Label;
-                        s_Group.m_Pinnable = true;
-                        s_Group.m_Text = s_Label + "   " + FullFormat(s_Was->m_V, p_Value.m_Comps) + " -> " + FullFormat(p_Value.m_V, p_Value.m_Comps);
-                        s_Groups.push_back(s_Group);
-                        s_Slot = s_GroupIndex.emplace(s_Label, s_Groups.size() - 1).first;
-                    }
-                    ++s_Groups[s_Slot->second].m_Count;
-
-                    SFullDiffItem s_Item;
-                    s_Item.m_Entity = p_Entity;
-                    s_Item.m_Prop = p_Prop;
-                    s_Item.m_Id = p_Prop->m_nPropertyID;
-                    s_Item.m_Comps = p_Value.m_Comps;
-                    s_Item.m_Kind = p_Value.m_Kind;
-                    for (int k = 0; k < 4; ++k) s_Item.m_Before[k] = s_Was->m_V[k];
-                    s_Item.m_Group = s_Slot->second; // re-mapped below after sorting
-                    m_FullDiff.push_back(s_Item);
-                }, s_Entities);
-
-                // Rare entries first: the grey is usually one or a few entities, noise is usually hundreds.
-                std::vector<size_t> s_Order(s_Groups.size());
-                for (size_t i = 0; i < s_Order.size(); ++i) s_Order[i] = i;
-                std::stable_sort(s_Order.begin(), s_Order.end(), [&](size_t a, size_t b) {
-                    return s_Groups[a].m_Count < s_Groups[b].m_Count;
-                });
-                std::vector<size_t> s_NewIndex(s_Groups.size());
-                std::vector<SFullGroup> s_Sorted;
-                for (size_t i = 0; i < s_Order.size(); ++i) {
-                    s_NewIndex[s_Order[i]] = i;
-                    SFullGroup s_Group = s_Groups[s_Order[i]];
-                    s_Group.m_Text += "   x" + std::to_string(s_Group.m_Count);
-                    s_Sorted.push_back(std::move(s_Group));
-                }
-                for (auto& s_Item : m_FullDiff) s_Item.m_Group = s_NewIndex[s_Item.m_Group];
-
-                m_FullChangedCount = static_cast<int>(m_FullDiff.size());
-                {
-                    std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-                    m_FullGroups = std::move(s_Sorted);
-                }
-                m_FullStatus = 2;
-            }
-        } else {
-            m_FullHold = 0.0f;
-            if (m_FullPhase != 2) m_FullInstinctArmed = false;
-        }
+    const D3D12_RESOURCE_STATES s_Rest = LutRestState(p_State);
+    if (!LutBegin(p_Gpu)) {
+        p_Err = "could not start the copy command list";
+        return false;
     }
 
-    if (p_Instinct && !m_FullDiff.empty() && !m_FullInstinctArmed.load()) WriteFullPins();
+    D3D12_RESOURCE_BARRIER s_Barrier = LutBarrier(p_Gpu.m_Res.Get(), s_Rest, D3D12_RESOURCE_STATE_COPY_DEST);
+    p_Gpu.m_List->ResourceBarrier(1, &s_Barrier);
 
-    if (m_FullSaveReq.exchange(false)) SaveFullReport();
+    for (UINT m = 0; m < s_Mips; ++m) {
+        D3D12_TEXTURE_COPY_LOCATION s_Dst{};
+        s_Dst.pResource = p_Gpu.m_Res.Get();
+        s_Dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s_Dst.SubresourceIndex = m;
+        D3D12_TEXTURE_COPY_LOCATION s_Src{};
+        s_Src.pResource = s_Upload.Get();
+        s_Src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        s_Src.PlacedFootprint = s_Fp[m];
+        p_Gpu.m_List->CopyTextureRegion(&s_Dst, 0, 0, 0, &s_Src, nullptr);
+    }
+
+    s_Barrier = LutBarrier(p_Gpu.m_Res.Get(), D3D12_RESOURCE_STATE_COPY_DEST, s_Rest);
+    p_Gpu.m_List->ResourceBarrier(1, &s_Barrier);
+
+    if (!LutRun(p_Gpu)) {
+        p_Err = "the GPU copy did not finish";
+        return false;
+    }
+    return true;
 }
 
-// Writes everything the search found to InstinctChanges.txt next to the mod (easy to send for analysis).
-void BetterInstinct::SaveFullReport() {
-    std::ofstream s_File(fs::path(m_ModDir + L"InstinctChanges.txt"), std::ios::trunc);
-    if (!s_File) {
-        m_FullReportSaved = -1;
+// Monochrome copy of the vanilla LUT in the chosen color. Strength 1 replaces the vanilla look completely.
+std::vector<uint8_t> LutRecolor(const std::vector<uint8_t>& p_Base, const float* p_Color, float p_Strength, bool p_Keep, float p_Bright) {
+    const float s_Max = std::max({p_Color[0], p_Color[1], p_Color[2], 0.001f});
+    const float s_C[3] = {p_Color[0] / s_Max, p_Color[1] / s_Max, p_Color[2] / s_Max};
+    const float s_LumC = 0.2126f * s_C[0] + 0.7152f * s_C[1] + 0.0722f * s_C[2];
+    // "Keep brightness": dark colors (blue, red) would otherwise make a much darker picture than vanilla Instinct.
+    const float s_Boost = p_Bright * (p_Keep ? 1.0f / std::max(s_LumC, 0.30f) : 1.0f);
+
+    std::vector<uint8_t> s_Out(p_Base.size());
+    for (size_t i = 0; i + 3 < p_Base.size(); i += 4) {
+        const float s_R = p_Base[i + 0] / 255.0f, s_G = p_Base[i + 1] / 255.0f, s_B = p_Base[i + 2] / 255.0f;
+        const float s_L = 0.2126f * s_R + 0.7152f * s_G + 0.0722f * s_B;
+        const float s_In[3] = {s_R, s_G, s_B};
+        for (int c = 0; c < 3; ++c) {
+            const float s_Mono = std::clamp(s_L * s_C[c] * s_Boost, 0.0f, 1.0f);
+            const float s_V = s_In[c] + (s_Mono - s_In[c]) * p_Strength;
+            s_Out[i + c] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(s_V * 255.0f)), 0, 255));
+        }
+        s_Out[i + 3] = p_Base[i + 3];
+    }
+    return s_Out;
+}
+
+fs::path LutCachePath() {
+    const std::wstring s_Dir = ConfigDir();
+    return s_Dir.empty() ? fs::path() : fs::path(s_Dir) / L"instinct_lut_base.bin";
+}
+
+} // namespace
+
+void BetterInstinct::SetLutStatus(int p_State, const std::string& p_Text) {
+    m_LutState = p_State;
+    std::lock_guard<std::mutex> s_Lock(m_LutMutex);
+    m_LutStatus = p_Text;
+}
+
+void BetterInstinct::ReleaseLut() {
+    delete m_Lut;
+    m_Lut = nullptr;
+    m_LutApplied = false;
+    m_LutAppliedSig = 0;
+    m_LutFailSig.store(0);
+}
+
+// Still the same resource, loaded and unchanged? (checked every frame, it is just a few reads)
+bool BetterInstinct::LutStillValid() const {
+    if (!m_Lut || !Globals::ResourceContainer || !*Globals::ResourceContainer) return false;
+    auto& s_Resources = (*Globals::ResourceContainer)->m_resources;
+    if (m_Lut->m_Index >= s_Resources.size()) return false;
+    const auto& s_Info = s_Resources[m_Lut->m_Index];
+    return s_Info.rid.GetID() == kInstinctLutId && s_Info.status == RESOURCE_STATUS_VALID && s_Info.resourceData == m_Lut->m_Data;
+}
+
+// Finds the LUT texture and gets the vanilla pixels. Returns true when m_Lut is ready to use.
+bool BetterInstinct::EnsureLut() {
+    if (m_Lut && LutStillValid()) return true;
+    if (m_Lut) ReleaseLut(); // the game reloaded the texture (new mission): start again on the fresh one
+
+    if (!Globals::ResourceContainer || !*Globals::ResourceContainer) {
+        SetLutStatus(2, "The game's resource container is not available.");
+        return false;
+    }
+
+    auto& s_Resources = (*Globals::ResourceContainer)->m_resources;
+    const size_t s_Count = s_Resources.size();
+    bool s_FoundButNotLoaded = false;
+
+    for (size_t i = 0; i < s_Count; ++i) {
+        const auto& s_Info = s_Resources[i];
+        if (s_Info.rid.GetID() != kInstinctLutId) continue;
+
+        if (s_Info.status != RESOURCE_STATUS_VALID || !s_Info.resourceData) {
+            s_FoundButNotLoaded = true;
+            continue;
+        }
+
+        std::string s_How;
+        ID3D12Resource* s_Res = LutProbe(s_Info.resourceData, s_How);
+        char s_Buf[256];
+        if (!s_Res) {
+            std::snprintf(s_Buf, sizeof(s_Buf),
+                          "Found the Instinct LUT (resource #%zu, type 0x%08X, data %p) but no 64x64 D3D12 texture inside it.", i,
+                          s_Info.resourceType, s_Info.resourceData);
+            SetLutStatus(2, s_Buf);
+            return false;
+        }
+
+        auto* s_Gpu = new SLutGpu();
+        s_Gpu->m_Index = static_cast<uint32_t>(i);
+        s_Gpu->m_Data = s_Info.resourceData;
+        s_Gpu->m_How = s_How;
+
+        std::string s_Err;
+        if (!LutInit(*s_Gpu, s_Res, s_Err)) {
+            delete s_Gpu;
+            SetLutStatus(2, "Instinct LUT: " + s_Err + ".");
+            return false;
+        }
+
+        // Vanilla pixels: from the cache file when there is one (so a plugin reload can never mistake our own
+        // recolored texture for the vanilla one), otherwise read back from the GPU and cache.
+        const size_t s_Bytes = static_cast<size_t>(s_Gpu->m_Desc.Width) * s_Gpu->m_Desc.Height * 4;
+        const fs::path s_Cache = LutCachePath();
+        bool s_Have = false;
+        if (!s_Cache.empty()) {
+            std::ifstream s_In(s_Cache, std::ios::binary);
+            if (s_In) {
+                std::vector<uint8_t> s_Data((std::istreambuf_iterator<char>(s_In)), std::istreambuf_iterator<char>());
+                if (s_Data.size() == s_Bytes) {
+                    s_Gpu->m_Base = std::move(s_Data);
+                    s_Have = true;
+                }
+            }
+        }
+        if (!s_Have) {
+            if (!LutReadback(*s_Gpu, m_LutBarrier, s_Err)) {
+                delete s_Gpu;
+                SetLutStatus(2, "Instinct LUT: " + s_Err + ".");
+                return false;
+            }
+            if (!s_Cache.empty()) {
+                std::error_code s_Ec;
+                fs::create_directories(s_Cache.parent_path(), s_Ec);
+                std::ofstream s_Out(s_Cache, std::ios::binary | std::ios::trunc);
+                if (s_Out) s_Out.write(reinterpret_cast<const char*>(s_Gpu->m_Base.data()), static_cast<std::streamsize>(s_Gpu->m_Base.size()));
+            }
+        }
+
+        m_Lut = s_Gpu;
+        m_LutApplied = false;
+        m_LutAppliedSig = 0;
+        std::snprintf(s_Buf, sizeof(s_Buf), "Instinct LUT found (resource #%zu, %ux%u, DXGI %d, %s, %s).", i,
+                      static_cast<unsigned>(s_Gpu->m_Desc.Width), s_Gpu->m_Desc.Height, static_cast<int>(s_Gpu->m_Desc.Format),
+                      s_How.c_str(), s_Have ? "vanilla pixels from cache" : "vanilla pixels read from the GPU");
+        SetLutStatus(3, s_Buf);
+        return true;
+    }
+
+    SetLutStatus(1, s_FoundButNotLoaded ? "The Instinct LUT exists but is not loaded yet." : "The Instinct LUT is not part of this scene (yet).");
+    return false;
+}
+
+// Puts the vanilla LUT back and lets go of the texture.
+void BetterInstinct::RestoreTint() {
+    if (m_Lut && m_LutApplied && m_HasPlayer.load() && LutStillValid()) {
+        std::string s_Err;
+        LutWrite(*m_Lut, m_LutBarrier, m_Lut->m_Base, s_Err);
+    }
+    ReleaseLut();
+}
+
+// Runs every frame from the game loop (also outside missions).
+void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
+    if (!m_HasPlayer.load()) {
+        // Out of the mission: the texture is about to go away. Drop our references without touching it.
+        if (m_NoPlayerTime > 0.25f && m_Lut) ReleaseLut();
         return;
     }
 
-    s_File << "BetterInstinct: values that changed while Instinct was active (noise removed)\n";
-    s_File << "Scanned entities: " << m_FullEntities.load() << ", recorded values: " << m_FullRecCount.load()
-           << ", values that moved on their own (ignored): " << m_FullNoiseCount.load()
-           << ", getters read: " << (m_FullUseGetters ? "yes" : "no") << "\n\n";
-
-    std::vector<SFullGroup> s_Groups;
-    {
-        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
-        s_Groups = m_FullGroups;
+    if (m_LutReread.exchange(false)) {
+        RestoreTint(); // vanilla pixels back first, so the new readback is the real vanilla LUT
+        std::error_code s_Ec;
+        const fs::path s_Cache = LutCachePath();
+        if (!s_Cache.empty()) fs::remove(s_Cache, s_Ec);
+        m_LutPoll = 0.0f;
     }
 
-    for (size_t g = 0; g < s_Groups.size(); ++g) {
-        s_File << "[" << g << "] " << s_Groups[g].m_Text << (s_Groups[g].m_Pinned ? "   <- held at normal" : "") << "\n";
-        int s_Shown = 0;
-        for (const auto& s_Item : m_FullDiff) {
-            if (s_Item.m_Group != g || s_Shown >= 8) continue;
-            SFullValue s_Now;
-            const bool s_Read = FullReadProperty(s_Item.m_Entity, s_Item.m_Prop, m_FullUseGetters, s_Now);
-            s_File << "      entity 0x" << std::hex << reinterpret_cast<uintptr_t>(s_Item.m_Entity.m_pObj) << std::dec << "  before "
-                   << FullFormat(s_Item.m_Before, s_Item.m_Comps) << "  now "
-                   << (s_Read ? FullFormat(s_Now.m_V, s_Item.m_Comps) : std::string("?")) << "\n";
-            ++s_Shown;
+    if (!m_TintEnabled && !m_Lut) return; // nothing to do and nothing to undo
+
+    m_LutPoll -= p_Dt;
+    m_LutCooldown -= p_Dt;
+
+    if (m_Lut && !LutStillValid()) ReleaseLut();
+
+    if (!m_Lut) {
+        if (!m_TintEnabled || m_LutPoll > 0.0f) return;
+        m_LutPoll = 2.0f; // searching walks the whole resource list: only every couple of seconds
+        if (!EnsureLut()) return;
+    }
+
+    // What should the texture contain right now?
+    uint32_t s_Sig = 2166136261u;
+    auto s_Mix = [&](uint32_t p_Value) { s_Sig = (s_Sig ^ p_Value) * 16777619u; };
+    s_Mix(m_TintEnabled ? 1u : 0u);
+    if (m_TintEnabled) {
+        for (int i = 0; i < 3; ++i) s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_InstinctTint[i], 0.0f, 1.0f) * 255.0f)));
+        s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_TintStrength, 0.0f, 1.0f) * 255.0f)));
+        s_Mix(m_TintKeepBrightness ? 1u : 0u);
+        s_Mix(static_cast<uint32_t>(std::lround(m_TintBrightness * 100.0f)));
+    }
+
+    if (m_LutApplied && s_Sig == m_LutAppliedSig) return; // already up to date
+    if (!m_LutApplied && !m_TintEnabled) {                // vanilla is already in place: let go of the texture
+        ReleaseLut();
+        return;
+    }
+    if (s_Sig == m_LutFailSig.load()) return;             // this exact setting failed already: wait for a change
+
+    if (m_LutCooldown > 0.0f) return; // while dragging the color picker, write at most ~10 times per second
+    m_LutCooldown = 0.1f;
+
+    std::string s_Err;
+    if (m_TintEnabled) {
+        const std::vector<uint8_t> s_Image = LutRecolor(m_Lut->m_Base, m_InstinctTint, std::clamp(m_TintStrength, 0.0f, 1.0f),
+                                                        m_TintKeepBrightness, m_TintBrightness);
+        if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
+            m_LutApplied = true;
+            m_LutAppliedSig = s_Sig;
+            ++m_LutWrites;
+            SetLutStatus(4, "Instinct color is active (the game's grey Instinct LUT has been replaced).");
+        } else {
+            SetLutStatus(2, "Could not write the Instinct LUT: " + s_Err + ". Try the other 'GPU state' option under Advanced.");
+            m_LutFailSig.store(s_Sig);
+            m_LutApplied = false;
+        }
+    } else {
+        if (LutWrite(*m_Lut, m_LutBarrier, m_Lut->m_Base, s_Err)) {
+            m_LutApplied = false;
+            m_LutAppliedSig = 0;
+            SetLutStatus(3, "Instinct color is off (vanilla LUT restored).");
         }
     }
-    s_File.flush();
-    m_FullReportSaved = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -4093,9 +3738,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
                         m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
             ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
-            ImGui::Text("Tint blend=%.2f  multiplier=(%.2f, %.2f, %.2f)  applied=%s  engine hook=%s", m_TintBlend.load(),
-                        m_TintMultiplier[0], m_TintMultiplier[1], m_TintMultiplier[2], m_TintApplied ? "yes" : "no",
-                        m_TintHookReady ? "connected" : "not connected");
+            ImGui::Text("Instinct color: state=%d  LUT writes=%u", m_LutState.load(), m_LutWrites.load());
             ImGui::Text("Game-level block: %s   blocked polls=%u", m_InputBlock.load() ? "ON" : "off", m_BlockedPolls.load());
             ImGui::TextDisabled("Updates stay at 0 outside a mission. Hold your Instinct key in a mission and watch these.");
 
@@ -4227,164 +3870,53 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
         ImGui::Separator();
 
-        // --- Instinct color tint ---
-        if (ImGui::Checkbox("Tint the world while Instinct is active", &m_TintEnabled)) s_Changed = true;
+        // --- Instinct color ---
+        if (ImGui::Checkbox("Custom Instinct color (replaces the grey)", &m_TintEnabled)) s_Changed = true;
         ImGui::BeginDisabled(!m_TintEnabled);
-        if (ImGui::ColorEdit3("Instinct tint", m_InstinctTint)) s_Changed = true;
-        if (ImGui::SliderFloat("Tint strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::ColorEdit3("Instinct color", m_InstinctTint)) s_Changed = true;
+        if (ImGui::SliderFloat("Strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        ImGui::TextDisabled("1.00 = the grey is completely replaced by your color. Lower keeps part of the original look.");
+        if (ImGui::SliderFloat("Brightness", &m_TintBrightness, 0.25f, 3.0f, "%.2f")) s_Changed = true;
         if (ImGui::Checkbox("Keep brightness (recommended)", &m_TintKeepBrightness)) s_Changed = true;
-        ImGui::TextDisabled("Tip: raise Tint strength towards 1.00 to push the color through Instinct's grey.");
-        if (ImGui::Button("Reset tint")) {
+        if (ImGui::Button("Reset color")) {
             m_InstinctTint[0] = 0.30f;
             m_InstinctTint[1] = 0.70f;
             m_InstinctTint[2] = 1.00f;
-            m_TintStrength = 0.70f;
+            m_TintStrength = 1.0f;
+            m_TintBrightness = 1.0f;
             m_TintKeepBrightness = true;
             s_Changed = true;
         }
         ImGui::EndDisabled();
-        ImGui::TextDisabled(m_TintHookReady ? "World tint: connected to the game's color grading"
-                                            : "World tint: not connected yet (pick a post-filter color property below)");
 
-        if (ImGui::TreeNode("Tint engine hook (post-filter property)")) {
-            ImGui::TextDisabled("The tint is written into a color property of the game's post-filter entities (scene render only),");
-            ImGui::TextDisabled("so UI, menus and map stay untouched. Pick which property to drive from the list the scan found.");
-
-            if (ImGui::InputText("Entity type contains", m_TintTypePattern, sizeof(m_TintTypePattern))) {
-                s_Changed = true;
-                m_TintRescan = true;
-            }
-            if (ImGui::InputText("Property name contains", m_TintPropPattern, sizeof(m_TintPropPattern))) {
-                s_Changed = true;
-                m_TintRescan = true;
-            }
-            if (ImGui::Button("Rescan scene")) m_TintRescan = true;
-            ImGui::SameLine();
-            ImGui::Checkbox("Test: show tint without Instinct", &m_TintForceTest);
-
-            ImGui::Text("Scanned %d entities, %d matching type, %d tint target(s)", m_TintScanned.load(), m_TintMatchedEntities.load(),
-                        m_TintTargetCount.load());
-            ImGui::TextDisabled("Scanning only runs in a mission with the tint enabled. Click a property to use it:");
-
-            ImGui::BeginChild("##tintreport", ImVec2(0.0f, 140.0f), true);
+        {
+            std::string s_LutText;
             {
-                std::lock_guard<std::mutex> s_ReportLock(m_TintReportMutex);
-                for (const auto& s_Item : m_TintReport) {
-                    if (ImGui::Selectable(s_Item.m_Text.c_str(), s_Item.m_Prop == m_TintPropPattern)) {
-                        std::snprintf(m_TintPropPattern, sizeof(m_TintPropPattern), "%s", s_Item.m_Prop.c_str());
-                        s_Changed = true;
-                        m_TintRescan = true;
-                    }
-                }
-                if (m_TintReport.empty()) ImGui::TextDisabled("(nothing found yet)");
+                std::lock_guard<std::mutex> s_LutLock(m_LutMutex);
+                s_LutText = m_LutStatus;
             }
-            ImGui::EndChild();
-            ImGui::TreePop();
+            const int s_LutState = m_LutState.load();
+            const ImVec4 s_LutColor = s_LutState == 4 ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)
+                                    : s_LutState == 2 ? ImVec4(0.95f, 0.45f, 0.40f, 1.0f)
+                                                      : ImVec4(0.70f, 0.70f, 0.70f, 1.0f);
+            if (s_LutText.empty()) s_LutText = m_TintEnabled ? "Waiting for a mission to load the Instinct texture..." : "Off.";
+            ImGui::PushStyleColor(ImGuiCol_Text, s_LutColor);
+            ImGui::TextWrapped("%s", s_LutText.c_str());
+            ImGui::PopStyleColor();
         }
 
-        if (ImGui::TreeNode("Find and remove Instinct's grey (advanced)")) {
-            ImGui::TextDisabled("1) Untick the tint above.  2) In a mission, with Instinct OFF, click 'Record normal look'.");
-            ImGui::TextDisabled("3) Click 'Record during Instinct', then hold your Instinct key for about a second.");
-            ImGui::TextDisabled("4) Click the entries that look like the grey (for example a saturation going towards 0).");
-
-            if (ImGui::Button("Record normal look")) m_SnapNormalReq = true;
-            ImGui::SameLine();
-            const bool s_Armed = m_SnapInstinctArmed.load();
-            if (ImGui::Button(s_Armed ? "Waiting for Instinct... (click to cancel)" : "Record during Instinct")) {
-                m_SnapInstinctArmed = !s_Armed;
-            }
-            ImGui::Text("Normal look: %d values recorded", m_SnapNormalCount.load());
-            if (m_SnapChangedCount.load() >= 0) {
-                ImGui::Text("%d value(s) changed during Instinct (click one to hold it at its normal value):", m_SnapChangedCount.load());
-            }
-
-            ImGui::BeginChild("##diffreport", ImVec2(0.0f, 160.0f), true);
-            {
-                std::lock_guard<std::mutex> s_DiffLock(m_TintReportMutex);
-                for (const auto& s_Item : m_DiffReport) {
-                    if (ImGui::Selectable(s_Item.m_Text.c_str(), false)) {
-                        std::string s_Pins = m_PinPropPattern;
-                        if (s_Pins.find(s_Item.m_Prop) == std::string::npos) {
-                            if (!s_Pins.empty()) s_Pins += ",";
-                            s_Pins += s_Item.m_Prop;
-                            std::snprintf(m_PinPropPattern, sizeof(m_PinPropPattern), "%s", s_Pins.c_str());
-                            s_Changed = true;
-                            m_PinRebuild = true;
-                        }
-                    }
-                }
-                if (m_DiffReport.empty()) ImGui::TextDisabled("(nothing recorded yet)");
-            }
-            ImGui::EndChild();
-
-            if (ImGui::InputText("Hold these at normal", m_PinPropPattern, sizeof(m_PinPropPattern))) {
+        if (ImGui::TreeNode("Advanced (Instinct color)")) {
+            ImGui::TextDisabled("Instinct's grey is the game's color-grading texture 008C1F5C7305A978. It is recolored on the GPU,");
+            ImGui::TextDisabled("so only the 3D scene changes. It is only used while Instinct is on.");
+            const char* s_States[] = {"Shader resource (default)", "Common"};
+            if (ImGui::Combo("GPU texture state", &m_LutBarrier, s_States, 2)) {
+                m_LutFailSig.store(0);
                 s_Changed = true;
-                m_PinRebuild = true;
             }
-            ImGui::TextDisabled("Comma-separated property names. Empty = off. They are held at their normal value while Instinct is active.");
-            ImGui::TreePop();
-        }
-
-        if (ImGui::TreeNode("Search the whole scene for Instinct's grey (advanced)")) {
-            ImGui::TextDisabled("Finds every value in the loaded mission that Instinct changes, not only post-filter ones.");
-            ImGui::TextDisabled("1) Untick the tint above. In a mission, Instinct OFF, stand still, click 'Record normal look' (takes ~2 s).");
-            ImGui::TextDisabled("2) Click 'Record during Instinct', then hold Instinct for about a second.");
-            ImGui::TextDisabled("3) Switch entries ON one by one: while Instinct is active they are held at their normal value.");
-            ImGui::TextDisabled("   When the grey disappears, that entry is the one. Then click 'Save report' and send me InstinctChanges.txt.");
-
-            ImGui::Checkbox("Also read values behind getter functions (finds more, small risk of a crash)", &m_FullUseGetters);
-
-            if (ImGui::Button("Record normal look##full")) m_FullRecordReq = true;
+            ImGui::TextDisabled("Only change this if the color does not apply or the picture glitches.");
+            if (ImGui::Button("Re-read vanilla texture")) m_LutReread = true;
             ImGui::SameLine();
-            const bool s_FullArmed = m_FullInstinctArmed.load();
-            ImGui::BeginDisabled(m_FullStatus.load() < 1);
-            if (ImGui::Button(s_FullArmed ? "Waiting for Instinct... (click to cancel)##full" : "Record during Instinct##full")) {
-                m_FullInstinctArmed = !s_FullArmed;
-            }
-            ImGui::EndDisabled();
-
-            if (m_FullWait.load() > 0.0f) {
-                ImGui::Text("Recording the normal look again in %.1f s - stay still, no Instinct...", m_FullWait.load());
-            } else if (m_FullStatus.load() >= 1) {
-                ImGui::Text("Normal look: %d values from %d entities, %d moved on their own (ignored)", m_FullRecCount.load(),
-                            m_FullEntities.load(), m_FullNoiseCount.load());
-            } else {
-                ImGui::TextDisabled("Normal look: not recorded yet");
-            }
-            if (m_FullChangedCount.load() >= 0) {
-                ImGui::Text("%d value(s) changed during Instinct. Rare entries first:", m_FullChangedCount.load());
-            }
-
-            if (ImGui::Button("Switch all ON##full")) {
-                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
-                for (auto& s_Group : m_FullGroups) s_Group.m_Pinned = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Switch all OFF##full")) {
-                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
-                for (auto& s_Group : m_FullGroups) s_Group.m_Pinned = false;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Save report")) m_FullSaveReq = true;
-            if (m_FullReportSaved.load() == 1) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("saved: InstinctChanges.txt (in the mod folder)");
-            } else if (m_FullReportSaved.load() == -1) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("could not write the file");
-            }
-
-            ImGui::BeginChild("##fullreport", ImVec2(0.0f, 220.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
-            {
-                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
-                for (size_t i = 0; i < m_FullGroups.size(); ++i) {
-                    ImGui::PushID(static_cast<int>(i));
-                    ImGui::Checkbox(m_FullGroups[i].m_Text.c_str(), &m_FullGroups[i].m_Pinned);
-                    ImGui::PopID();
-                }
-                if (m_FullGroups.empty()) ImGui::TextDisabled("(nothing compared yet)");
-            }
-            ImGui::EndChild();
+            ImGui::TextDisabled("(after a game update)");
             ImGui::TreePop();
         }
 
