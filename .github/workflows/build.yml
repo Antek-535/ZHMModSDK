@@ -33,10 +33,17 @@ jobs:
                     arch: x64
 
             -   name: Bootstrap vcpkg
-                # Done here, by hand, so the real error shows up in this step's output if it fails.
-                # If it works, CMake finds vcpkg.exe already built and skips its own bootstrap.
-                shell: cmd
-                run: External\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+                # Done here, by hand, so a flaky download (like a 504 from GitHub) is retried instead of failing the run.
+                # Once vcpkg.exe exists, CMake skips its own bootstrap.
+                shell: powershell
+                run: |
+                    for ($i = 1; $i -le 6; $i++) {
+                        & "External\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+                        if ($LASTEXITCODE -eq 0 -and (Test-Path "External\vcpkg\vcpkg.exe")) { exit 0 }
+                        Write-Host "vcpkg bootstrap attempt $i of 6 failed, retrying in 30 seconds..."
+                        Start-Sleep -Seconds 30
+                    }
+                    exit 1
 
             -   name: Build and install debug
                 run: |
