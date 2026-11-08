@@ -575,6 +575,7 @@ BetterInstinct::~BetterInstinct() {
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
+    RestoreTint();
     CloseSound();
     g_Guard.reset(); // removes the input hooks
 
@@ -747,6 +748,12 @@ void BetterInstinct::LoadSettings() {
     m_LowColor[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_g", m_LowColor[1])), 0.0f, 1.0f);
     m_LowColor[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_b", m_LowColor[2])), 0.0f, 1.0f);
 
+    m_TintEnabled = GetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    m_InstinctTint[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_r", m_InstinctTint[0])), 0.0f, 1.0f);
+    m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
+    m_InstinctTint[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_b", m_InstinctTint[2])), 0.0f, 1.0f);
+    m_TintStrength = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_strength", m_TintStrength)), 0.0f, 1.0f);
+
     // Older versions saved a plain white meter colour: switch to the new gold look once.
     if (GetSettingInt(kSection, "hud_style", 0) < 2) {
         m_FillColor[0] = 1.00f;
@@ -788,6 +795,12 @@ void BetterInstinct::SaveSettings() {
     SetSettingDouble(kSection, "low_r", m_LowColor[0]);
     SetSettingDouble(kSection, "low_g", m_LowColor[1]);
     SetSettingDouble(kSection, "low_b", m_LowColor[2]);
+
+    SetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    SetSettingDouble(kSection, "tint_r", m_InstinctTint[0]);
+    SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
+    SetSettingDouble(kSection, "tint_b", m_InstinctTint[2]);
+    SetSettingDouble(kSection, "tint_strength", m_TintStrength);
 
     SetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     SetSettingInt(kSection, "sound_source", m_SoundSource);
@@ -904,6 +917,12 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("low_r", m_LowColor[0]);
         s_Flt("low_g", m_LowColor[1]);
         s_Flt("low_b", m_LowColor[2]);
+
+        s_Bool("tint_enabled", m_TintEnabled);
+        s_Flt("tint_r", m_InstinctTint[0]);
+        s_Flt("tint_g", m_InstinctTint[1]);
+        s_Flt("tint_b", m_InstinctTint[2]);
+        s_Flt("tint_strength", m_TintStrength);
 
         s_Bool("sound_enabled", m_SoundEnabled);
         s_Int("sound_source", m_SoundSource);
@@ -1029,6 +1048,12 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("low_r", m_LowColor[0], 0.0f, 1.0f);
     s_Flt("low_g", m_LowColor[1], 0.0f, 1.0f);
     s_Flt("low_b", m_LowColor[2], 0.0f, 1.0f);
+
+    s_Bool("tint_enabled", m_TintEnabled);
+    s_Flt("tint_r", m_InstinctTint[0], 0.0f, 1.0f);
+    s_Flt("tint_g", m_InstinctTint[1], 0.0f, 1.0f);
+    s_Flt("tint_b", m_InstinctTint[2], 0.0f, 1.0f);
+    s_Flt("tint_strength", m_TintStrength, 0.0f, 1.0f);
 
     s_Bool("sound_enabled", m_SoundEnabled);
     s_Int("sound_source", m_SoundSource, 0, 1);
@@ -2553,6 +2578,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         g_HipAssist = false;
         ReleaseHipClick(); // never leave the left button held when leaving the mission
         ResetPointShooting();
+        UpdateTint(s_Dt, false); // fade out and restore the tint when there is no player
 
         if (m_NoPlayerTime > 1.0f) { // really out of the mission (not just a short gap): start the next one fresh
             m_Meter = 1.0f;
@@ -2650,6 +2676,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     }
 
     m_Active.store(s_Want);
+    UpdateTint(s_Dt, s_Want);
     g_HipGameMs = m_HipGameMs;
     g_HipAssist = m_HipAssist && m_PsState.load() == PS_IDLE && (s_Want || m_CurrentScale < 0.9f); // also covers the short blend back to normal speed
 
@@ -2706,6 +2733,51 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         m_CurrentScale = 1.0f;
         m_Touched = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Instinct color tint
+// ---------------------------------------------------------------------------
+
+// Runs every frame (also outside missions, with p_Active = false, so the tint always fades out and is restored).
+void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
+    const float s_Target = (m_TintEnabled && p_Active) ? 1.0f : 0.0f;
+
+    float s_Blend = m_TintBlend.load();
+    s_Blend += (s_Target - s_Blend) * std::clamp(m_BlendSpeed * p_Dt, 0.0f, 1.0f);
+    if (std::abs(s_Target - s_Blend) < 0.002f) s_Blend = s_Target;
+    m_TintBlend.store(s_Blend);
+
+    if (s_Blend > 0.0f) {
+        ApplyTint(s_Blend);
+    } else if (m_TintApplied) {
+        RestoreTint();
+    }
+}
+
+void BetterInstinct::ApplyTint(float p_Blend) {
+    // A multiplier on the world's colors: 1 = unchanged, so blend 0 or strength 0 is exactly the vanilla look.
+    const float s_Amount = std::clamp(p_Blend * m_TintStrength, 0.0f, 1.0f);
+    for (int i = 0; i < 3; ++i) {
+        m_TintMultiplier[i] = 1.0f + (std::clamp(m_InstinctTint[i], 0.0f, 1.0f) - 1.0f) * s_Amount;
+    }
+    m_TintApplied = true;
+
+    // ENGINE LAYER (not connected yet):
+    // Write m_TintMultiplier into the color-filter / multiplier parameter of the game's post-filter that carries
+    // the Instinct look. That post-filter is part of the 3D scene render, so the UI, menus and map stay untouched.
+    //  - Save the original value the first time through, and put exactly that value back in RestoreTint().
+    //  - Set m_TintHookReady = true only once the write really reaches the engine (the settings window shows it).
+    // To find the right entity type and property name, look through the SDK's Glacier headers / ZHMTools type
+    // definitions for "Postfilter" and "ColorGrading", and inspect the live entities with the SDK's editor
+    // tools while Instinct is on.
+}
+
+void BetterInstinct::RestoreTint() {
+    m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
+    m_TintApplied = false;
+
+    // ENGINE LAYER (not connected yet): put back the original post-filter value saved in ApplyTint().
 }
 
 // ---------------------------------------------------------------------------
@@ -3038,6 +3110,9 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
                         m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
             ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
+            ImGui::Text("Tint blend=%.2f  multiplier=(%.2f, %.2f, %.2f)  applied=%s  engine hook=%s", m_TintBlend.load(),
+                        m_TintMultiplier[0], m_TintMultiplier[1], m_TintMultiplier[2], m_TintApplied ? "yes" : "no",
+                        m_TintHookReady ? "connected" : "not connected");
             ImGui::Text("Game-level block: %s   blocked polls=%u", m_InputBlock.load() ? "ON" : "off", m_BlockedPolls.load());
             ImGui::TextDisabled("Updates stay at 0 outside a mission. Hold your Instinct key in a mission and watch these.");
 
@@ -3166,6 +3241,24 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             m_Meter = 1.0f;
             m_Locked = false;
         }
+
+        ImGui::Separator();
+
+        // --- Instinct color tint ---
+        if (ImGui::Checkbox("Tint the world while Instinct is active", &m_TintEnabled)) s_Changed = true;
+        ImGui::BeginDisabled(!m_TintEnabled);
+        if (ImGui::ColorEdit3("Instinct tint", m_InstinctTint)) s_Changed = true;
+        if (ImGui::SliderFloat("Tint strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::Button("Reset tint")) {
+            m_InstinctTint[0] = 0.30f;
+            m_InstinctTint[1] = 0.70f;
+            m_InstinctTint[2] = 1.00f;
+            m_TintStrength = 0.70f;
+            s_Changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled(m_TintHookReady ? "World tint: connected to the game's color grading"
+                                            : "World tint: engine hook not connected yet (see ApplyTint in the source)");
 
         ImGui::Separator();
 
