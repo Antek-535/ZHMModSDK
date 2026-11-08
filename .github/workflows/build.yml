@@ -32,6 +32,17 @@ jobs:
                 with:
                     arch: x64
 
+            -   name: Restore vcpkg cache
+                # Keeps already built packages and downloads between runs, so a flaky download only has to be redone once.
+                uses: actions/cache/restore@v4
+                with:
+                    path: |
+                        ~\AppData\Local\vcpkg\archives
+                        External\vcpkg\downloads
+                    key: vcpkg-${{ runner.os }}-${{ github.run_id }}
+                    restore-keys: |
+                        vcpkg-${{ runner.os }}-
+
             -   name: Bootstrap vcpkg
                 # Done here, by hand, so a flaky download (like a 504 from GitHub) is retried instead of failing the run.
                 # Once vcpkg.exe exists, CMake skips its own bootstrap.
@@ -46,22 +57,42 @@ jobs:
                     exit 1
 
             -   name: Build and install debug
+                shell: pwsh
                 run: |
-                    cmake --preset x64-Debug .
+                    $ok = $false
+                    for ($i = 1; $i -le 5; $i++) {
+                        cmake --preset x64-Debug .
+                        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+                        Write-Host "Configure attempt $i of 5 failed (usually a flaky download), retrying in 45 seconds..."
+                        Start-Sleep -Seconds 45
+                    }
+                    if (-not $ok) { exit 1 }
                     cmake --build _build/x64-Debug -j12
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
                     cmake --install _build/x64-Debug
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
 
             -   name: Build and install release
+                shell: pwsh
                 run: |
-                    cmake --preset x64-Release .
+                    $ok = $false
+                    for ($i = 1; $i -le 5; $i++) {
+                        cmake --preset x64-Release .
+                        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+                        Write-Host "Configure attempt $i of 5 failed (usually a flaky download), retrying in 45 seconds..."
+                        Start-Sleep -Seconds 45
+                    }
+                    if (-not $ok) { exit 1 }
                     cmake --build _build/x64-Release -j12
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
                     cmake --install _build/x64-Release
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
 
             -   name: Show vcpkg logs (only runs when something failed)
                 if: failure()
                 shell: powershell
                 run: |
-                    Get-ChildItem -Path _build -Recurse -Include vcpkg-bootstrap.log -ErrorAction SilentlyContinue | ForEach-Object {
+                    Get-ChildItem -Path _build -Recurse -Include vcpkg-*.log -ErrorAction SilentlyContinue | ForEach-Object {
                         Write-Host "===== $($_.FullName)"
                         Get-Content $_.FullName
                     }
@@ -69,6 +100,15 @@ jobs:
                         Write-Host "===== $($_.FullName)"
                         Get-Content $_.FullName -Tail 60
                     }
+
+            -   name: Save vcpkg cache
+                if: always()
+                uses: actions/cache/save@v4
+                with:
+                    path: |
+                        ~\AppData\Local\vcpkg\archives
+                        External\vcpkg\downloads
+                    key: vcpkg-${{ runner.os }}-${{ github.run_id }}
 
             -   name: Copy debug artifacts
                 run: |
