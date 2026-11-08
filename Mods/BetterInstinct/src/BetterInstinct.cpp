@@ -759,6 +759,7 @@ void BetterInstinct::LoadSettings() {
     m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
     m_InstinctTint[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_b", m_InstinctTint[2])), 0.0f, 1.0f);
     m_TintStrength = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_strength", m_TintStrength)), 0.0f, 1.0f);
+    m_TintKeepBrightness = GetSettingBool(kSection, "tint_keep_brightness", m_TintKeepBrightness);
 
     // Older versions saved a plain white meter colour: switch to the new gold look once.
     if (GetSettingInt(kSection, "hud_style", 0) < 2) {
@@ -807,6 +808,7 @@ void BetterInstinct::SaveSettings() {
     SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
     SetSettingDouble(kSection, "tint_b", m_InstinctTint[2]);
     SetSettingDouble(kSection, "tint_strength", m_TintStrength);
+    SetSettingBool(kSection, "tint_keep_brightness", m_TintKeepBrightness);
 
     SetSettingBool(kSection, "sound_enabled", m_SoundEnabled);
     SetSettingInt(kSection, "sound_source", m_SoundSource);
@@ -929,6 +931,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("tint_g", m_InstinctTint[1]);
         s_Flt("tint_b", m_InstinctTint[2]);
         s_Flt("tint_strength", m_TintStrength);
+        s_Bool("tint_keep_brightness", m_TintKeepBrightness);
 
         s_Bool("sound_enabled", m_SoundEnabled);
         s_Int("sound_source", m_SoundSource);
@@ -1062,6 +1065,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("tint_g", m_InstinctTint[1], 0.0f, 1.0f);
     s_Flt("tint_b", m_InstinctTint[2], 0.0f, 1.0f);
     s_Flt("tint_strength", m_TintStrength, 0.0f, 1.0f);
+    s_Bool("tint_keep_brightness", m_TintKeepBrightness);
 
     s_Bool("sound_enabled", m_SoundEnabled);
     s_Int("sound_source", m_SoundSource, 0, 1);
@@ -2805,8 +2809,21 @@ void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
 void BetterInstinct::ApplyTint(float p_Blend) {
     // A multiplier on the world's colors: 1 = unchanged, so blend 0 or strength 0 is exactly the vanilla look.
     const float s_Amount = std::clamp(p_Blend * m_TintStrength, 0.0f, 1.0f);
+
+    float s_Color[3];
+    for (int i = 0; i < 3; ++i) s_Color[i] = std::clamp(m_InstinctTint[i], 0.0f, 1.0f);
+
+    // Instinct's own grey look is already in the picture, and multiplying grey by a color (e.g. red = 1, 0, 0) throws
+    // away most of its brightness, so the result looks dark and still grey. With "keep brightness" the color is scaled
+    // so its perceived brightness equals the untinted picture: the world gets the hue without getting darker.
+    if (m_TintKeepBrightness) {
+        const float s_Luma = 0.2126f * s_Color[0] + 0.7152f * s_Color[1] + 0.0722f * s_Color[2];
+        const float s_Gain = std::min(1.0f / std::max(s_Luma, 0.001f), 6.0f);
+        for (int i = 0; i < 3; ++i) s_Color[i] *= s_Gain;
+    }
+
     for (int i = 0; i < 3; ++i) {
-        m_TintMultiplier[i] = 1.0f + (std::clamp(m_InstinctTint[i], 0.0f, 1.0f) - 1.0f) * s_Amount;
+        m_TintMultiplier[i] = 1.0f + (s_Color[i] - 1.0f) * s_Amount;
     }
     m_TintApplied = true;
 
@@ -3482,11 +3499,14 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::BeginDisabled(!m_TintEnabled);
         if (ImGui::ColorEdit3("Instinct tint", m_InstinctTint)) s_Changed = true;
         if (ImGui::SliderFloat("Tint strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::Checkbox("Keep brightness (recommended)", &m_TintKeepBrightness)) s_Changed = true;
+        ImGui::TextDisabled("Tip: raise Tint strength towards 1.00 to push the color through Instinct's grey.");
         if (ImGui::Button("Reset tint")) {
             m_InstinctTint[0] = 0.30f;
             m_InstinctTint[1] = 0.70f;
             m_InstinctTint[2] = 1.00f;
             m_TintStrength = 0.70f;
+            m_TintKeepBrightness = true;
             s_Changed = true;
         }
         ImGui::EndDisabled();
