@@ -43,6 +43,13 @@ private:
     bool m_ConfigReady = false;
     void DrawHud();
 
+    // Instinct color tint: a smooth 0..1 blend follows Instinct on/off and is handed to the engine layer.
+    // The tint is a multiplier on the world's color grading (white = unchanged). It is never an ImGui
+    // overlay, so the game's own UI, menus and map are not affected.
+    void UpdateTint(float p_Dt, bool p_Active);
+    void ApplyTint(float p_Blend);
+    void RestoreTint();
+
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
     void LoadSoundText();
     void SaveSoundText();
@@ -106,6 +113,12 @@ private:
     float m_HudAlpha = 0.0f;         // HUD fade 0..1
     bool m_InPlay = false;
     float m_LastHudDt = 0.016f;
+
+    // --- Instinct tint runtime state ---
+    std::atomic<float> m_TintBlend{0.0f};           // 0 = no tint, 1 = full tint (follows Instinct smoothly)
+    float m_TintMultiplier[3] = {1.0f, 1.0f, 1.0f}; // what the engine layer should apply (white = neutral)
+    bool m_TintApplied = false;                     // true while non-neutral values are pushed to the engine
+    bool m_TintHookReady = false;                   // true once ApplyTint really reaches the engine
     std::chrono::steady_clock::time_point m_LastFrame = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point m_HudLast = std::chrono::steady_clock::now();
     std::atomic<uint32_t> m_FrameCount{0};
@@ -253,6 +266,10 @@ private:
     float m_HudOpacity = 0.95f;
     float m_FillColor[3] = {1.00f, 0.78f, 0.28f}; // gold
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
+
+    bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
+    float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color Instinct tints the world with
+    float m_TintStrength = 0.70f;    // 0 = no visible tint, 1 = the full chosen color
 
     bool m_SoundEnabled = true;
     int m_SoundSource = 0;           // 0 = preset / folder, 1 = custom file
