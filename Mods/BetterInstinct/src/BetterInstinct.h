@@ -24,6 +24,32 @@
 
 // Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
+// Full scene search (finds everything Instinct changes). Plain data, kept at namespace level so the cpp helpers can use it.
+struct SFullRec {                // one recorded value (compact: millions of these can exist)
+    uintptr_t m_Key = 0;         // entity address
+    const SPropertyData* m_Prop = nullptr;
+    uint32_t m_Id = 0;           // property id
+    float m_V[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint8_t m_Comps = 1;
+    uint8_t m_Kind = 0;          // 0 = float-like, 1 = bool, 2 = int32
+};
+struct SFullDiffItem {           // one value that changed during Instinct
+    ZEntityRef m_Entity;
+    const SPropertyData* m_Prop = nullptr;
+    uint32_t m_Id = 0;
+    uint8_t m_Comps = 1;
+    uint8_t m_Kind = 0;
+    float m_Before[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // the normal value
+    size_t m_Group = 0;
+};
+struct SFullGroup {              // entries with the same entity type + property are shown as one line
+    std::string m_Text;
+    std::string m_Label;
+    int m_Count = 0;
+    bool m_Pinnable = true;
+    bool m_Pinned = false;       // switched on = held at its normal value while Instinct is active
+};
+
 class BetterInstinct : public IPluginInterface {
 public:
     ~BetterInstinct() override;
@@ -107,6 +133,31 @@ private:
     float m_SnapAutoCooldown = 3.0f;
     std::vector<STintReportItem> m_DiffReport;     // guarded by m_TintReportMutex
     char m_PinPropPattern[128] = {};               // comma-separated parts of property names held at their normal value
+
+    // --- Full scene search ---
+    void UpdateFullSearch(float p_Dt, bool p_Instinct);
+    void WriteFullPins();
+    bool WriteFullRec(const SFullDiffItem& p_Item, const float* p_Values);
+    void SaveFullReport();
+    std::vector<SFullRec> m_FullA;                 // first normal recording (dropped once the noise is known)
+    std::vector<SFullRec> m_FullB;                 // second normal recording (compared against Instinct)
+    std::vector<std::pair<uintptr_t, uint32_t>> m_FullNoise; // values that moved on their own, sorted
+    std::vector<SFullDiffItem> m_FullDiff;         // game thread only
+    std::vector<SFullGroup> m_FullGroups;          // guarded by m_TintReportMutex
+    int m_FullPhase = 0;                           // 0 idle, 1 waiting for the second normal recording, 2 normal look ready
+    float m_FullTimer = 0.0f;
+    float m_FullHold = 0.0f;
+    bool m_FullUseGetters = false;                 // also read properties that sit behind getter functions (riskier)
+    std::atomic<bool> m_FullRecordReq{false};
+    std::atomic<bool> m_FullInstinctArmed{false};
+    std::atomic<bool> m_FullSaveReq{false};
+    std::atomic<int> m_FullStatus{0};              // 0 nothing, 1 normal look recorded, 2 Instinct compared
+    std::atomic<int> m_FullRecCount{0};
+    std::atomic<int> m_FullNoiseCount{0};
+    std::atomic<int> m_FullChangedCount{-1};
+    std::atomic<int> m_FullEntities{0};
+    std::atomic<int> m_FullReportSaved{0};         // 1 = saved, -1 = could not write the file
+    std::atomic<float> m_FullWait{0.0f};
 
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
     void LoadSoundText();
