@@ -301,6 +301,7 @@ private:
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
     float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color Instinct tints the world with
     float m_TintStrength = 0.70f;    // 0 = no visible tint, 1 = the full chosen color
+    bool m_TintKeepBrightness = true; // keep the picture as bright as vanilla Instinct (a plain color multiply makes it much darker)
     char m_TintTypePattern[64] = "postfilter"; // entities whose type name contains this (case-insensitive) are searched
     char m_TintPropPattern[128] = {};          // comma-separated parts of the color property name to drive (pick one in the list)
 
