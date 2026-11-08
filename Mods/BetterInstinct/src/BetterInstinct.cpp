@@ -20,7 +20,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <queue>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <imgui.h>
@@ -35,6 +37,10 @@
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZHitman5.h"
 #include "Glacier/ZObject.h"
+#include "Glacier/ZModule.h"
+#include "Glacier/ZScene.h"
+#include "Glacier/SColorRGB.h"
+#include "Glacier/SColorRGBA.h"
 #include "Glacier/ZSpatialEntity.h"
 #include "Glacier/ZGameTime.h"
 #include "Glacier/ZInput.h"
@@ -935,6 +941,8 @@ bool BetterInstinct::SaveConfigFile() {
         s_Str("preset_name", m_PresetName);
         s_Str("custom_path", m_CustomPath);
         s_Str("action_patterns", m_ActionPatterns);
+        s_Str("tint_type_pattern", m_TintTypePattern);
+        s_Str("tint_prop_pattern", m_TintPropPattern);
 
         s_File.flush();
         if (!s_File.good()) return false;
@@ -1066,6 +1074,9 @@ bool BetterInstinct::LoadConfigFile() {
     if (const std::string* p = s_Find("preset_name")) m_PresetName = *p;
     s_Str("custom_path", m_CustomPath, sizeof(m_CustomPath));
     s_Str("action_patterns", m_ActionPatterns, sizeof(m_ActionPatterns));
+    s_Str("tint_type_pattern", m_TintTypePattern, sizeof(m_TintTypePattern));
+    s_Str("tint_prop_pattern", m_TintPropPattern, sizeof(m_TintPropPattern));
+    if (m_TintTypePattern[0] == '\0') std::snprintf(m_TintTypePattern, sizeof(m_TintTypePattern), "%s", "postfilter");
     if (m_ActionPatterns[0] == '\0') {
         std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", "instinct,focus");
     }
@@ -2741,7 +2752,43 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 
 // Runs every frame (also outside missions, with p_Active = false, so the tint always fades out and is restored).
 void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
-    const float s_Target = (m_TintEnabled && p_Active) ? 1.0f : 0.0f;
+    const bool s_InPlay = m_HasPlayer.load();
+
+    // Entities of an unloaded scene are gone: forget them without touching them.
+    if (!s_InPlay) {
+        if (m_NoPlayerTime > 0.25f && (!m_TintTargets.empty() || m_TintScanDone || m_TintApplied)) {
+            m_TintTargets.clear();
+            m_TintTargetCount = 0;
+            m_TintScanDone = false;
+            m_TintScanTries = 0;
+            m_TintScanCooldown = 2.0f;
+            m_TintWritten = false;
+            m_TintApplied = false;
+            m_TintHookReady = false;
+            m_TintBlend.store(0.0f);
+            m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
+        }
+        return;
+    }
+
+    // Find the post-filter properties once per mission (a few retries, because parts of the scene stream in later).
+    if (m_TintRescan.exchange(false)) {
+        RestoreTint();
+        m_TintScanDone = false;
+        m_TintScanTries = 0;
+        m_TintScanCooldown = 0.0f;
+    }
+    if (m_TintEnabled && !m_TintScanDone) {
+        m_TintScanCooldown -= p_Dt;
+        if (m_TintScanCooldown <= 0.0f) {
+            ScanTintTargets();
+            ++m_TintScanTries;
+            m_TintScanCooldown = 3.0f;
+            if (!m_TintTargets.empty() || m_TintScanTries >= 4) m_TintScanDone = true;
+        }
+    }
+
+    const float s_Target = (m_TintEnabled && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
 
     float s_Blend = m_TintBlend.load();
     s_Blend += (s_Target - s_Blend) * std::clamp(m_BlendSpeed * p_Dt, 0.0f, 1.0f);
@@ -2763,21 +2810,207 @@ void BetterInstinct::ApplyTint(float p_Blend) {
     }
     m_TintApplied = true;
 
-    // ENGINE LAYER (not connected yet):
-    // Write m_TintMultiplier into the color-filter / multiplier parameter of the game's post-filter that carries
-    // the Instinct look. That post-filter is part of the 3D scene render, so the UI, menus and map stay untouched.
-    //  - Save the original value the first time through, and put exactly that value back in RestoreTint().
-    //  - Set m_TintHookReady = true only once the write really reaches the engine (the settings window shows it).
-    // To find the right entity type and property name, look through the SDK's Glacier headers / ZHMTools type
-    // definitions for "Postfilter" and "ColorGrading", and inspect the live entities with the SDK's editor
-    // tools while Instinct is on.
+    if (m_TintTargets.empty()) {
+        m_TintHookReady = false;
+        return;
+    }
+
+    // Only touch the engine when the value really moved (each write runs the entity's change handlers).
+    bool s_Moved = !m_TintWritten;
+    for (int i = 0; i < 3; ++i) {
+        if (std::abs(m_TintMultiplier[i] - m_TintLastWritten[i]) > 0.002f) s_Moved = true;
+    }
+    if (!s_Moved) return;
+
+    // ENGINE LAYER: the post-filter is part of the 3D scene render, so the UI, menus and map stay untouched.
+    // The written value is (original value) * (tint multiplier), so a white original becomes exactly the tint.
+    bool s_AnyOk = false;
+    for (auto& s_Target : m_TintTargets) {
+        const float s_Value[3] = {
+            s_Target.m_Original[0] * m_TintMultiplier[0],
+            s_Target.m_Original[1] * m_TintMultiplier[1],
+            s_Target.m_Original[2] * m_TintMultiplier[2],
+        };
+        if (WriteTintTarget(s_Target, s_Value)) s_AnyOk = true;
+    }
+
+    for (int i = 0; i < 3; ++i) m_TintLastWritten[i] = m_TintMultiplier[i];
+    m_TintWritten = true;
+    m_TintHookReady = s_AnyOk;
 }
 
 void BetterInstinct::RestoreTint() {
-    m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
-    m_TintApplied = false;
+    // Put back exactly what was found at scan time (only while the scene's entities are alive).
+    if (m_TintWritten && m_HasPlayer.load()) {
+        for (auto& s_Target : m_TintTargets) {
+            WriteTintTarget(s_Target, s_Target.m_Original);
+        }
+    }
 
-    // ENGINE LAYER (not connected yet): put back the original post-filter value saved in ApplyTint().
+    m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
+    m_TintLastWritten[0] = m_TintLastWritten[1] = m_TintLastWritten[2] = 1.0f;
+    m_TintWritten = false;
+    m_TintApplied = false;
+}
+
+bool BetterInstinct::WriteTintTarget(STintTarget& p_Target, const float* p_Rgb) {
+    if (!p_Target.m_Entity.GetEntity() || !p_Target.m_Type) return false;
+
+    // Same pattern the SDK's Editor uses: wrap a raw value in a ZObjectRef of the property's own type.
+    float s_Buffer[4] = {p_Rgb[0], p_Rgb[1], p_Rgb[2], p_Target.m_Components == 4 ? p_Target.m_Original[3] : 0.0f};
+    ZObjectRef s_Value;
+    s_Value.Assign(p_Target.m_Type, s_Buffer);
+    return p_Target.m_Entity.SetProperty(p_Target.m_PropertyId, s_Value, true);
+}
+
+// Walks every loaded brick the way the SDK's Editor builds its entity tree, looking for entities whose type name matches
+// m_TintTypePattern. Their color-typed properties go into the report (for the picker); the ones whose name matches
+// m_TintPropPattern become tint targets.
+void BetterInstinct::ScanTintTargets() {
+    m_TintTargets.clear();
+    m_TintTargetCount = 0;
+    m_TintMatchedEntities = 0;
+    m_TintScanned = 0;
+
+    std::vector<STintReportItem> s_Report;
+    std::set<std::string> s_ReportSeen;
+
+    auto s_Lower = [](std::string s_Text) {
+        std::transform(s_Text.begin(), s_Text.end(), s_Text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return s_Text;
+    };
+    auto s_Split = [&](const char* p_Text) {
+        std::vector<std::string> s_Out;
+        std::string s_Cur;
+        auto s_Flush = [&]() {
+            const size_t a = s_Cur.find_first_not_of(" \t");
+            if (a != std::string::npos) s_Out.push_back(s_Lower(s_Cur.substr(a, s_Cur.find_last_not_of(" \t") - a + 1)));
+            s_Cur.clear();
+        };
+        for (const char* p = p_Text; *p; ++p) {
+            if (*p == ',') s_Flush(); else s_Cur += *p;
+        }
+        s_Flush();
+        return s_Out;
+    };
+
+    const std::string s_TypePattern = s_Lower(m_TintTypePattern);
+    const std::vector<std::string> s_PropPatterns = s_Split(m_TintPropPattern);
+
+    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
+    if (s_TypePattern.empty() || !s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) {
+        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+        m_TintReport.clear();
+        return;
+    }
+
+    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
+    std::unordered_set<ZEntityRef> s_Visited;
+    std::unordered_set<ZEntityRef> s_Expanded;
+
+    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
+        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
+            s_Queue.emplace(p_Factory, p_Root);
+        }
+    };
+
+    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
+        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
+        if (!s_BrickEntity) continue;
+        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
+    }
+
+    int s_Scanned = 0;
+    int s_Matched = 0;
+    constexpr int kMaxEntities = 600000; // safety cap
+
+    while (!s_Queue.empty() && s_Scanned < kMaxEntities) {
+        const auto [s_Factory, s_Root] = s_Queue.front();
+        s_Queue.pop();
+
+        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
+        for (int i = 0; i < s_SubCount && s_Scanned < kMaxEntities; ++i) {
+            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
+            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
+
+            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
+            if (!s_Visited.insert(s_Sub).second) {
+                s_Enqueue(s_SubFactory, s_Sub);
+                continue;
+            }
+            ++s_Scanned;
+            s_Enqueue(s_SubFactory, s_Sub);
+
+            const auto* s_Type = s_Sub->GetType();
+            if (!s_Type->m_pInterfaceData || !s_Type->m_pPropertyData) continue;
+
+            std::string s_TypeName;
+            for (const auto& s_Interface : *s_Type->m_pInterfaceData) {
+                if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
+                const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
+                if (s_Name && ContainsNoCase(s_Name, s_TypePattern)) {
+                    s_TypeName = s_Name;
+                    break;
+                }
+            }
+            if (s_TypeName.empty()) continue;
+            ++s_Matched;
+
+            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
+                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
+                const auto* s_Info = s_Property->GetPropertyInfo();
+                if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) continue;
+
+                const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
+                if (!s_ValueType) continue;
+                const bool s_IsRgb = std::strcmp(s_ValueType, "SColorRGB") == 0 || std::strcmp(s_ValueType, "SVector3") == 0;
+                const bool s_IsRgba = std::strcmp(s_ValueType, "SColorRGBA") == 0;
+                if (!s_IsRgb && !s_IsRgba) continue;
+
+                char s_Hex[16];
+                std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", s_Property->m_nPropertyID);
+                const std::string s_PropName = (s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
+
+                const std::string s_Line = s_TypeName + "." + s_PropName + " : " + s_ValueType;
+                if (s_ReportSeen.insert(s_Line).second && s_Report.size() < 400) {
+                    s_Report.push_back({s_Line, s_PropName});
+                }
+
+                // Is this the property the player picked?
+                bool s_Wanted = false;
+                const std::string s_PropLower = s_Lower(s_PropName);
+                for (const auto& s_Pattern : s_PropPatterns) {
+                    if (s_PropLower.find(s_Pattern) != std::string::npos) { s_Wanted = true; break; }
+                }
+                if (!s_Wanted) continue;
+
+                // Plain data members only: properties behind a getter/setter can't be read back safely here.
+                if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
+
+                STintTarget s_Target;
+                s_Target.m_Entity = s_Sub;
+                s_Target.m_PropertyId = s_Property->m_nPropertyID;
+                s_Target.m_Type = s_Info->m_propertyInfo.m_Type;
+                s_Target.m_Components = s_IsRgba ? 4 : 3;
+
+                const float* s_Raw = reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(s_Sub.m_pObj) + s_Property->m_nPropertyOffset);
+                bool s_Sane = true;
+                for (int k = 0; k < s_Target.m_Components; ++k) {
+                    s_Target.m_Original[k] = s_Raw[k];
+                    if (!std::isfinite(s_Raw[k]) || std::abs(s_Raw[k]) > 1000.0f) s_Sane = false;
+                }
+                if (s_Sane) m_TintTargets.push_back(std::move(s_Target));
+            }
+        }
+    }
+
+    m_TintScanned = s_Scanned;
+    m_TintMatchedEntities = s_Matched;
+    m_TintTargetCount = static_cast<int>(m_TintTargets.size());
+    m_TintWritten = false;
+
+    std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+    m_TintReport = std::move(s_Report);
 }
 
 // ---------------------------------------------------------------------------
@@ -3258,7 +3491,43 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         }
         ImGui::EndDisabled();
         ImGui::TextDisabled(m_TintHookReady ? "World tint: connected to the game's color grading"
-                                            : "World tint: engine hook not connected yet (see ApplyTint in the source)");
+                                            : "World tint: not connected yet (pick a post-filter color property below)");
+
+        if (ImGui::TreeNode("Tint engine hook (post-filter property)")) {
+            ImGui::TextDisabled("The tint is written into a color property of the game's post-filter entities (scene render only),");
+            ImGui::TextDisabled("so UI, menus and map stay untouched. Pick which property to drive from the list the scan found.");
+
+            if (ImGui::InputText("Entity type contains", m_TintTypePattern, sizeof(m_TintTypePattern))) {
+                s_Changed = true;
+                m_TintRescan = true;
+            }
+            if (ImGui::InputText("Property name contains", m_TintPropPattern, sizeof(m_TintPropPattern))) {
+                s_Changed = true;
+                m_TintRescan = true;
+            }
+            if (ImGui::Button("Rescan scene")) m_TintRescan = true;
+            ImGui::SameLine();
+            ImGui::Checkbox("Test: show tint without Instinct", &m_TintForceTest);
+
+            ImGui::Text("Scanned %d entities, %d matching type, %d tint target(s)", m_TintScanned.load(), m_TintMatchedEntities.load(),
+                        m_TintTargetCount.load());
+            ImGui::TextDisabled("Scanning only runs in a mission with the tint enabled. Click a property to use it:");
+
+            ImGui::BeginChild("##tintreport", ImVec2(0.0f, 140.0f), true);
+            {
+                std::lock_guard<std::mutex> s_ReportLock(m_TintReportMutex);
+                for (const auto& s_Item : m_TintReport) {
+                    if (ImGui::Selectable(s_Item.m_Text.c_str(), s_Item.m_Prop == m_TintPropPattern)) {
+                        std::snprintf(m_TintPropPattern, sizeof(m_TintPropPattern), "%s", s_Item.m_Prop.c_str());
+                        s_Changed = true;
+                        m_TintRescan = true;
+                    }
+                }
+                if (m_TintReport.empty()) ImGui::TextDisabled("(nothing found yet)");
+            }
+            ImGui::EndChild();
+            ImGui::TreePop();
+        }
 
         ImGui::Separator();
 
