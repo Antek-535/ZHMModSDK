@@ -81,6 +81,33 @@ private:
     std::mutex m_TintReportMutex;
     std::vector<STintReportItem> m_TintReport;
 
+    // "Find what Instinct changes": records the post-filter values in the normal look and during Instinct, lists what
+    // differs, and can hold chosen properties at their normal value while Instinct is active (removes the grey).
+    struct SSnapItem {
+        STintTarget m_Target;        // entity + property + type; m_Original = the value that was recorded
+        uintptr_t m_Key = 0;         // entity address (to match the same entity in both recordings)
+        size_t m_Offset = 0;         // where the value lives inside the entity
+        std::string m_Label;         // "EntityType.property : valueType"
+        std::string m_PropName;
+        bool m_Pinnable = true;      // false for bool / int values (listed only)
+    };
+    void RecordPostfilter(std::vector<SSnapItem>& p_Out);
+    void BuildInstinctDiff(const std::vector<SSnapItem>& p_Now);
+    void RebuildPins();
+    void WritePins();
+    std::vector<SSnapItem> m_SnapNormal;
+    std::vector<SSnapItem> m_Pins;                 // the part of m_SnapNormal whose property name matches m_PinPropPattern
+    std::atomic<bool> m_SnapNormalReq{false};
+    std::atomic<bool> m_SnapInstinctArmed{false};
+    std::atomic<bool> m_SnapHaveNormal{false};
+    std::atomic<bool> m_PinRebuild{false};
+    std::atomic<int> m_SnapNormalCount{0};
+    std::atomic<int> m_SnapChangedCount{-1};       // -1 = no Instinct recording yet
+    float m_SnapHoldTime = 0.0f;
+    float m_SnapAutoCooldown = 3.0f;
+    std::vector<STintReportItem> m_DiffReport;     // guarded by m_TintReportMutex
+    char m_PinPropPattern[128] = {};               // comma-separated parts of property names held at their normal value
+
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
     void LoadSoundText();
     void SaveSoundText();
