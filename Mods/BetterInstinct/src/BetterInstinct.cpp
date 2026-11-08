@@ -2776,6 +2776,21 @@ void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
             m_TintBlend.store(0.0f);
             m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
         }
+        if (m_NoPlayerTime > 0.25f && (m_FullPhase != 0 || !m_FullDiff.empty() || !m_FullB.empty() || m_FullStatus.load() != 0)) {
+            m_FullA.clear();
+            m_FullB.clear();
+            m_FullNoise.clear();
+            m_FullDiff.clear();
+            {
+                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
+                m_FullGroups.clear();
+            }
+            m_FullPhase = 0;
+            m_FullStatus = 0;
+            m_FullChangedCount = -1;
+            m_FullInstinctArmed = false;
+            m_FullRecordReq = false;
+        }
         if (m_NoPlayerTime > 0.25f && (m_SnapHaveNormal.load() || !m_SnapNormal.empty())) {
             m_SnapNormal.clear();
             m_Pins.clear();
@@ -2833,8 +2848,9 @@ void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
     }
     if (m_PinRebuild.exchange(false)) RebuildPins();
     if (s_Instinct && !m_Pins.empty() && !m_SnapInstinctArmed.load()) WritePins();
+    UpdateFullSearch(p_Dt, s_Instinct);
 
-    const float s_Target = (m_TintEnabled && !m_SnapInstinctArmed.load() && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
+    const float s_Target = (m_TintEnabled && !m_SnapInstinctArmed.load() && !m_FullInstinctArmed.load() && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
 
     float s_Blend = m_TintBlend.load();
     s_Blend += (s_Target - s_Blend) * std::clamp(m_BlendSpeed * p_Dt, 0.0f, 1.0f);
@@ -3323,6 +3339,427 @@ void BetterInstinct::WritePins() {
         }
         if (s_Differs) WriteTintTarget(s_Pin.m_Target, s_Pin.m_Target.m_Original);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Full scene search: finds EVERYTHING Instinct changes in the loaded scene (not only post-filter entities).
+//   1) Record the normal look twice, a moment apart: whatever differs between the two moves on its own (noise).
+//   2) Record during Instinct: whatever differs from the normal look and is not noise is listed.
+//   3) Each list entry has a switch that holds it at its normal value while Instinct is active, so you can find out
+//      which one is the grey just by flipping switches and looking at the screen.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kFullMaxRecords = 2000000; // safety cap on recorded values
+constexpr int kFullMaxDiffItems = 20000;
+
+struct SFullValue {
+    uint8_t m_Kind = 0;  // 0 = float-like, 1 = bool, 2 = int32
+    uint8_t m_Comps = 1;
+    float m_V[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+// Reads one property as plain numbers. Returns false for anything that is not a simple number-like value.
+bool FullReadProperty(const ZEntityRef& p_Entity, const SPropertyData* p_Prop, bool p_AllowGetters, SFullValue& p_Out) {
+    const auto* s_Info = p_Prop->GetPropertyInfo();
+    if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) return false;
+
+    const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
+    if (!s_ValueType) return false;
+
+    uint8_t s_Kind = 0;
+    uint8_t s_Comps = 0;
+    if (std::strcmp(s_ValueType, "float32") == 0 || std::strcmp(s_ValueType, "float") == 0) s_Comps = 1;
+    else if (std::strcmp(s_ValueType, "SVector2") == 0) s_Comps = 2;
+    else if (std::strcmp(s_ValueType, "SVector3") == 0 || std::strcmp(s_ValueType, "SColorRGB") == 0) s_Comps = 3;
+    else if (std::strcmp(s_ValueType, "SVector4") == 0 || std::strcmp(s_ValueType, "SColorRGBA") == 0) s_Comps = 4;
+    else if (std::strcmp(s_ValueType, "bool") == 0) { s_Kind = 1; s_Comps = 1; }
+    else if (std::strcmp(s_ValueType, "int32") == 0) { s_Kind = 2; s_Comps = 1; }
+    else return false;
+
+    const uintptr_t s_Address = reinterpret_cast<uintptr_t>(p_Entity.m_pObj) + p_Prop->m_nPropertyOffset;
+    alignas(16) uint8_t s_Raw[32] = {};
+    const size_t s_Size = s_Kind == 1 ? 1 : (s_Kind == 2 ? 4 : static_cast<size_t>(s_Comps) * 4);
+
+    if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) {
+        // Same call the SDK's own GetProperty makes. Optional, because a getter on an odd entity could misbehave.
+        if (!p_AllowGetters || !s_Info->m_propertyInfo.m_PropertyGetter) return false;
+        s_Info->m_propertyInfo.m_PropertyGetter(reinterpret_cast<void*>(s_Address), s_Raw, s_Info->m_propertyInfo.m_nExtraData);
+    } else {
+        std::memcpy(s_Raw, reinterpret_cast<const void*>(s_Address), s_Size);
+    }
+
+    p_Out.m_Kind = s_Kind;
+    p_Out.m_Comps = s_Comps;
+    for (int k = 0; k < 4; ++k) p_Out.m_V[k] = 0.0f;
+
+    if (s_Kind == 1) {
+        p_Out.m_V[0] = s_Raw[0] ? 1.0f : 0.0f;
+    } else if (s_Kind == 2) {
+        int32_t s_Int = 0;
+        std::memcpy(&s_Int, s_Raw, sizeof(s_Int));
+        p_Out.m_V[0] = static_cast<float>(s_Int);
+    } else {
+        float s_Floats[4] = {};
+        std::memcpy(s_Floats, s_Raw, s_Size);
+        for (int k = 0; k < s_Comps; ++k) {
+            if (!std::isfinite(s_Floats[k]) || std::abs(s_Floats[k]) > 100000.0f) return false;
+            p_Out.m_V[k] = s_Floats[k];
+        }
+    }
+    return true;
+}
+
+// Visits every number-like property of every entity of every loaded brick.
+template <typename F>
+void FullWalkScene(bool p_AllowGetters, F&& p_Fn, int& p_EntityCount) {
+    p_EntityCount = 0;
+
+    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
+    if (!s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) return;
+
+    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
+    std::unordered_set<ZEntityRef> s_Visited;
+    std::unordered_set<ZEntityRef> s_Expanded;
+
+    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
+        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
+            s_Queue.emplace(p_Factory, p_Root);
+        }
+    };
+
+    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
+        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
+        if (!s_BrickEntity) continue;
+        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
+    }
+
+    int s_Records = 0;
+    constexpr int kMaxEntities = 600000;
+
+    while (!s_Queue.empty() && p_EntityCount < kMaxEntities && s_Records < kFullMaxRecords) {
+        const auto [s_Factory, s_Root] = s_Queue.front();
+        s_Queue.pop();
+
+        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
+        for (int i = 0; i < s_SubCount && p_EntityCount < kMaxEntities && s_Records < kFullMaxRecords; ++i) {
+            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
+            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
+
+            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
+            if (!s_Visited.insert(s_Sub).second) {
+                s_Enqueue(s_SubFactory, s_Sub);
+                continue;
+            }
+            ++p_EntityCount;
+            s_Enqueue(s_SubFactory, s_Sub);
+
+            const auto* s_Type = s_Sub->GetType();
+            if (!s_Type->m_pPropertyData) continue;
+
+            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
+                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
+                SFullValue s_Value;
+                if (!FullReadProperty(s_Sub, s_Property, p_AllowGetters, s_Value)) continue;
+                p_Fn(s_Sub, s_Property, s_Value);
+                ++s_Records;
+            }
+        }
+    }
+}
+
+// "EntityType.propertyName : valueType"
+std::string FullLabel(const ZEntityRef& p_Entity, const SPropertyData* p_Prop) {
+    std::string s_Type = "?";
+    const auto* s_T = p_Entity.GetEntity() ? p_Entity->GetType() : nullptr;
+    if (s_T && s_T->m_pInterfaceData) {
+        bool s_Found = false;
+        for (const auto& s_Interface : *s_T->m_pInterfaceData) {
+            if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
+            const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
+            if (!s_Name) continue;
+            if (!s_Found || (s_Name[0] == 'Z' && s_Type[0] != 'Z')) {
+                s_Type = s_Name;
+                s_Found = true;
+            }
+        }
+    }
+
+    const auto* s_Info = p_Prop->GetPropertyInfo();
+    char s_Hex[16];
+    std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", p_Prop->m_nPropertyID);
+    const std::string s_PropName = (s_Info && s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
+    const char* s_ValueType = (s_Info && s_Info->m_propertyInfo.m_Type && s_Info->m_propertyInfo.m_Type->GetTypeInfo() &&
+                               s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName)
+        ? s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName : "?";
+    return s_Type + "." + s_PropName + " : " + s_ValueType;
+}
+
+std::string FullFormat(const float* p_Values, int p_Count) {
+    std::string s_Out = "(";
+    for (int k = 0; k < p_Count; ++k) {
+        char s_Buf[32];
+        std::snprintf(s_Buf, sizeof(s_Buf), "%.3f", p_Values[k]);
+        if (k > 0) s_Out += ", ";
+        s_Out += s_Buf;
+    }
+    return s_Out + ")";
+}
+
+bool FullDiffers(const float* p_A, const float* p_B, int p_Comps) {
+    for (int k = 0; k < p_Comps; ++k) {
+        if (std::abs(p_A[k] - p_B[k]) > 0.001f) return true;
+    }
+    return false;
+}
+
+const SFullRec* FullFind(const std::vector<SFullRec>& p_Sorted, uintptr_t p_Key, uint32_t p_Id) {
+    const auto s_It = std::lower_bound(p_Sorted.begin(), p_Sorted.end(), std::make_pair(p_Key, p_Id),
+        [](const SFullRec& p_Rec, const std::pair<uintptr_t, uint32_t>& p_Want) {
+            return p_Rec.m_Key != p_Want.first ? p_Rec.m_Key < p_Want.first : p_Rec.m_Id < p_Want.second;
+        });
+    if (s_It == p_Sorted.end() || s_It->m_Key != p_Key || s_It->m_Id != p_Id) return nullptr;
+    return &*s_It;
+}
+
+bool FullIsNoise(const std::vector<std::pair<uintptr_t, uint32_t>>& p_Sorted, uintptr_t p_Key, uint32_t p_Id) {
+    return std::binary_search(p_Sorted.begin(), p_Sorted.end(), std::make_pair(p_Key, p_Id));
+}
+
+} // namespace
+
+bool BetterInstinct::WriteFullRec(const SFullDiffItem& p_Item, const float* p_Values) {
+    if (!p_Item.m_Entity.GetEntity() || !p_Item.m_Prop) return false;
+    const auto* s_Info = p_Item.m_Prop->GetPropertyInfo();
+    if (!s_Info || !s_Info->m_propertyInfo.m_Type) return false;
+
+    alignas(16) uint8_t s_Buffer[32] = {};
+    if (p_Item.m_Kind == 1) {
+        s_Buffer[0] = p_Values[0] > 0.5f ? 1 : 0;
+    } else if (p_Item.m_Kind == 2) {
+        const int32_t s_Int = static_cast<int32_t>(std::lround(p_Values[0]));
+        std::memcpy(s_Buffer, &s_Int, sizeof(s_Int));
+    } else {
+        float s_Floats[4] = {p_Values[0], p_Values[1], p_Values[2], p_Values[3]};
+        std::memcpy(s_Buffer, s_Floats, static_cast<size_t>(p_Item.m_Comps) * 4);
+    }
+
+    ZObjectRef s_Value;
+    s_Value.Assign(s_Info->m_propertyInfo.m_Type, s_Buffer);
+    return p_Item.m_Entity.SetProperty(p_Item.m_Id, s_Value, true);
+}
+
+// Puts every switched-on entry back to its normal value whenever the game moved it away (runs while Instinct is active).
+void BetterInstinct::WriteFullPins() {
+    std::vector<char> s_Pinned;
+    {
+        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+        s_Pinned.reserve(m_FullGroups.size());
+        for (const auto& s_Group : m_FullGroups) s_Pinned.push_back(s_Group.m_Pinned && s_Group.m_Pinnable ? 1 : 0);
+    }
+
+    for (const auto& s_Item : m_FullDiff) {
+        if (s_Item.m_Group >= s_Pinned.size() || !s_Pinned[s_Item.m_Group]) continue;
+        if (!s_Item.m_Entity.GetEntity()) continue;
+
+        SFullValue s_Current;
+        const bool s_Read = FullReadProperty(s_Item.m_Entity, s_Item.m_Prop, m_FullUseGetters, s_Current);
+        if (s_Read && !FullDiffers(s_Current.m_V, s_Item.m_Before, s_Item.m_Comps)) continue;
+        WriteFullRec(s_Item, s_Item.m_Before);
+    }
+}
+
+void BetterInstinct::UpdateFullSearch(float p_Dt, bool p_Instinct) {
+    // --- Step 1: record the normal look twice (the difference between the two is noise) ---
+    if (m_FullRecordReq.load()) {
+        if (!p_Instinct && m_TintBlend.load() <= 0.0f && m_FullPhase == 0) {
+            m_FullRecordReq = false;
+            m_FullA.clear();
+            m_FullB.clear();
+            m_FullNoise.clear();
+            m_FullDiff.clear();
+            {
+                std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+                m_FullGroups.clear();
+            }
+            m_FullStatus = 0;
+            m_FullChangedCount = -1;
+
+            int s_Entities = 0;
+            FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
+                SFullRec s_Rec;
+                s_Rec.m_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
+                s_Rec.m_Prop = p_Prop;
+                s_Rec.m_Id = p_Prop->m_nPropertyID;
+                s_Rec.m_Comps = p_Value.m_Comps;
+                s_Rec.m_Kind = p_Value.m_Kind;
+                for (int k = 0; k < 4; ++k) s_Rec.m_V[k] = p_Value.m_V[k];
+                m_FullA.push_back(s_Rec);
+            }, s_Entities);
+            std::sort(m_FullA.begin(), m_FullA.end(), [](const SFullRec& a, const SFullRec& b) {
+                return a.m_Key != b.m_Key ? a.m_Key < b.m_Key : a.m_Id < b.m_Id;
+            });
+            m_FullEntities = s_Entities;
+            m_FullRecCount = static_cast<int>(m_FullA.size());
+            m_FullPhase = 1;
+            m_FullTimer = 1.5f;
+        } else if (p_Instinct) {
+            m_FullRecordReq = false; // can't record the normal look during Instinct
+        }
+    }
+
+    if (m_FullPhase == 1) {
+        if (p_Instinct) {
+            m_FullPhase = 0;
+            std::vector<SFullRec>().swap(m_FullA);
+            m_FullWait = 0.0f;
+        } else {
+            m_FullTimer -= p_Dt;
+            m_FullWait = std::max(0.0f, m_FullTimer);
+            if (m_FullTimer <= 0.0f) {
+                int s_Entities = 0;
+                FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
+                    SFullRec s_Rec;
+                    s_Rec.m_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
+                    s_Rec.m_Prop = p_Prop;
+                    s_Rec.m_Id = p_Prop->m_nPropertyID;
+                    s_Rec.m_Comps = p_Value.m_Comps;
+                    s_Rec.m_Kind = p_Value.m_Kind;
+                    for (int k = 0; k < 4; ++k) s_Rec.m_V[k] = p_Value.m_V[k];
+                    m_FullB.push_back(s_Rec);
+
+                    if (const SFullRec* s_Was = FullFind(m_FullA, s_Rec.m_Key, s_Rec.m_Id)) {
+                        if (FullDiffers(s_Was->m_V, s_Rec.m_V, s_Rec.m_Comps)) m_FullNoise.emplace_back(s_Rec.m_Key, s_Rec.m_Id);
+                    }
+                }, s_Entities);
+                std::sort(m_FullB.begin(), m_FullB.end(), [](const SFullRec& a, const SFullRec& b) {
+                    return a.m_Key != b.m_Key ? a.m_Key < b.m_Key : a.m_Id < b.m_Id;
+                });
+                std::sort(m_FullNoise.begin(), m_FullNoise.end());
+                std::vector<SFullRec>().swap(m_FullA);
+
+                m_FullNoiseCount = static_cast<int>(m_FullNoise.size());
+                m_FullRecCount = static_cast<int>(m_FullB.size());
+                m_FullEntities = s_Entities;
+                m_FullPhase = 2;
+                m_FullStatus = 1;
+                m_FullWait = 0.0f;
+            }
+        }
+    }
+
+    // --- Step 2: record during Instinct and list what changed (and is not noise) ---
+    if (m_FullInstinctArmed.load()) {
+        if (m_FullPhase == 2 && p_Instinct) {
+            m_FullHold += p_Dt; // wait until Instinct has fully faded in
+            if (m_FullHold >= 0.8f) {
+                m_FullHold = 0.0f;
+                m_FullInstinctArmed = false;
+                m_FullDiff.clear();
+
+                std::map<std::string, size_t> s_GroupIndex;
+                std::vector<SFullGroup> s_Groups;
+
+                int s_Entities = 0;
+                FullWalkScene(m_FullUseGetters, [&](const ZEntityRef& p_Entity, const SPropertyData* p_Prop, const SFullValue& p_Value) {
+                    if (static_cast<int>(m_FullDiff.size()) >= kFullMaxDiffItems) return;
+                    const uintptr_t s_Key = reinterpret_cast<uintptr_t>(p_Entity.m_pObj);
+                    const SFullRec* s_Was = FullFind(m_FullB, s_Key, p_Prop->m_nPropertyID);
+                    if (!s_Was || !FullDiffers(s_Was->m_V, p_Value.m_V, p_Value.m_Comps)) return;
+                    if (FullIsNoise(m_FullNoise, s_Key, p_Prop->m_nPropertyID)) return;
+
+                    const std::string s_Label = FullLabel(p_Entity, p_Prop);
+                    auto s_Slot = s_GroupIndex.find(s_Label);
+                    if (s_Slot == s_GroupIndex.end()) {
+                        SFullGroup s_Group;
+                        s_Group.m_Label = s_Label;
+                        s_Group.m_Pinnable = true;
+                        s_Group.m_Text = s_Label + "   " + FullFormat(s_Was->m_V, p_Value.m_Comps) + " -> " + FullFormat(p_Value.m_V, p_Value.m_Comps);
+                        s_Groups.push_back(s_Group);
+                        s_Slot = s_GroupIndex.emplace(s_Label, s_Groups.size() - 1).first;
+                    }
+                    ++s_Groups[s_Slot->second].m_Count;
+
+                    SFullDiffItem s_Item;
+                    s_Item.m_Entity = p_Entity;
+                    s_Item.m_Prop = p_Prop;
+                    s_Item.m_Id = p_Prop->m_nPropertyID;
+                    s_Item.m_Comps = p_Value.m_Comps;
+                    s_Item.m_Kind = p_Value.m_Kind;
+                    for (int k = 0; k < 4; ++k) s_Item.m_Before[k] = s_Was->m_V[k];
+                    s_Item.m_Group = s_Slot->second; // re-mapped below after sorting
+                    m_FullDiff.push_back(s_Item);
+                }, s_Entities);
+
+                // Rare entries first: the grey is usually one or a few entities, noise is usually hundreds.
+                std::vector<size_t> s_Order(s_Groups.size());
+                for (size_t i = 0; i < s_Order.size(); ++i) s_Order[i] = i;
+                std::stable_sort(s_Order.begin(), s_Order.end(), [&](size_t a, size_t b) {
+                    return s_Groups[a].m_Count < s_Groups[b].m_Count;
+                });
+                std::vector<size_t> s_NewIndex(s_Groups.size());
+                std::vector<SFullGroup> s_Sorted;
+                for (size_t i = 0; i < s_Order.size(); ++i) {
+                    s_NewIndex[s_Order[i]] = i;
+                    SFullGroup s_Group = s_Groups[s_Order[i]];
+                    s_Group.m_Text += "   x" + std::to_string(s_Group.m_Count);
+                    s_Sorted.push_back(std::move(s_Group));
+                }
+                for (auto& s_Item : m_FullDiff) s_Item.m_Group = s_NewIndex[s_Item.m_Group];
+
+                m_FullChangedCount = static_cast<int>(m_FullDiff.size());
+                {
+                    std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+                    m_FullGroups = std::move(s_Sorted);
+                }
+                m_FullStatus = 2;
+            }
+        } else {
+            m_FullHold = 0.0f;
+            if (m_FullPhase != 2) m_FullInstinctArmed = false;
+        }
+    }
+
+    if (p_Instinct && !m_FullDiff.empty() && !m_FullInstinctArmed.load()) WriteFullPins();
+
+    if (m_FullSaveReq.exchange(false)) SaveFullReport();
+}
+
+// Writes everything the search found to InstinctChanges.txt next to the mod (easy to send for analysis).
+void BetterInstinct::SaveFullReport() {
+    std::ofstream s_File(fs::path(m_ModDir + L"InstinctChanges.txt"), std::ios::trunc);
+    if (!s_File) {
+        m_FullReportSaved = -1;
+        return;
+    }
+
+    s_File << "BetterInstinct: values that changed while Instinct was active (noise removed)\n";
+    s_File << "Scanned entities: " << m_FullEntities.load() << ", recorded values: " << m_FullRecCount.load()
+           << ", values that moved on their own (ignored): " << m_FullNoiseCount.load()
+           << ", getters read: " << (m_FullUseGetters ? "yes" : "no") << "\n\n";
+
+    std::vector<SFullGroup> s_Groups;
+    {
+        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+        s_Groups = m_FullGroups;
+    }
+
+    for (size_t g = 0; g < s_Groups.size(); ++g) {
+        s_File << "[" << g << "] " << s_Groups[g].m_Text << (s_Groups[g].m_Pinned ? "   <- held at normal" : "") << "\n";
+        int s_Shown = 0;
+        for (const auto& s_Item : m_FullDiff) {
+            if (s_Item.m_Group != g || s_Shown >= 8) continue;
+            SFullValue s_Now;
+            const bool s_Read = FullReadProperty(s_Item.m_Entity, s_Item.m_Prop, m_FullUseGetters, s_Now);
+            s_File << "      entity 0x" << std::hex << reinterpret_cast<uintptr_t>(s_Item.m_Entity.m_pObj) << std::dec << "  before "
+                   << FullFormat(s_Item.m_Before, s_Item.m_Comps) << "  now "
+                   << (s_Read ? FullFormat(s_Now.m_V, s_Item.m_Comps) : std::string("?")) << "\n";
+            ++s_Shown;
+        }
+    }
+    s_File.flush();
+    m_FullReportSaved = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -3884,6 +4321,69 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 m_PinRebuild = true;
             }
             ImGui::TextDisabled("Comma-separated property names. Empty = off. They are held at their normal value while Instinct is active.");
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Search the whole scene for Instinct's grey (advanced)")) {
+            ImGui::TextDisabled("Finds every value in the loaded mission that Instinct changes, not only post-filter ones.");
+            ImGui::TextDisabled("1) Untick the tint above. In a mission, Instinct OFF, stand still, click 'Record normal look' (takes ~2 s).");
+            ImGui::TextDisabled("2) Click 'Record during Instinct', then hold Instinct for about a second.");
+            ImGui::TextDisabled("3) Switch entries ON one by one: while Instinct is active they are held at their normal value.");
+            ImGui::TextDisabled("   When the grey disappears, that entry is the one. Then click 'Save report' and send me InstinctChanges.txt.");
+
+            ImGui::Checkbox("Also read values behind getter functions (finds more, small risk of a crash)", &m_FullUseGetters);
+
+            if (ImGui::Button("Record normal look##full")) m_FullRecordReq = true;
+            ImGui::SameLine();
+            const bool s_FullArmed = m_FullInstinctArmed.load();
+            ImGui::BeginDisabled(m_FullStatus.load() < 1);
+            if (ImGui::Button(s_FullArmed ? "Waiting for Instinct... (click to cancel)##full" : "Record during Instinct##full")) {
+                m_FullInstinctArmed = !s_FullArmed;
+            }
+            ImGui::EndDisabled();
+
+            if (m_FullWait.load() > 0.0f) {
+                ImGui::Text("Recording the normal look again in %.1f s - stay still, no Instinct...", m_FullWait.load());
+            } else if (m_FullStatus.load() >= 1) {
+                ImGui::Text("Normal look: %d values from %d entities, %d moved on their own (ignored)", m_FullRecCount.load(),
+                            m_FullEntities.load(), m_FullNoiseCount.load());
+            } else {
+                ImGui::TextDisabled("Normal look: not recorded yet");
+            }
+            if (m_FullChangedCount.load() >= 0) {
+                ImGui::Text("%d value(s) changed during Instinct. Rare entries first:", m_FullChangedCount.load());
+            }
+
+            if (ImGui::Button("Switch all ON##full")) {
+                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
+                for (auto& s_Group : m_FullGroups) s_Group.m_Pinned = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Switch all OFF##full")) {
+                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
+                for (auto& s_Group : m_FullGroups) s_Group.m_Pinned = false;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save report")) m_FullSaveReq = true;
+            if (m_FullReportSaved.load() == 1) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("saved: InstinctChanges.txt (in the mod folder)");
+            } else if (m_FullReportSaved.load() == -1) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("could not write the file");
+            }
+
+            ImGui::BeginChild("##fullreport", ImVec2(0.0f, 220.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+            {
+                std::lock_guard<std::mutex> s_FullLock(m_TintReportMutex);
+                for (size_t i = 0; i < m_FullGroups.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::Checkbox(m_FullGroups[i].m_Text.c_str(), &m_FullGroups[i].m_Pinned);
+                    ImGui::PopID();
+                }
+                if (m_FullGroups.empty()) ImGui::TextDisabled("(nothing compared yet)");
+            }
+            ImGui::EndChild();
             ImGui::TreePop();
         }
 
