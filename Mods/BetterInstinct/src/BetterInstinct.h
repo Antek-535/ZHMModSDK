@@ -19,6 +19,8 @@
 #include <Glacier/ZInput.h>
 #include <Glacier/ZObject.h>
 #include <Glacier/ZItem.h>
+#include <Glacier/ZModule.h>
+#include <Glacier/ZScene.h>
 
 // Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
@@ -49,6 +51,35 @@ private:
     void UpdateTint(float p_Dt, bool p_Active);
     void ApplyTint(float p_Blend);
     void RestoreTint();
+
+    // Engine layer: finds the post-filter entities of the loaded scene and drives one color property on them.
+    // Everything here runs on the game-loop thread; the settings window only reads counters and the report.
+    struct STintTarget {
+        ZEntityRef m_Entity;
+        uint32_t m_PropertyId = 0;
+        decltype(SPropertyInfo::m_Type) m_Type = nullptr; // the property's own reflection type (SColorRGB / SColorRGBA / SVector3)
+        int m_Components = 3;                             // 3 = RGB, 4 = RGBA (alpha is kept as it was)
+        float m_Original[4] = {1.0f, 1.0f, 1.0f, 1.0f};   // value found at scan time, restored when the tint ends
+    };
+    struct STintReportItem {
+        std::string m_Text; // "EntityType.propertyName : valueType"
+        std::string m_Prop; // just the property name (what the picker stores)
+    };
+    void ScanTintTargets();
+    bool WriteTintTarget(STintTarget& p_Target, const float* p_Rgb);
+    std::vector<STintTarget> m_TintTargets;
+    bool m_TintScanDone = false;
+    int m_TintScanTries = 0;
+    float m_TintScanCooldown = 2.0f;
+    float m_TintLastWritten[3] = {1.0f, 1.0f, 1.0f};
+    bool m_TintWritten = false;
+    std::atomic<bool> m_TintRescan{false};
+    std::atomic<int> m_TintTargetCount{0};
+    std::atomic<int> m_TintMatchedEntities{0};
+    std::atomic<int> m_TintScanned{0};
+    bool m_TintForceTest = false;                    // debug: show the tint without Instinct, to check the hook
+    std::mutex m_TintReportMutex;
+    std::vector<STintReportItem> m_TintReport;
 
     // Sound (Windows MCI, same approach as the old InstinctSounds mod).
     void LoadSoundText();
@@ -270,6 +301,8 @@ private:
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
     float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color Instinct tints the world with
     float m_TintStrength = 0.70f;    // 0 = no visible tint, 1 = the full chosen color
+    char m_TintTypePattern[64] = "postfilter"; // entities whose type name contains this (case-insensitive) are searched
+    char m_TintPropPattern[128] = {};          // comma-separated parts of the color property name to drive (pick one in the list)
 
     bool m_SoundEnabled = true;
     int m_SoundSource = 0;           // 0 = preset / folder, 1 = custom file
