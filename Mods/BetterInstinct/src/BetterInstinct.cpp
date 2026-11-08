@@ -3547,7 +3547,8 @@ bool BetterInstinct::WriteFullRec(const SFullDiffItem& p_Item, const float* p_Va
 
     ZObjectRef s_Value;
     s_Value.Assign(s_Info->m_propertyInfo.m_Type, s_Buffer);
-    return p_Item.m_Entity.SetProperty(p_Item.m_Id, s_Value, true);
+    ZEntityRef s_Entity = p_Item.m_Entity; // SetProperty is not const
+    return s_Entity.SetProperty(p_Item.m_Id, s_Value, true);
 }
 
 // Puts every switched-on entry back to its normal value whenever the game moved it away (runs while Instinct is active).
