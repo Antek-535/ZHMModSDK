@@ -1,5 +1,7 @@
 #include "BetterInstinct.h"
 
+#include <map>
+
 #include <Windows.h>
 #include <mmsystem.h>
 #include <commdlg.h>
@@ -946,6 +948,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Str("action_patterns", m_ActionPatterns);
         s_Str("tint_type_pattern", m_TintTypePattern);
         s_Str("tint_prop_pattern", m_TintPropPattern);
+        s_Str("pin_prop_pattern", m_PinPropPattern);
 
         s_File.flush();
         if (!s_File.good()) return false;
@@ -1080,6 +1083,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Str("action_patterns", m_ActionPatterns, sizeof(m_ActionPatterns));
     s_Str("tint_type_pattern", m_TintTypePattern, sizeof(m_TintTypePattern));
     s_Str("tint_prop_pattern", m_TintPropPattern, sizeof(m_TintPropPattern));
+    s_Str("pin_prop_pattern", m_PinPropPattern, sizeof(m_PinPropPattern));
     if (m_TintTypePattern[0] == '\0') std::snprintf(m_TintTypePattern, sizeof(m_TintTypePattern), "%s", "postfilter");
     if (m_ActionPatterns[0] == '\0') {
         std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", "instinct,focus");
@@ -2772,6 +2776,13 @@ void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
             m_TintBlend.store(0.0f);
             m_TintMultiplier[0] = m_TintMultiplier[1] = m_TintMultiplier[2] = 1.0f;
         }
+        if (m_NoPlayerTime > 0.25f && (m_SnapHaveNormal.load() || !m_SnapNormal.empty())) {
+            m_SnapNormal.clear();
+            m_Pins.clear();
+            m_SnapHaveNormal = false;
+            m_SnapAutoCooldown = 3.0f;
+            m_SnapHoldTime = 0.0f;
+        }
         return;
     }
 
@@ -2792,7 +2803,38 @@ void BetterInstinct::UpdateTint(float p_Dt, bool p_Active) {
         }
     }
 
-    const float s_Target = (m_TintEnabled && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
+    // --- Find what Instinct changes / hold the grey at its normal value ---
+    const bool s_Instinct = p_Active;
+    if (m_PinPropPattern[0] != '\0' && !m_SnapHaveNormal.load() && !s_Instinct && m_TintBlend.load() <= 0.0f) {
+        m_SnapAutoCooldown -= p_Dt; // once per mission, a few seconds after the scene is up
+        if (m_SnapAutoCooldown <= 0.0f) m_SnapNormalReq = true;
+    }
+    if (m_SnapNormalReq.load() && !s_Instinct && m_TintBlend.load() <= 0.0f) {
+        m_SnapNormalReq = false;
+        RecordPostfilter(m_SnapNormal);
+        m_SnapHaveNormal = !m_SnapNormal.empty();
+        m_SnapNormalCount = static_cast<int>(m_SnapNormal.size());
+        m_SnapAutoCooldown = 3.0f;
+        m_PinRebuild = true;
+    }
+    if (m_SnapInstinctArmed.load()) {
+        if (s_Instinct && m_SnapHaveNormal.load()) {
+            m_SnapHoldTime += p_Dt; // wait until Instinct has fully faded in
+            if (m_SnapHoldTime >= 0.8f) {
+                std::vector<SSnapItem> s_Now;
+                RecordPostfilter(s_Now);
+                BuildInstinctDiff(s_Now);
+                m_SnapInstinctArmed = false;
+                m_SnapHoldTime = 0.0f;
+            }
+        } else {
+            m_SnapHoldTime = 0.0f;
+        }
+    }
+    if (m_PinRebuild.exchange(false)) RebuildPins();
+    if (s_Instinct && !m_Pins.empty() && !m_SnapInstinctArmed.load()) WritePins();
+
+    const float s_Target = (m_TintEnabled && !m_SnapInstinctArmed.load() && (p_Active || m_TintForceTest)) ? 1.0f : 0.0f;
 
     float s_Blend = m_TintBlend.load();
     s_Blend += (s_Target - s_Blend) * std::clamp(m_BlendSpeed * p_Dt, 0.0f, 1.0f);
@@ -3028,6 +3070,259 @@ void BetterInstinct::ScanTintTargets() {
 
     std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
     m_TintReport = std::move(s_Report);
+}
+
+// Reads every plain number-like property (float, vectors, colors, bool, int) of the post-filter entities.
+void BetterInstinct::RecordPostfilter(std::vector<SSnapItem>& p_Out) {
+    p_Out.clear();
+
+    auto s_Lower = [](std::string s_Text) {
+        std::transform(s_Text.begin(), s_Text.end(), s_Text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return s_Text;
+    };
+    const std::string s_TypePattern = s_Lower(m_TintTypePattern);
+
+    const auto s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
+    if (s_TypePattern.empty() || !s_Ctx || !s_Ctx->m_pScene || !s_Ctx->m_pScene.m_entityRef || s_Ctx->m_aLoadedBricks.size() == 0) {
+        return;
+    }
+
+    std::queue<std::pair<ZEntityBlueprintFactoryBase*, ZEntityRef>> s_Queue;
+    std::unordered_set<ZEntityRef> s_Visited;
+    std::unordered_set<ZEntityRef> s_Expanded;
+
+    auto s_Enqueue = [&](ZEntityBlueprintFactoryBase* p_Factory, const ZEntityRef& p_Root) {
+        if (p_Factory && p_Factory->GetSubEntitiesCount() > 0 && s_Expanded.insert(p_Root).second) {
+            s_Queue.emplace(p_Factory, p_Root);
+        }
+    };
+
+    for (const auto& s_Brick : s_Ctx->m_aLoadedBricks) {
+        const ZEntityRef s_BrickEntity = s_Brick.m_EntityRef;
+        if (!s_BrickEntity) continue;
+        s_Enqueue(s_BrickEntity.GetBlueprintFactory(), s_BrickEntity);
+    }
+
+    int s_Scanned = 0;
+    int s_Matched = 0;
+    constexpr int kMaxEntities = 600000; // safety cap
+
+    while (!s_Queue.empty() && s_Scanned < kMaxEntities) {
+        const auto [s_Factory, s_Root] = s_Queue.front();
+        s_Queue.pop();
+
+        const int64_t s_SubCount = s_Factory->GetSubEntitiesCount();
+        for (int i = 0; i < s_SubCount && s_Scanned < kMaxEntities; ++i) {
+            const ZEntityRef s_Sub = s_Factory->GetSubEntity(s_Root.m_pObj, i);
+            const auto s_SubFactory = s_Factory->GetSubEntityBlueprint(i);
+
+            if (!s_Sub.GetEntity() || !s_Sub->GetType()) continue;
+            if (!s_Visited.insert(s_Sub).second) {
+                s_Enqueue(s_SubFactory, s_Sub);
+                continue;
+            }
+            ++s_Scanned;
+            s_Enqueue(s_SubFactory, s_Sub);
+
+            const auto* s_Type = s_Sub->GetType();
+            if (!s_Type->m_pInterfaceData || !s_Type->m_pPropertyData) continue;
+
+            std::string s_TypeName;
+            for (const auto& s_Interface : *s_Type->m_pInterfaceData) {
+                if (!s_Interface.m_Type || !s_Interface.m_Type->GetTypeInfo()) continue;
+                const char* s_Name = s_Interface.m_Type->GetTypeInfo()->pszTypeName;
+                if (s_Name && ContainsNoCase(s_Name, s_TypePattern)) {
+                    s_TypeName = s_Name;
+                    break;
+                }
+            }
+            if (s_TypeName.empty()) continue;
+            ++s_Matched;
+
+            for (uint32_t p = 0; p < s_Type->m_pPropertyData->size(); ++p) {
+                if (p_Out.size() >= 80000) break;
+
+                const SPropertyData* s_Property = &(*s_Type->m_pPropertyData)[p];
+                const auto* s_Info = s_Property->GetPropertyInfo();
+                if (!s_Info || !s_Info->m_propertyInfo.m_Type || !s_Info->m_propertyInfo.m_Type->GetTypeInfo()) continue;
+                if (s_Info->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
+
+                const char* s_ValueType = s_Info->m_propertyInfo.m_Type->GetTypeInfo()->pszTypeName;
+                if (!s_ValueType) continue;
+
+                int s_Comps = 0;
+                bool s_Pinnable = true;
+                bool s_IsBool = false;
+                bool s_IsInt = false;
+                if (std::strcmp(s_ValueType, "float32") == 0 || std::strcmp(s_ValueType, "float") == 0) s_Comps = 1;
+                else if (std::strcmp(s_ValueType, "SVector2") == 0) s_Comps = 2;
+                else if (std::strcmp(s_ValueType, "SVector3") == 0 || std::strcmp(s_ValueType, "SColorRGB") == 0) s_Comps = 3;
+                else if (std::strcmp(s_ValueType, "SVector4") == 0 || std::strcmp(s_ValueType, "SColorRGBA") == 0) s_Comps = 4;
+                else if (std::strcmp(s_ValueType, "bool") == 0) { s_Comps = 1; s_Pinnable = false; s_IsBool = true; }
+                else if (std::strcmp(s_ValueType, "int32") == 0) { s_Comps = 1; s_Pinnable = false; s_IsInt = true; }
+                else continue;
+
+                const uintptr_t s_Address = reinterpret_cast<uintptr_t>(s_Sub.m_pObj) + s_Property->m_nPropertyOffset;
+                float s_Values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (s_IsBool) {
+                    s_Values[0] = *reinterpret_cast<const uint8_t*>(s_Address) ? 1.0f : 0.0f;
+                } else if (s_IsInt) {
+                    s_Values[0] = static_cast<float>(*reinterpret_cast<const int32_t*>(s_Address));
+                } else {
+                    const float* s_Raw = reinterpret_cast<const float*>(s_Address);
+                    bool s_Sane = true;
+                    for (int k = 0; k < s_Comps; ++k) {
+                        s_Values[k] = s_Raw[k];
+                        if (!std::isfinite(s_Raw[k]) || std::abs(s_Raw[k]) > 100000.0f) s_Sane = false;
+                    }
+                    if (!s_Sane) continue;
+                }
+
+                char s_Hex[16];
+                std::snprintf(s_Hex, sizeof(s_Hex), "~%08x", s_Property->m_nPropertyID);
+                const std::string s_PropName = (s_Info->m_pszPropertyName && s_Info->m_pszPropertyName[0]) ? s_Info->m_pszPropertyName : s_Hex;
+
+                SSnapItem s_Item;
+                s_Item.m_Target.m_Entity = s_Sub;
+                s_Item.m_Target.m_PropertyId = s_Property->m_nPropertyID;
+                s_Item.m_Target.m_Type = s_Info->m_propertyInfo.m_Type;
+                s_Item.m_Target.m_Components = s_Comps;
+                for (int k = 0; k < 4; ++k) s_Item.m_Target.m_Original[k] = s_Values[k];
+                s_Item.m_Key = reinterpret_cast<uintptr_t>(s_Sub.m_pObj);
+                s_Item.m_Offset = static_cast<size_t>(s_Property->m_nPropertyOffset);
+                s_Item.m_Label = s_TypeName + "." + s_PropName + " : " + s_ValueType;
+                s_Item.m_PropName = s_PropName;
+                s_Item.m_Pinnable = s_Pinnable;
+                p_Out.push_back(std::move(s_Item));
+            }
+        }
+    }
+}
+
+// Compares the Instinct recording with the normal one and lists the properties that differ (grouped by property).
+void BetterInstinct::BuildInstinctDiff(const std::vector<SSnapItem>& p_Now) {
+    std::map<std::pair<uintptr_t, uint32_t>, const SSnapItem*> s_Before;
+    for (const auto& s_Item : m_SnapNormal) {
+        s_Before[{s_Item.m_Key, s_Item.m_Target.m_PropertyId}] = &s_Item;
+    }
+
+    struct SGroup {
+        std::string m_Label;
+        std::string m_Prop;
+        int m_Count = 0;
+        int m_Comps = 1;
+        float m_A[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float m_B[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        bool m_Pinnable = true;
+    };
+    std::vector<SGroup> s_Groups;
+    std::map<std::string, size_t> s_GroupIndex;
+    int s_Changed = 0;
+
+    for (const auto& s_After : p_Now) {
+        const auto s_It = s_Before.find({s_After.m_Key, s_After.m_Target.m_PropertyId});
+        if (s_It == s_Before.end()) continue;
+        const SSnapItem& s_Was = *s_It->second;
+
+        bool s_Differs = false;
+        for (int k = 0; k < s_After.m_Target.m_Components; ++k) {
+            if (std::abs(s_After.m_Target.m_Original[k] - s_Was.m_Target.m_Original[k]) > 0.001f) s_Differs = true;
+        }
+        if (!s_Differs) continue;
+        ++s_Changed;
+
+        auto s_Slot = s_GroupIndex.find(s_After.m_Label);
+        if (s_Slot == s_GroupIndex.end()) {
+            SGroup s_Group;
+            s_Group.m_Label = s_After.m_Label;
+            s_Group.m_Prop = s_After.m_PropName;
+            s_Group.m_Comps = s_After.m_Target.m_Components;
+            s_Group.m_Pinnable = s_After.m_Pinnable;
+            for (int k = 0; k < 4; ++k) {
+                s_Group.m_A[k] = s_Was.m_Target.m_Original[k];
+                s_Group.m_B[k] = s_After.m_Target.m_Original[k];
+            }
+            s_Groups.push_back(s_Group);
+            s_Slot = s_GroupIndex.emplace(s_After.m_Label, s_Groups.size() - 1).first;
+        }
+        ++s_Groups[s_Slot->second].m_Count;
+    }
+
+    std::stable_sort(s_Groups.begin(), s_Groups.end(), [](const SGroup& p_L, const SGroup& p_R) { return p_L.m_Count > p_R.m_Count; });
+
+    auto s_Fmt = [](const float* p_Values, int p_Count) {
+        std::string s_Out = "(";
+        for (int k = 0; k < p_Count; ++k) {
+            char s_Buf[32];
+            std::snprintf(s_Buf, sizeof(s_Buf), "%.2f", p_Values[k]);
+            if (k > 0) s_Out += ", ";
+            s_Out += s_Buf;
+        }
+        return s_Out + ")";
+    };
+
+    std::vector<STintReportItem> s_Report;
+    for (const auto& s_Group : s_Groups) {
+        if (s_Report.size() >= 300) break;
+        std::string s_Line = s_Group.m_Label + "   x" + std::to_string(s_Group.m_Count) + "   " +
+            s_Fmt(s_Group.m_A, s_Group.m_Comps) + " -> " + s_Fmt(s_Group.m_B, s_Group.m_Comps);
+        if (!s_Group.m_Pinnable) s_Line += "   (can't be changed)";
+        s_Report.push_back({s_Line, s_Group.m_Prop});
+    }
+
+    {
+        std::lock_guard<std::mutex> s_Lock(m_TintReportMutex);
+        m_DiffReport = std::move(s_Report);
+    }
+    m_SnapChangedCount = s_Changed;
+}
+
+// The properties to hold at their normal value: every recorded property whose name contains one of the patterns.
+void BetterInstinct::RebuildPins() {
+    m_Pins.clear();
+    if (!m_SnapHaveNormal.load() || m_PinPropPattern[0] == '\0') return;
+
+    std::vector<std::string> s_Patterns;
+    std::string s_Cur;
+    auto s_Flush = [&]() {
+        const size_t a = s_Cur.find_first_not_of(" \t");
+        if (a != std::string::npos) {
+            std::string s_Part = s_Cur.substr(a, s_Cur.find_last_not_of(" \t") - a + 1);
+            std::transform(s_Part.begin(), s_Part.end(), s_Part.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            s_Patterns.push_back(s_Part);
+        }
+        s_Cur.clear();
+    };
+    for (const char* p = m_PinPropPattern; *p; ++p) {
+        if (*p == ',') s_Flush(); else s_Cur += *p;
+    }
+    s_Flush();
+
+    for (const auto& s_Item : m_SnapNormal) {
+        if (!s_Item.m_Pinnable) continue;
+        std::string s_Name = s_Item.m_PropName;
+        std::transform(s_Name.begin(), s_Name.end(), s_Name.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        for (const auto& s_Pattern : s_Patterns) {
+            if (s_Name.find(s_Pattern) != std::string::npos) {
+                m_Pins.push_back(s_Item);
+                break;
+            }
+        }
+    }
+}
+
+// Runs every frame while Instinct is active: puts a value back whenever the game moved it away from its normal value.
+void BetterInstinct::WritePins() {
+    for (auto& s_Pin : m_Pins) {
+        if (!s_Pin.m_Target.m_Entity.GetEntity()) continue;
+        const float* s_Current = reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(s_Pin.m_Target.m_Entity.m_pObj) + s_Pin.m_Offset);
+
+        bool s_Differs = false;
+        for (int k = 0; k < s_Pin.m_Target.m_Components; ++k) {
+            if (!std::isfinite(s_Current[k]) || std::abs(s_Current[k] - s_Pin.m_Target.m_Original[k]) > 0.001f) s_Differs = true;
+        }
+        if (s_Differs) WriteTintTarget(s_Pin.m_Target, s_Pin.m_Target.m_Original);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3546,6 +3841,49 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 if (m_TintReport.empty()) ImGui::TextDisabled("(nothing found yet)");
             }
             ImGui::EndChild();
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Find and remove Instinct's grey (advanced)")) {
+            ImGui::TextDisabled("1) Untick the tint above.  2) In a mission, with Instinct OFF, click 'Record normal look'.");
+            ImGui::TextDisabled("3) Click 'Record during Instinct', then hold your Instinct key for about a second.");
+            ImGui::TextDisabled("4) Click the entries that look like the grey (for example a saturation going towards 0).");
+
+            if (ImGui::Button("Record normal look")) m_SnapNormalReq = true;
+            ImGui::SameLine();
+            const bool s_Armed = m_SnapInstinctArmed.load();
+            if (ImGui::Button(s_Armed ? "Waiting for Instinct... (click to cancel)" : "Record during Instinct")) {
+                m_SnapInstinctArmed = !s_Armed;
+            }
+            ImGui::Text("Normal look: %d values recorded", m_SnapNormalCount.load());
+            if (m_SnapChangedCount.load() >= 0) {
+                ImGui::Text("%d value(s) changed during Instinct (click one to hold it at its normal value):", m_SnapChangedCount.load());
+            }
+
+            ImGui::BeginChild("##diffreport", ImVec2(0.0f, 160.0f), true);
+            {
+                std::lock_guard<std::mutex> s_DiffLock(m_TintReportMutex);
+                for (const auto& s_Item : m_DiffReport) {
+                    if (ImGui::Selectable(s_Item.m_Text.c_str(), false)) {
+                        std::string s_Pins = m_PinPropPattern;
+                        if (s_Pins.find(s_Item.m_Prop) == std::string::npos) {
+                            if (!s_Pins.empty()) s_Pins += ",";
+                            s_Pins += s_Item.m_Prop;
+                            std::snprintf(m_PinPropPattern, sizeof(m_PinPropPattern), "%s", s_Pins.c_str());
+                            s_Changed = true;
+                            m_PinRebuild = true;
+                        }
+                    }
+                }
+                if (m_DiffReport.empty()) ImGui::TextDisabled("(nothing recorded yet)");
+            }
+            ImGui::EndChild();
+
+            if (ImGui::InputText("Hold these at normal", m_PinPropPattern, sizeof(m_PinPropPattern))) {
+                s_Changed = true;
+                m_PinRebuild = true;
+            }
+            ImGui::TextDisabled("Comma-separated property names. Empty = off. They are held at their normal value while Instinct is active.");
             ImGui::TreePop();
         }
 
