@@ -1234,6 +1234,17 @@ inline uint32_t FloatBits(float p_F) {
 
 } // namespace
 
+// One short log file (BetterInstinct.log, next to the config) with the result of the last color search.
+static void GlowLog(const std::string& p_Text) {
+    try {
+        std::wstring s_Dir = ConfigDir();
+        if (s_Dir.empty()) return;
+        std::ofstream s_File(fs::path(s_Dir) / L"BetterInstinct.log", std::ios::trunc);
+        s_File << p_Text << "\n";
+    } catch (...) {
+    }
+}
+
 void BetterInstinct::InitGlowDefaults() {
     for (int i = 0; i < kGlowCatCount; ++i) {
         SGlowSetting& s_G = m_Glow[i];
@@ -1332,6 +1343,8 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 SGlowSlot s_Slot;
                 s_Slot.Ptr = s_Ptr;
                 s_Slot.Size = s_Size;
+                s_Slot.Ref = s_Ref;
+                s_Slot.PropId = s_Prop.Id;
                 s_Slot.Cat = s_Prop.Cat;
                 s_Slot.Outline = s_Prop.Outline;
 
@@ -1390,9 +1403,20 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
     m_GlowFound = static_cast<uint32_t>(m_GlowSlots.size());
     m_GlowState = m_GlowSlots.empty() ? 1 : 2;
     m_GlowForce = true;
+
+    {
+        std::string s_Log = "Entities checked: " + std::to_string(s_Scanned) + "\nGlow config entities found: " + std::to_string(s_Entities) +
+                            "\nColors found: " + std::to_string(m_GlowSlots.size()) + "\nSkipped: " + std::to_string(s_Skipped) + "\n";
+        for (int i = 0; i < kGlowCatCount; ++i) {
+            int s_N = 0;
+            for (const SGlowSlot& s_Slot : m_GlowSlots) if (s_Slot.Cat == i) ++s_N;
+            s_Log += std::string("  ") + kGlowCats[i].Key + ": " + std::to_string(s_N) + "\n";
+        }
+        GlowLog(s_Log);
+    }
 }
 
-void BetterInstinct::WriteGlowSlots() {
+void BetterInstinct::WriteGlowSlots(bool p_NotifyGame) {
     for (const SGlowSlot& s_Slot : m_GlowSlots) {
         if (s_Slot.Cat < 0 || s_Slot.Cat >= kGlowCatCount) continue;
         const SGlowSetting& s_G = m_Glow[s_Slot.Cat];
@@ -1409,6 +1433,23 @@ void BetterInstinct::WriteGlowSlots() {
 
         if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
         std::memcpy(s_Slot.Ptr, s_V, s_Slot.Size); // size 12 (RGB only) just drops the alpha
+
+        // Writing the memory alone isn't enough when the game only reads these colors when they change:
+        // set the property the normal way too, so the game's change handlers run.
+        if (p_NotifyGame) {
+            try {
+                if (s_Slot.Size == 16) {
+                    SColorRGBA s_Color;
+                    s_Color.r = s_V[0]; s_Color.g = s_V[1]; s_Color.b = s_V[2]; s_Color.a = s_V[3];
+                    s_Slot.Ref.SetProperty<SColorRGBA>(s_Slot.PropId, s_Color, true);
+                } else {
+                    SColorRGB s_Color;
+                    s_Color.r = s_V[0]; s_Color.g = s_V[1]; s_Color.b = s_V[2];
+                    s_Slot.Ref.SetProperty<SColorRGB>(s_Slot.PropId, s_Color, true);
+                }
+            } catch (...) {
+            }
+        }
     }
 }
 
@@ -1449,7 +1490,7 @@ void BetterInstinct::UpdateGlowColors(float p_Dt) {
     const uint32_t s_Sig = GlowSignature();
     if (m_GlowForce || s_Sig != m_GlowAppliedSig || (s_AnyCustom && m_GlowTimer >= 1.0f)) {
         // While custom colors are on they are written again about once a second, in case the game resets them.
-        WriteGlowSlots();
+        WriteGlowSlots(m_GlowForce || s_Sig != m_GlowAppliedSig);
         m_GlowAppliedSig = s_Sig;
         m_GlowForce = false;
         m_GlowTimer = 0.0f;
