@@ -37,6 +37,7 @@
 #include "Glacier/ZCameraEntity.h"
 #include "Glacier/ZCollision.h"
 #include "Glacier/ZEntity.h"
+#include "Glacier/ZEntityManager.h"
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZHitman5.h"
 #include "Glacier/ZObject.h"
@@ -55,6 +56,37 @@ static constexpr char kSection[] = "BetterInstinct";
 static constexpr float kUnlockLevel = 0.25f; // after running dry, the meter must refill to this before Instinct works again
 static constexpr float kMinStart = 0.10f;    // Instinct can't be started below this level
 static constexpr float kLowLevel = 0.25f;    // below this the meter turns to the "low" color
+
+// ---------------------------------------------------------------------------
+// Instinct glow categories. Each one is a pair of game properties: m_Glow<Name>Color (silhouette / fill) and
+// m_Glow<Name>OutlineColor (outline). The default RGB values are the game's own colors.
+// ---------------------------------------------------------------------------
+
+struct SGlowCatDef {
+    const char* Key;
+    const char* Label;
+    const char* Tip;
+    const char* Names[2]; // property name stems (without Color / OutlineColor); the 2nd may be null
+    int FillRgb;
+    int OutlineRgb;
+};
+
+static constexpr SGlowCatDef kGlowCats[kGlowCatCount] = {
+    {"targets", "Targets", "Contract targets (and non-critical targets).", {"m_GlowContractTarget", "m_GlowContractTargetNonCritical"}, 0x520000, 0xCF0000},
+    {"special", "Special targets", "Targets the game colors differently (blue).", {"m_GlowContractTargetSpecial", nullptr}, 0x05102B, 0x154EEB},
+    {"suspects", "Suspects", "Suspects in Sniper Assassin / suspect-style contracts.", {"m_GlowContractSuspect", nullptr}, 0x3B0AA6, 0x3B0AA6},
+    {"civilians", "Civilians", "Non-hostile NPCs.", {"m_GlowCivilian", nullptr}, 0x262626, 0xFFFFFF},
+    {"guards", "Guards", "Armed guards and other hostile NPCs.", {"m_GlowEnemies", nullptr}, 0x262626, 0xFFFFFF},
+    {"enforcers", "Enforcers", "Enforcers (NPCs who can see through disguises).", {"m_GlowEnforcer", nullptr}, 0x262626, 0xFFFFFF},
+    {"witnesses", "Witnesses", "NPCs that have seen you without a mask.", {"m_GlowBackgroundUnmasked", nullptr}, 0xFFEDA3, 0xFFF7D6},
+    {"memory", "Witnesses (memory)", "Long-term-memory markers.", {"m_GlowLTMemory", nullptr}, 0x8A5224, 0xFF6C03},
+    {"interactables", "Interactables", "Set pieces and other interactive objects.", {"m_GlowSetPiece", nullptr}, 0xFFEDA3, 0xFFF7D6},
+    {"climbables", "Climbables", "Ledges, pipes, ladders and other traversal.", {"m_GlowTraversal", nullptr}, 0xFFEDA3, 0xFCF6DE},
+    {"items", "Items", "Weapons and other pick-up items.", {"m_GlowGuns", nullptr}, 0xFFEDA3, 0xFFF7D6},
+};
+
+static constexpr float kGlowDefFillAlpha = 75.0f / 255.0f;     // typical game values (used until the game's own are read)
+static constexpr float kGlowDefOutlineAlpha = 127.0f / 255.0f;
 
 namespace {
 
@@ -508,6 +540,7 @@ BetterInstinct::~BetterInstinct() {
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
+    if (m_HasPlayer.load()) RestoreGlowColors(); // put the game's own colors back
     RestoreTint();
     CloseSound();
     g_Guard.reset(); // removes the input hooks
@@ -520,10 +553,10 @@ BetterInstinct::~BetterInstinct() {
 void BetterInstinct::Init() {
     // Lets us answer "not pressed" to the game when it asks about the Instinct action.
     Hooks::ZInputAction_Digital->AddDetour(this, &BetterInstinct::ZInputAction_Digital);
-    Hooks::ZHM5ItemWeapon_IsFiring->AddDetour(this, &BetterInstinct::ZHM5ItemWeapon_IsFiring);
 }
 
 void BetterInstinct::OnEngineInitialized() {
+    InitGlowDefaults();
     LoadSettings();
     RebuildPatterns(); // default patterns (LoadSoundText below may replace them)
 
@@ -628,22 +661,6 @@ DEFINE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* t
     return HookResult<bool>(HookAction::Continue());
 }
 
-// Called by the game whenever it asks a weapon whether it is firing. We only take a note (never change the result).
-DEFINE_PLUGIN_DETOUR(BetterInstinct, bool, ZHM5ItemWeapon_IsFiring, IFirearm* th) {
-    if (th && m_AimFocusEnabled && m_AimWeaponOnly) {
-        void* s_Local = m_LocalPlayerEntity.load();
-        if (s_Local) {
-            auto* s_Weapon = static_cast<ZHM5ItemWeapon*>(th);
-            if (s_Weapon->m_pOwner.GetEntity() == s_Local) {
-                m_LastWeaponPollTicks.store(std::chrono::steady_clock::now().time_since_epoch().count());
-                m_HeldWeaponType.store(static_cast<int>(s_Weapon->m_WeaponType));
-                ++m_WeaponPolls;
-            }
-        }
-    }
-    return HookResult<bool>(HookAction::Continue());
-}
-
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -652,12 +669,6 @@ void BetterInstinct::LoadSettings() {
     m_InstinctKey = static_cast<int>(GetSettingInt(kSection, "instinct_key", m_InstinctKey));
     m_ToggleMode = GetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     m_BlockEnabled = GetSettingBool(kSection, "block_enabled", m_BlockEnabled);
-    m_InstinctSlowdown = GetSettingBool(kSection, "instinct_slowdown", m_InstinctSlowdown);
-    m_AimFocusEnabled = GetSettingBool(kSection, "aim_focus_enabled", m_AimFocusEnabled);
-    m_AimWeaponOnly = GetSettingBool(kSection, "aim_weapon_only", m_AimWeaponOnly);
-    m_AimButton = std::clamp(static_cast<int>(GetSettingInt(kSection, "aim_button", m_AimButton)), 1, 254);
-    m_AimFocusKey = std::clamp(static_cast<int>(GetSettingInt(kSection, "aim_focus_key", m_AimFocusKey)), 1, 254);
-    m_AimFocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "aim_focus_scale", m_AimFocusScale)), 0.05f, 0.95f);
     m_FocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "focus_scale", m_FocusScale)), 0.05f, 0.95f);
     m_BlendSpeed = std::clamp(static_cast<float>(GetSettingDouble(kSection, "blend_speed", m_BlendSpeed)), 1.0f, 30.0f);
     m_DrainSeconds = std::clamp(static_cast<float>(GetSettingDouble(kSection, "drain_seconds", m_DrainSeconds)), 2.0f, 120.0f);
@@ -678,6 +689,7 @@ void BetterInstinct::LoadSettings() {
     m_LowColor[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_b", m_LowColor[2])), 0.0f, 1.0f);
 
     m_TintEnabled = GetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    m_TintRemove = GetSettingBool(kSection, "tint_remove", m_TintRemove);
     m_InstinctTint[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_r", m_InstinctTint[0])), 0.0f, 1.0f);
     m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
     m_InstinctTint[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_b", m_InstinctTint[2])), 0.0f, 1.0f);
@@ -706,12 +718,6 @@ void BetterInstinct::SaveSettings() {
     SetSettingInt(kSection, "hud_style", 2);
     SetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     SetSettingBool(kSection, "block_enabled", m_BlockEnabled);
-    SetSettingBool(kSection, "instinct_slowdown", m_InstinctSlowdown);
-    SetSettingBool(kSection, "aim_focus_enabled", m_AimFocusEnabled);
-    SetSettingBool(kSection, "aim_weapon_only", m_AimWeaponOnly);
-    SetSettingInt(kSection, "aim_button", m_AimButton);
-    SetSettingInt(kSection, "aim_focus_key", m_AimFocusKey);
-    SetSettingDouble(kSection, "aim_focus_scale", m_AimFocusScale);
     SetSettingDouble(kSection, "focus_scale", m_FocusScale);
     SetSettingDouble(kSection, "blend_speed", m_BlendSpeed);
     SetSettingDouble(kSection, "drain_seconds", m_DrainSeconds);
@@ -732,6 +738,7 @@ void BetterInstinct::SaveSettings() {
     SetSettingDouble(kSection, "low_b", m_LowColor[2]);
 
     SetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    SetSettingBool(kSection, "tint_remove", m_TintRemove);
     SetSettingDouble(kSection, "tint_r", m_InstinctTint[0]);
     SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
     SetSettingDouble(kSection, "tint_b", m_InstinctTint[2]);
@@ -802,12 +809,6 @@ bool BetterInstinct::SaveConfigFile() {
         s_Int("instinct_key", m_InstinctKey);
         s_Bool("toggle_mode", m_ToggleMode);
         s_Bool("block_enabled", m_BlockEnabled);
-        s_Bool("instinct_slowdown", m_InstinctSlowdown);
-        s_Bool("aim_focus_enabled", m_AimFocusEnabled);
-        s_Bool("aim_weapon_only", m_AimWeaponOnly);
-        s_Int("aim_button", m_AimButton);
-        s_Int("aim_focus_key", m_AimFocusKey);
-        s_Flt("aim_focus_scale", m_AimFocusScale);
         s_Flt("focus_scale", m_FocusScale);
         s_Flt("blend_speed", m_BlendSpeed);
         s_Flt("drain_seconds", m_DrainSeconds);
@@ -828,6 +829,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("low_b", m_LowColor[2]);
 
         s_Bool("tint_enabled", m_TintEnabled);
+        s_Bool("tint_remove", m_TintRemove);
         s_Flt("tint_r", m_InstinctTint[0]);
         s_Flt("tint_g", m_InstinctTint[1]);
         s_Flt("tint_b", m_InstinctTint[2]);
@@ -843,6 +845,20 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("fade_out_ms", m_FadeOutMs);
         s_Bool("fade_in_on", m_FadeInOn);
         s_Flt("fade_in_ms", m_FadeInMs);
+
+        for (int i = 0; i < kGlowCatCount; ++i) {
+            const std::string s_K = std::string("glow_") + kGlowCats[i].Key + "_";
+            const SGlowSetting& s_G = m_Glow[i];
+            s_Int((s_K + "mode").c_str(), s_G.Mode);
+            s_Bool((s_K + "fill_on").c_str(), s_G.FillOn);
+            s_Bool((s_K + "out_on").c_str(), s_G.OutlineOn);
+            s_Bool((s_K + "seeded").c_str(), s_G.Seeded);
+            const char* s_Ch = "rgba";
+            for (int k = 0; k < 4; ++k) {
+                s_Flt((s_K + "fill_" + s_Ch[k]).c_str(), s_G.Fill[k]);
+                s_Flt((s_K + "out_" + s_Ch[k]).c_str(), s_G.Outline[k]);
+            }
+        }
 
         s_Str("preset_name", m_PresetName);
         s_Str("custom_path", m_CustomPath);
@@ -908,12 +924,6 @@ bool BetterInstinct::LoadConfigFile() {
     s_Int("instinct_key", m_InstinctKey, 1, 254);
     s_Bool("toggle_mode", m_ToggleMode);
     s_Bool("block_enabled", m_BlockEnabled);
-    s_Bool("instinct_slowdown", m_InstinctSlowdown);
-    s_Bool("aim_focus_enabled", m_AimFocusEnabled);
-    s_Bool("aim_weapon_only", m_AimWeaponOnly);
-    s_Int("aim_button", m_AimButton, 1, 254);
-    s_Int("aim_focus_key", m_AimFocusKey, 1, 254);
-    s_Flt("aim_focus_scale", m_AimFocusScale, 0.05f, 0.95f);
     s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
     s_Flt("blend_speed", m_BlendSpeed, 1.0f, 30.0f);
     s_Flt("drain_seconds", m_DrainSeconds, 2.0f, 120.0f);
@@ -934,6 +944,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("low_b", m_LowColor[2], 0.0f, 1.0f);
 
     s_Bool("tint_enabled", m_TintEnabled);
+    s_Bool("tint_remove", m_TintRemove);
     s_Flt("tint_r", m_InstinctTint[0], 0.0f, 1.0f);
     s_Flt("tint_g", m_InstinctTint[1], 0.0f, 1.0f);
     s_Flt("tint_b", m_InstinctTint[2], 0.0f, 1.0f);
@@ -949,6 +960,20 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("fade_out_ms", m_FadeOutMs, 0.0f, 3000.0f);
     s_Bool("fade_in_on", m_FadeInOn);
     s_Flt("fade_in_ms", m_FadeInMs, 0.0f, 3000.0f);
+
+    for (int i = 0; i < kGlowCatCount; ++i) {
+        const std::string s_K = std::string("glow_") + kGlowCats[i].Key + "_";
+        SGlowSetting& s_G = m_Glow[i];
+        s_Int((s_K + "mode").c_str(), s_G.Mode, 0, 1);
+        s_Bool((s_K + "fill_on").c_str(), s_G.FillOn);
+        s_Bool((s_K + "out_on").c_str(), s_G.OutlineOn);
+        s_Bool((s_K + "seeded").c_str(), s_G.Seeded);
+        const char* s_Ch = "rgba";
+        for (int k = 0; k < 4; ++k) {
+            s_Flt((s_K + "fill_" + s_Ch[k]).c_str(), s_G.Fill[k], 0.0f, 1.0f);
+            s_Flt((s_K + "out_" + s_Ch[k]).c_str(), s_G.Outline[k], 0.0f, 1.0f);
+        }
+    }
 
     if (const std::string* p = s_Find("preset_name")) m_PresetName = *p;
     s_Str("custom_path", m_CustomPath, sizeof(m_CustomPath));
@@ -1176,6 +1201,262 @@ std::string BetterInstinct::KeyName(int p_Vk) {
 }
 
 // ---------------------------------------------------------------------------
+// Instinct glow colors (people and items)
+//
+// The game keeps the Instinct outline / silhouette colors as properties of a config entity (the same ones other
+// Instinct mods change with "entity patches": m_GlowCivilianColor, m_GlowEnemiesOutlineColor, ...). We find that entity at
+// runtime by looking for those property names, remember where each color lives, and write our values into it.
+// The game's own values are remembered, so "Game default" puts them back exactly.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool CanWriteMemory(const void* p_Ptr, size_t p_Size) {
+    MEMORY_BASIC_INFORMATION s_Info{};
+    if (!p_Ptr || !VirtualQuery(p_Ptr, &s_Info, sizeof(s_Info))) return false;
+    if (s_Info.State != MEM_COMMIT) return false;
+    if (s_Info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const DWORD s_Writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!(s_Info.Protect & s_Writable)) return false;
+    const uint8_t* s_End = static_cast<const uint8_t*>(p_Ptr) + p_Size;
+    return s_End <= static_cast<const uint8_t*>(s_Info.BaseAddress) + s_Info.RegionSize;
+}
+
+inline void HashMix(uint32_t& p_H, uint32_t p_V) {
+    p_H ^= p_V + 0x9E3779B9u + (p_H << 6) + (p_H >> 2);
+}
+
+inline uint32_t FloatBits(float p_F) {
+    uint32_t s_B = 0;
+    std::memcpy(&s_B, &p_F, sizeof(s_B));
+    return s_B;
+}
+
+} // namespace
+
+void BetterInstinct::InitGlowDefaults() {
+    for (int i = 0; i < kGlowCatCount; ++i) {
+        SGlowSetting& s_G = m_Glow[i];
+        s_G = SGlowSetting{};
+        const int s_F = kGlowCats[i].FillRgb;
+        const int s_O = kGlowCats[i].OutlineRgb;
+        s_G.Fill[0] = ((s_F >> 16) & 0xFF) / 255.0f;
+        s_G.Fill[1] = ((s_F >> 8) & 0xFF) / 255.0f;
+        s_G.Fill[2] = (s_F & 0xFF) / 255.0f;
+        s_G.Fill[3] = kGlowDefFillAlpha;
+        s_G.Outline[0] = ((s_O >> 16) & 0xFF) / 255.0f;
+        s_G.Outline[1] = ((s_O >> 8) & 0xFF) / 255.0f;
+        s_G.Outline[2] = (s_O & 0xFF) / 255.0f;
+        s_G.Outline[3] = kGlowDefOutlineAlpha;
+    }
+}
+
+uint32_t BetterInstinct::GlowSignature() const {
+    uint32_t s_H = 0x811C9DC5u;
+    for (int i = 0; i < kGlowCatCount; ++i) {
+        const SGlowSetting& s_G = m_Glow[i];
+        HashMix(s_H, static_cast<uint32_t>(s_G.Mode));
+        HashMix(s_H, (s_G.FillOn ? 1u : 0u) | (s_G.OutlineOn ? 2u : 0u));
+        for (int k = 0; k < 4; ++k) {
+            HashMix(s_H, FloatBits(s_G.Fill[k]));
+            HashMix(s_H, FloatBits(s_G.Outline[k]));
+        }
+    }
+    return s_H;
+}
+
+// Finds every glow color in the game's entities. Runs on the game thread (it reads the entity manager).
+void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
+    std::vector<SGlowSlot> s_Old;
+    if (p_KeepSnapshots) s_Old = m_GlowSlots;
+    m_GlowSlots.clear();
+
+    uint32_t s_Scanned = 0, s_Entities = 0, s_Skipped = 0;
+
+    try {
+        if (!Globals::EntityManager) {
+            m_GlowState = 0;
+            m_GlowFound = 0;
+            return;
+        }
+
+        struct SProp { uint32_t Id; int Cat; bool Outline; };
+        std::vector<SProp> s_Props;
+        std::vector<uint32_t> s_Anchors; // a few properties that every glow config entity has
+        for (int i = 0; i < kGlowCatCount; ++i) {
+            for (const char* s_Stem : kGlowCats[i].Names) {
+                if (!s_Stem) continue;
+                const std::string s_Fill = std::string(s_Stem) + "Color";
+                const std::string s_Out = std::string(s_Stem) + "OutlineColor";
+                s_Props.push_back({Hash::Crc32(s_Fill.c_str()), i, false});
+                s_Props.push_back({Hash::Crc32(s_Out.c_str()), i, true});
+                if (i == 0 || i == 3 || i == 4 || i == 10) s_Anchors.push_back(s_Props[s_Props.size() - 2].Id);
+            }
+        }
+
+        for (const auto& s_Pair : Globals::EntityManager->m_Entities) {
+            ++s_Scanned;
+            const ZEntityRef& s_Ref = s_Pair.second;
+            ZEntityImpl* s_Entity = s_Ref.GetEntity();
+            if (!s_Entity) continue;
+            ZEntityType* s_Type = s_Entity->GetType();
+            if (!s_Type || !s_Type->m_pPropertyData) continue;
+
+            bool s_IsConfig = false;
+            for (const uint32_t s_Id : s_Anchors) {
+                if (s_Type->FindProperty(s_Id)) { s_IsConfig = true; break; }
+            }
+            if (!s_IsConfig) continue;
+            ++s_Entities;
+
+            for (const SProp& s_Prop : s_Props) {
+                SPropertyData* s_Data = s_Type->FindProperty(s_Prop.Id);
+                if (!s_Data) continue;
+
+                const SPropertyInfo& s_Info = s_Data->GetPropertyInfo()->m_propertyInfo;
+                if (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) { ++s_Skipped; continue; } // can't be written directly
+
+                const IType* s_TypeInfo = s_Info.m_Type ? s_Info.m_Type->GetTypeInfo() : nullptr;
+                const uint32_t s_Size = s_TypeInfo ? s_TypeInfo->m_nTypeSize : 0;
+                if (s_Size != 16 && s_Size != 12) { ++s_Skipped; continue; } // not an RGBA / RGB float color
+
+                uint8_t* s_Ptr = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Data->m_nPropertyOffset);
+                if (!CanWriteMemory(s_Ptr, s_Size)) { ++s_Skipped; continue; }
+
+                bool s_Dup = false;
+                for (const SGlowSlot& s_Existing : m_GlowSlots) {
+                    if (s_Existing.Ptr == s_Ptr) { s_Dup = true; break; }
+                }
+                if (s_Dup) continue;
+
+                SGlowSlot s_Slot;
+                s_Slot.Ptr = s_Ptr;
+                s_Slot.Size = s_Size;
+                s_Slot.Cat = s_Prop.Cat;
+                s_Slot.Outline = s_Prop.Outline;
+
+                bool s_FromOld = false;
+                for (const SGlowSlot& s_OldSlot : s_Old) {
+                    if (s_OldSlot.Ptr == s_Ptr) {
+                        std::memcpy(s_Slot.Vanilla, s_OldSlot.Vanilla, sizeof(s_Slot.Vanilla));
+                        s_FromOld = true;
+                        break;
+                    }
+                }
+                if (!s_FromOld) {
+                    float s_Raw[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    std::memcpy(s_Raw, s_Ptr, s_Size);
+                    bool s_Sane = true;
+                    for (int k = 0; k < 4; ++k) {
+                        if (!std::isfinite(s_Raw[k]) || s_Raw[k] < -0.01f || s_Raw[k] > 16.0f) s_Sane = false;
+                    }
+                    if (!s_Sane) { ++s_Skipped; continue; } // doesn't look like a color: leave it alone
+                    std::memcpy(s_Slot.Vanilla, s_Raw, sizeof(s_Slot.Vanilla));
+                }
+                m_GlowSlots.push_back(s_Slot);
+            }
+        }
+    } catch (...) {
+        m_GlowSlots.clear();
+    }
+
+    // The game's own colors per category (from the first value found for each).
+    for (int i = 0; i < kGlowCatCount; ++i) {
+        SGlowSetting& s_G = m_Glow[i];
+        bool s_GotFill = false, s_GotOutline = false;
+        for (const SGlowSlot& s_Slot : m_GlowSlots) {
+            if (s_Slot.Cat != i) continue;
+            if (!s_Slot.Outline && !s_GotFill) { std::memcpy(s_G.VanFill, s_Slot.Vanilla, sizeof(s_G.VanFill)); s_GotFill = true; }
+            if (s_Slot.Outline && !s_GotOutline) { std::memcpy(s_G.VanOutline, s_Slot.Vanilla, sizeof(s_G.VanOutline)); s_GotOutline = true; }
+        }
+        s_G.HasVanilla = s_GotFill && s_GotOutline;
+
+        // First time we see the game's colors: start the custom colors from them, so "custom" looks like the game until changed.
+        if (s_G.HasVanilla && !s_G.Seeded) {
+            std::memcpy(s_G.Fill, s_G.VanFill, sizeof(s_G.Fill));
+            std::memcpy(s_G.Outline, s_G.VanOutline, sizeof(s_G.Outline));
+            for (int k = 0; k < 4; ++k) {
+                s_G.Fill[k] = std::clamp(s_G.Fill[k], 0.0f, 1.0f);
+                s_G.Outline[k] = std::clamp(s_G.Outline[k], 0.0f, 1.0f);
+            }
+            s_G.Seeded = true;
+            m_GlowDirty = true;
+        }
+    }
+
+    m_GlowScanned = s_Scanned;
+    m_GlowEntities = s_Entities;
+    m_GlowSkipped = s_Skipped;
+    m_GlowFound = static_cast<uint32_t>(m_GlowSlots.size());
+    m_GlowState = m_GlowSlots.empty() ? 1 : 2;
+    m_GlowForce = true;
+}
+
+void BetterInstinct::WriteGlowSlots() {
+    for (const SGlowSlot& s_Slot : m_GlowSlots) {
+        if (s_Slot.Cat < 0 || s_Slot.Cat >= kGlowCatCount) continue;
+        const SGlowSetting& s_G = m_Glow[s_Slot.Cat];
+
+        float s_V[4];
+        if (s_G.Mode == 0) {
+            std::memcpy(s_V, s_Slot.Vanilla, sizeof(s_V));
+        } else {
+            const float* s_Src = s_Slot.Outline ? s_G.Outline : s_G.Fill;
+            const bool s_On = s_Slot.Outline ? s_G.OutlineOn : s_G.FillOn;
+            std::memcpy(s_V, s_Src, sizeof(s_V));
+            if (!s_On) s_V[3] = 0.0f; // hidden = fully transparent
+        }
+
+        if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
+        std::memcpy(s_Slot.Ptr, s_V, s_Slot.Size); // size 12 (RGB only) just drops the alpha
+    }
+}
+
+void BetterInstinct::RestoreGlowColors() {
+    for (const SGlowSlot& s_Slot : m_GlowSlots) {
+        if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
+        std::memcpy(s_Slot.Ptr, s_Slot.Vanilla, s_Slot.Size);
+    }
+}
+
+void BetterInstinct::UpdateGlowColors(float p_Dt) {
+    if (m_GlowRescanRequest.exchange(false)) {
+        m_GlowNeedScan = true;
+        m_GlowKeepSnap = true; // same mission: keep the game's colors we already remembered
+        m_GlowWait = 0.0f;
+    }
+
+    if (m_GlowNeedScan) {
+        m_GlowWait -= p_Dt;
+        if (m_GlowWait <= 0.0f) {
+            ScanGlowSlots(m_GlowKeepSnap);
+            m_GlowKeepSnap = false;
+            if (m_GlowSlots.empty()) {
+                m_GlowWait = 6.0f; // nothing yet (the mission is still loading): try again in a few seconds
+            } else {
+                m_GlowNeedScan = false;
+            }
+        }
+    }
+    if (m_GlowSlots.empty()) return;
+
+    bool s_AnyCustom = false;
+    for (const SGlowSetting& s_G : m_Glow) {
+        if (s_G.Mode != 0) s_AnyCustom = true;
+    }
+
+    m_GlowTimer += p_Dt;
+    const uint32_t s_Sig = GlowSignature();
+    if (m_GlowForce || s_Sig != m_GlowAppliedSig || (s_AnyCustom && m_GlowTimer >= 1.0f)) {
+        // While custom colors are on they are written again about once a second, in case the game resets them.
+        WriteGlowSlots();
+        m_GlowAppliedSig = s_Sig;
+        m_GlowForce = false;
+        m_GlowTimer = 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Game loop
 // ---------------------------------------------------------------------------
 
@@ -1187,8 +1468,16 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     // Real (unscaled) frame delta, so neither the meter nor the blend depend on the slowdown itself.
     using clock = std::chrono::steady_clock;
     const auto s_Now = clock::now();
-    const float s_Dt = std::min(std::chrono::duration<float>(s_Now - m_LastFrame).count(), 0.1f);
+    const float s_RawGap = std::chrono::duration<float>(s_Now - m_LastFrame).count();
+    const float s_Dt = std::min(s_RawGap, 0.1f);
     m_LastFrame = s_Now;
+    if (s_RawGap > 1.5f) { // the game loop stood still for a while (new mission, restart...): old entity pointers can't be trusted
+        m_GlowSlots.clear();
+        m_GlowNeedScan = true;
+        m_GlowKeepSnap = false;
+        m_GlowWait = 2.0f;
+        m_GlowState = 0;
+    }
     m_LastUpdateTicks.store(s_Now.time_since_epoch().count());
     ++m_FrameCount;
 
@@ -1196,22 +1485,23 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     bool s_HasPlayer = false;
     if (auto s_LocalHitman = SDK()->GetLocalPlayer()) {
         s_HasPlayer = true;
-        m_LocalPlayerEntity.store(s_LocalHitman.m_entityRef.GetEntity());
-    } else {
-        m_LocalPlayerEntity.store(nullptr);
     }
     m_HasPlayer = s_HasPlayer;
 
     if (!s_HasPlayer) {
         m_NoPlayerTime += s_Dt;
         m_Active.store(false);
-        m_AimFocusActive.store(false);
         m_InputBlock = false;
         g_Block = false;
         m_PrevDown = false;
         UpdateTint(s_Dt, false); // fade out and restore the tint when there is no player
 
         if (m_NoPlayerTime > 1.0f) { // really out of the mission (not just a short gap): start the next one fresh
+            m_GlowSlots.clear(); // the mission's entities are gone: find them again in the next one
+            m_GlowNeedScan = true;
+            m_GlowKeepSnap = false;
+            m_GlowWait = 3.0f;
+            m_GlowState = 0;
             m_Meter = 1.0f;
             m_Locked = false;
             m_Blocked = false;
@@ -1229,6 +1519,8 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         return;
     }
     m_NoPlayerTime = 0.0f;
+
+    UpdateGlowColors(s_Dt);
 
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
@@ -1322,24 +1614,11 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     }
 
     // Time scale.
-    // Aim Focus: aim button + focus key held together (any weapon). Doesn't use the Instinct meter.
-    // With "weapon only" on, a weapon owned by 47 must have been polled by the game within the last 0.3 s.
-    bool s_WeaponOk = true;
-    if (m_AimWeaponOnly) {
-        const int64_t s_Last = m_LastWeaponPollTicks.load();
-        const auto s_Age = s_Now - clock::time_point(clock::duration(s_Last));
-        s_WeaponOk = s_Last != 0 && std::chrono::duration<float>(s_Age).count() < 0.3f;
-    }
-    const bool s_AimFocus = m_AimFocusEnabled && s_GameFocused && s_WeaponOk && PhysKeyDown(m_AimButton) && PhysKeyDown(m_AimFocusKey);
-    m_AimFocusActive.store(s_AimFocus);
-
-    float s_Target = 1.0f;
-    if (s_Want && m_InstinctSlowdown) s_Target = m_FocusScale;
-    if (s_AimFocus) s_Target = std::min(s_Target, m_AimFocusScale);
+    const float s_Target = s_Want ? m_FocusScale : 1.0f;
     const float s_T = std::clamp(m_BlendSpeed * s_Dt, 0.0f, 1.0f);
     m_CurrentScale += (s_Target - m_CurrentScale) * s_T;
 
-    if (s_Target < 1.0f || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
+    if (s_Want || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
         Globals::GameTimeManager->m_fGameTimeMultiplier = m_CurrentScale;
         m_Touched = true;
     } else if (m_Touched) {
@@ -1803,6 +2082,93 @@ std::vector<uint8_t> LutRecolor(const std::vector<uint8_t>& p_Base, const float*
     return s_Out;
 }
 
+// "No Instinct color": an identity LUT (every color maps to itself), so Instinct's grading changes nothing on screen.
+// The layout of the game's LUT is not known in advance, so it is worked out from the vanilla (grey) data itself: the
+// vanilla LUT outputs a luminance of its input, so the right layout is the one where "luminance of the input color the
+// texel stands for" matches the vanilla texel. If no layout matches well, nothing is written (the picture stays vanilla).
+std::vector<uint8_t> LutIdentity(const std::vector<uint8_t>& p_Base, int p_W, int p_H, std::string& p_Err) {
+    int s_N = 0;
+    for (int n = 2; n <= 64; ++n) if (n * n * n == p_W * p_H) s_N = n;
+    if (s_N == 0 || p_W % s_N != 0 || p_H % s_N != 0 || (p_W / s_N) * (p_H / s_N) != s_N ||
+        p_Base.size() < static_cast<size_t>(p_W) * p_H * 4) {
+        p_Err = "the Instinct texture is not a 3D color LUT layout I recognise";
+        return {};
+    }
+
+    const int s_TilesX = p_W / s_N;
+    const float s_Den = static_cast<float>(s_N - 1);
+    const int s_Count = p_W * p_H;
+
+    std::vector<float> s_BaseLum(s_Count);
+    double s_Mean = 0.0;
+    for (int i = 0; i < s_Count; ++i) {
+        const float s_L = 0.2126f * p_Base[i * 4 + 0] + 0.7152f * p_Base[i * 4 + 1] + 0.0722f * p_Base[i * 4 + 2];
+        s_BaseLum[i] = s_L / 255.0f;
+        s_Mean += s_BaseLum[i];
+    }
+    s_Mean /= s_Count;
+    double s_VarBase = 0.0;
+    for (int i = 0; i < s_Count; ++i) s_VarBase += (s_BaseLum[i] - s_Mean) * (s_BaseLum[i] - s_Mean);
+    if (s_VarBase < 1e-6) {
+        p_Err = "the vanilla Instinct texture has no brightness variation to learn its layout from";
+        return {};
+    }
+
+    static const int s_Perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    double s_BestCorr = -2.0;
+    int s_BestPerm = 0, s_BestFlip = 0;
+
+    auto s_InputAt = [&](int p_Texel, int p_Perm, int p_Flip, float* p_Rgb) {
+        const int x = p_Texel % p_W, y = p_Texel / p_W;
+        const int s_Tile = (y / s_N) * s_TilesX + (x / s_N);
+        const int s_Axes[3] = {x % s_N, y % s_N, s_Tile}; // 0 = across the tile, 1 = down the tile, 2 = which tile
+        for (int a = 0; a < 3; ++a) {
+            float s_V = static_cast<float>(s_Axes[a]) / s_Den;
+            if (p_Flip & (1 << a)) s_V = 1.0f - s_V;
+            p_Rgb[s_Perms[p_Perm][a]] = s_V;
+        }
+    };
+
+    for (int s_P = 0; s_P < 6; ++s_P) {
+        for (int s_F = 0; s_F < 8; ++s_F) {
+            double s_MeanIn = 0.0;
+            std::vector<float> s_InLum(s_Count);
+            for (int i = 0; i < s_Count; ++i) {
+                float s_Rgb[3];
+                s_InputAt(i, s_P, s_F, s_Rgb);
+                s_InLum[i] = 0.2126f * s_Rgb[0] + 0.7152f * s_Rgb[1] + 0.0722f * s_Rgb[2];
+                s_MeanIn += s_InLum[i];
+            }
+            s_MeanIn /= s_Count;
+            double s_Cov = 0.0, s_VarIn = 0.0;
+            for (int i = 0; i < s_Count; ++i) {
+                s_Cov += (s_InLum[i] - s_MeanIn) * (s_BaseLum[i] - s_Mean);
+                s_VarIn += (s_InLum[i] - s_MeanIn) * (s_InLum[i] - s_MeanIn);
+            }
+            const double s_Corr = s_VarIn > 1e-9 ? s_Cov / std::sqrt(s_VarIn * s_VarBase) : -2.0;
+            if (s_Corr > s_BestCorr) { s_BestCorr = s_Corr; s_BestPerm = s_P; s_BestFlip = s_F; }
+        }
+    }
+
+    if (s_BestCorr < 0.97) {
+        char s_Buf[128];
+        std::snprintf(s_Buf, sizeof(s_Buf), "could not work out the Instinct texture layout (best match %.2f)", s_BestCorr);
+        p_Err = s_Buf;
+        return {};
+    }
+
+    std::vector<uint8_t> s_Out(p_Base.size());
+    for (int i = 0; i < s_Count; ++i) {
+        float s_Rgb[3];
+        s_InputAt(i, s_BestPerm, s_BestFlip, s_Rgb);
+        for (int c = 0; c < 3; ++c) {
+            s_Out[i * 4 + c] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(s_Rgb[c] * 255.0f)), 0, 255));
+        }
+        s_Out[i * 4 + 3] = p_Base[i * 4 + 3];
+    }
+    return s_Out;
+}
+
 fs::path LutCachePath() {
     const std::wstring s_Dir = ConfigDir();
     return s_Dir.empty() ? fs::path() : fs::path(s_Dir) / L"instinct_lut_base.bin";
@@ -1947,7 +2313,8 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
         m_LutPoll = 0.0f;
     }
 
-    if (!m_TintEnabled && !m_Lut) return; // nothing to do and nothing to undo
+    const bool s_Mod = m_TintEnabled || m_TintRemove; // do we want the texture changed at all?
+    if (!s_Mod && !m_Lut) return; // nothing to do and nothing to undo
 
     m_LutPoll -= p_Dt;
     m_LutCooldown -= p_Dt;
@@ -1955,7 +2322,7 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     if (m_Lut && !LutStillValid()) ReleaseLut();
 
     if (!m_Lut) {
-        if (!m_TintEnabled || m_LutPoll > 0.0f) return;
+        if (!s_Mod || m_LutPoll > 0.0f) return;
         m_LutPoll = 2.0f; // searching walks the whole resource list: only every couple of seconds
         if (!EnsureLut()) return;
     }
@@ -1963,8 +2330,8 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     // What should the texture contain right now?
     uint32_t s_Sig = 2166136261u;
     auto s_Mix = [&](uint32_t p_Value) { s_Sig = (s_Sig ^ p_Value) * 16777619u; };
-    s_Mix(m_TintEnabled ? 1u : 0u);
-    if (m_TintEnabled) {
+    s_Mix(m_TintRemove ? 2u : (m_TintEnabled ? 1u : 0u));
+    if (m_TintEnabled && !m_TintRemove) {
         for (int i = 0; i < 3; ++i) s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_InstinctTint[i], 0.0f, 1.0f) * 255.0f)));
         s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_TintStrength, 0.0f, 1.0f) * 255.0f)));
         s_Mix(m_TintKeepBrightness ? 1u : 0u);
@@ -1972,7 +2339,7 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     }
 
     if (m_LutApplied && s_Sig == m_LutAppliedSig) return; // already up to date
-    if (!m_LutApplied && !m_TintEnabled) {                // vanilla is already in place: let go of the texture
+    if (!m_LutApplied && !s_Mod) {                // vanilla is already in place: let go of the texture
         ReleaseLut();
         return;
     }
@@ -1982,14 +2349,25 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     m_LutCooldown = 0.1f;
 
     std::string s_Err;
-    if (m_TintEnabled) {
-        const std::vector<uint8_t> s_Image = LutRecolor(m_Lut->m_Base, m_InstinctTint, std::clamp(m_TintStrength, 0.0f, 1.0f),
-                                                        m_TintKeepBrightness, m_TintBrightness);
-        if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
+    if (s_Mod) {
+        std::vector<uint8_t> s_Image;
+        bool s_Built = true;
+        if (m_TintRemove) {
+            s_Image = LutIdentity(m_Lut->m_Base, static_cast<int>(m_Lut->m_Desc.Width), static_cast<int>(m_Lut->m_Desc.Height), s_Err);
+            s_Built = !s_Image.empty();
+        } else {
+            s_Image = LutRecolor(m_Lut->m_Base, m_InstinctTint, std::clamp(m_TintStrength, 0.0f, 1.0f),
+                                 m_TintKeepBrightness, m_TintBrightness);
+        }
+        if (!s_Built) {
+            SetLutStatus(2, "Could not remove the Instinct color: " + s_Err + ". The vanilla look stays.");
+            m_LutFailSig.store(s_Sig);
+        } else if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
             m_LutApplied = true;
             m_LutAppliedSig = s_Sig;
             ++m_LutWrites;
-            SetLutStatus(4, "Instinct color is active (the game's grey Instinct LUT has been replaced).");
+            SetLutStatus(4, m_TintRemove ? "Instinct color is removed (no grey overlay, only the outlines remain)."
+                                         : "Instinct color is active (the game's grey Instinct LUT has been replaced).");
         } else {
             SetLutStatus(2, "Could not write the Instinct LUT: " + s_Err + ". Try the other 'GPU state' option under Advanced.");
             m_LutFailSig.store(s_Sig);
@@ -2196,6 +2574,8 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         }
     }
 
+    if (m_GlowDirty.exchange(false)) SaveSettings(); // colors copied from the game on the first scan
+
     // Safety net: save everything once more whenever the settings window is closed.
     static bool s_WasOpen = false;
     if (m_ShowUI) {
@@ -2226,46 +2606,39 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Better Instinct", &m_ShowUI)) {
-        // --- Key binding (shared by the Instinct key, the aim button and the Aim Focus key) ---
-        auto s_KeyBind = [&](const char* p_Id, int& p_Key, int p_Target) {
-            ImGui::PushID(p_Id);
-            if (m_Binding && m_BindTarget == p_Target) {
-                ImGui::Button("Press a key or mouse button... (Esc cancels)", ImVec2(-1, 0));
+        // --- Key binding ---
+        ImGui::TextUnformatted("Instinct key (set this to your in-game Instinct bind)");
+        if (m_Binding) {
+            ImGui::Button("Press a key or mouse button... (Esc cancels)", ImVec2(-1, 0));
 
-                bool s_AnyDown = false;
-                for (int vk = 1; vk < 255; ++vk) {
-                    if (vk >= VK_SHIFT && vk <= VK_MENU) continue; // generic modifiers; L/R variants are captured instead
-                    if (IsKeyDown(vk)) { s_AnyDown = true; break; }
-                }
+            bool s_AnyDown = false;
+            for (int vk = 1; vk < 255; ++vk) {
+                if (vk >= VK_SHIFT && vk <= VK_MENU) continue; // generic modifiers; L/R variants are captured instead
+                if (IsKeyDown(vk)) { s_AnyDown = true; break; }
+            }
 
-                if (!m_BindArmed) {
-                    m_BindArmed = !s_AnyDown; // wait for the click that started binding to be released
-                } else {
-                    for (int vk = 1; vk < 255; ++vk) {
-                        if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
-                        if (!IsKeyDown(vk)) continue;
-
-                        if (vk != VK_ESCAPE) {
-                            p_Key = vk;
-                            s_Changed = true;
-                        }
-                        m_Binding = false;
-                        break;
-                    }
-                }
+            if (!m_BindArmed) {
+                m_BindArmed = !s_AnyDown; // wait for the click that started binding to be released
             } else {
-                const std::string s_Text = KeyName(p_Key) + "  (click to change)";
-                if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
-                    m_Binding = true;
-                    m_BindArmed = false;
-                    m_BindTarget = p_Target;
+                for (int vk = 1; vk < 255; ++vk) {
+                    if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
+                    if (!IsKeyDown(vk)) continue;
+
+                    if (vk != VK_ESCAPE) {
+                        m_InstinctKey = vk;
+                        s_Changed = true;
+                    }
+                    m_Binding = false;
+                    break;
                 }
             }
-            ImGui::PopID();
-        };
-
-        ImGui::TextUnformatted("Instinct key (set this to your in-game Instinct bind)");
-        s_KeyBind("instinct_key", m_InstinctKey, 0);
+        } else {
+            const std::string s_Text = KeyName(m_InstinctKey) + "  (click to change)";
+            if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
+                m_Binding = true;
+                m_BindArmed = false;
+            }
+        }
 
         int s_Mode = m_ToggleMode ? 1 : 0;
         if (ImGui::RadioButton("Hold", &s_Mode, 0)) { m_ToggleMode = false; s_Changed = true; }
@@ -2277,68 +2650,11 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
 
-        if (ImGui::Checkbox("Instinct slows time", &m_InstinctSlowdown)) s_Changed = true;
-        ImGui::TextDisabled("Off = Instinct no longer slows the game (meter, color and sound still work).");
-
         if (ImGui::InputText("Instinct action name(s)", m_ActionPatterns, sizeof(m_ActionPatterns))) {
             RebuildPatterns();
             s_Changed = true;
         }
-        ImGui::TextDisabled("Comma-separated, matches part of the game's action name. Find it in Debug below.");
-
-        if (ImGui::CollapsingHeader("Debug")) {
-            m_CaptureNames = true;
-
-            ImGui::Text("Game updates seen: %u", m_FrameCount.load());
-            ImGui::Text("Instinct key down:  Windows=%s  hook=%s", AsyncKeyDown(m_InstinctKey) ? "YES" : "no", HookKeyDown(m_InstinctKey) ? "YES" : "no");
-            ImGui::Text("Hook events: keyboard=%u  mouse=%u  last key=0x%02X", g_KbEvents.load(), g_MouseEvents.load(), g_LastVk.load());
-            ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
-                        m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
-            ImGui::Text("Aim Focus active=%s", m_AimFocusActive.load() ? "yes" : "no");
-            ImGui::Text("Weapon polls=%u  weapon type=%d  (aim with a gun: polls should rise)", m_WeaponPolls.load(), m_HeldWeaponType.load());
-            ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
-            ImGui::Text("Instinct color: state=%d  LUT writes=%u", m_LutState.load(), m_LutWrites.load());
-            ImGui::Text("Game-level block: %s   blocked polls=%u", m_InputBlock.load() ? "ON" : "off", m_BlockedPolls.load());
-            ImGui::TextDisabled("Updates stay at 0 outside a mission. Hold your Instinct key in a mission and watch these.");
-
-            ImGui::Checkbox("Test: block matching actions now", &m_ForceBlockTest);
-            ImGui::TextDisabled("With this on, Instinct should stop working in game. If it doesn't, pick another action name.");
-
-            ImGui::InputText("Filter action names", m_NameFilter, sizeof(m_NameFilter));
-            if (ImGui::Button("Clear list")) {
-                std::lock_guard<std::mutex> s_Lock(m_NameMutex);
-                m_SeenNames.clear();
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("Click a name to use it as the Instinct action");
-
-            std::string s_Picked;
-            if (ImGui::BeginChild("SeenActions", ImVec2(0, 150), true)) {
-                std::lock_guard<std::mutex> s_Lock(m_NameMutex);
-                for (const auto& s_SeenName : m_SeenNames) {
-                    if (m_NameFilter[0] && !ContainsNoCase(s_SeenName.c_str(), [&]() {
-                            std::string s_F = m_NameFilter;
-                            std::transform(s_F.begin(), s_F.end(), s_F.begin(),
-                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                            return s_F;
-                        }())) {
-                        continue;
-                    }
-                    if (ImGui::Selectable(s_SeenName.c_str())) {
-                        s_Picked = s_SeenName;
-                    }
-                }
-            }
-            ImGui::EndChild();
-
-            if (!s_Picked.empty()) {
-                std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", s_Picked.c_str());
-                RebuildPatterns();
-                s_Changed = true;
-            }
-        } else {
-            m_ForceBlockTest = false;
-        }
+        ImGui::TextDisabled("Comma-separated, matches part of the game's action name.");
 
         ImGui::Separator();
 
@@ -2357,8 +2673,12 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::Separator();
 
         // --- Instinct color ---
+        if (ImGui::Checkbox("Remove the Instinct color completely (no overlay, outlines only)", &m_TintRemove)) s_Changed = true;
+        ImGui::TextDisabled("The screen stays exactly as it is without Instinct; the game's outlines on people and items still show.");
+        ImGui::BeginDisabled(m_TintRemove);
         if (ImGui::Checkbox("Custom Instinct color (replaces the grey)", &m_TintEnabled)) s_Changed = true;
-        ImGui::BeginDisabled(!m_TintEnabled);
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!m_TintEnabled || m_TintRemove);
         if (ImGui::ColorEdit3("Instinct color", m_InstinctTint)) s_Changed = true;
         if (ImGui::SliderFloat("Strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
         ImGui::TextDisabled("1.00 = the grey is completely replaced by your color. Lower keeps part of the original look.");
@@ -2385,7 +2705,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             const ImVec4 s_LutColor = s_LutState == 4 ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)
                                     : s_LutState == 2 ? ImVec4(0.95f, 0.45f, 0.40f, 1.0f)
                                                       : ImVec4(0.70f, 0.70f, 0.70f, 1.0f);
-            if (s_LutText.empty()) s_LutText = m_TintEnabled ? "Waiting for a mission to load the Instinct texture..." : "Off.";
+            if (s_LutText.empty()) s_LutText = (m_TintEnabled || m_TintRemove) ? "Waiting for a mission to load the Instinct texture..." : "Off.";
             ImGui::PushStyleColor(ImGuiCol_Text, s_LutColor);
             ImGui::TextWrapped("%s", s_LutText.c_str());
             ImGui::PopStyleColor();
@@ -2408,24 +2728,60 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
         ImGui::Separator();
 
-        // --- Aim Focus ---
-        if (ImGui::Checkbox("Aim Focus: slow time while aiming with a weapon", &m_AimFocusEnabled)) s_Changed = true;
-        ImGui::BeginDisabled(!m_AimFocusEnabled);
-        if (ImGui::Checkbox("Only with a weapon in hand (not coins, tools, empty hands)", &m_AimWeaponOnly)) s_Changed = true;
-        ImGui::TextUnformatted("Aim button (your in-game aim bind)");
-        s_KeyBind("aim_button", m_AimButton, 1);
-        ImGui::TextUnformatted("Focus key (hold while aiming)");
-        s_KeyBind("aim_focus_key", m_AimFocusKey, 2);
-        if (ImGui::SliderFloat("Aim Focus time scale", &m_AimFocusScale, 0.05f, 0.95f, "%.2fx")) s_Changed = true;
-        if (ImGui::Button("Reset Aim Focus")) {
-            m_AimButton = 0x02;
-            m_AimFocusKey = 0x10;
-            m_AimFocusScale = 0.35f;
-            s_Changed = true;
-        }
-        ImGui::EndDisabled();
-        ImGui::TextDisabled("Hold the aim button and the focus key together. It does not use the Instinct meter.");
+        // --- Instinct glow colors (people and items) ---
+        if (ImGui::CollapsingHeader("Instinct colors (people and items)")) {
+            if (ImGui::Button("All to game default")) {
+                for (auto& s_G : m_Glow) s_G.Mode = 0;
+                s_Changed = true;
+            }
+            ImGui::TextDisabled("Pick \"Custom\" for a group, then choose the silhouette (fill) and outline colors. Applies in missions.");
+            ImGui::TextDisabled("Unticking Silhouette / Outline hides that part. Alpha = how strong it is.");
 
+            for (int i = 0; i < kGlowCatCount; ++i) {
+                SGlowSetting& s_G = m_Glow[i];
+                ImGui::PushID(i);
+
+                std::string s_Title = kGlowCats[i].Label;
+                if (s_G.Mode != 0) s_Title += "  (custom)";
+                s_Title += "###glowcat";
+
+                if (ImGui::TreeNode(s_Title.c_str())) {
+                    ImGui::TextDisabled("%s", kGlowCats[i].Tip);
+
+                    static const char* const s_ModeNames[] = {"Game default", "Custom"};
+                    if (ImGui::Combo("Colors", &s_G.Mode, s_ModeNames, 2)) s_Changed = true;
+
+                    ImGui::BeginDisabled(s_G.Mode == 0);
+                    constexpr ImGuiColorEditFlags s_Flags = ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf;
+
+                    if (ImGui::Checkbox("Silhouette", &s_G.FillOn)) { s_G.Seeded = true; s_Changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::ColorEdit4("##fill", s_G.Fill, s_Flags)) { s_G.Seeded = true; s_Changed = true; }
+
+                    if (ImGui::Checkbox("Outline   ", &s_G.OutlineOn)) { s_G.Seeded = true; s_Changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::ColorEdit4("##outline", s_G.Outline, s_Flags)) { s_G.Seeded = true; s_Changed = true; }
+
+                    ImGui::BeginDisabled(!s_G.HasVanilla);
+                    if (ImGui::Button("Copy the game's colors")) {
+                        std::memcpy(s_G.Fill, s_G.VanFill, sizeof(s_G.Fill));
+                        std::memcpy(s_G.Outline, s_G.VanOutline, sizeof(s_G.Outline));
+                        for (int k = 0; k < 4; ++k) {
+                            s_G.Fill[k] = std::clamp(s_G.Fill[k], 0.0f, 1.0f);
+                            s_G.Outline[k] = std::clamp(s_G.Outline[k], 0.0f, 1.0f);
+                        }
+                        s_G.FillOn = true;
+                        s_G.OutlineOn = true;
+                        s_G.Seeded = true;
+                        s_Changed = true;
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::EndDisabled();
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+        }
         ImGui::Separator();
 
         // --- HUD ---
