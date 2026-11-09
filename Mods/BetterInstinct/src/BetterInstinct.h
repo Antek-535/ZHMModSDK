@@ -81,6 +81,12 @@ private:
     void StopSound();
     void UpdateSound(float p_Dt, bool p_InPlay);
 
+    // Debug: lists entities that have glow properties (GlowType / GlowColor1 / GlowColor2). Runs on the game thread.
+    void ScanGlowEntities();
+    std::atomic<bool> m_GlowScanRequest{false};
+    std::mutex m_GlowMutex;
+    std::vector<std::string> m_GlowLines;       // guarded by m_GlowMutex
+
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
 
@@ -156,6 +162,7 @@ private:
     float m_FillColor[3] = {1.00f, 0.78f, 0.28f}; // gold
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
 
+    bool m_TintRemove = false;       // no Instinct color at all: the grey grading is replaced by an identity LUT (outlines only)
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
     float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color that replaces Instinct's grey
     float m_TintStrength = 1.00f;    // 1 = the grey is completely replaced, lower keeps part of the vanilla look
