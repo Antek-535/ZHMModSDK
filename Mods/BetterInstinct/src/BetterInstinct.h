@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <map>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -22,7 +21,6 @@
 #include <Glacier/ZItem.h>
 #include <Glacier/ZModule.h>
 #include <Glacier/ZScene.h>
-#include <Glacier/SColorRGBA.h>
 
 // Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
@@ -93,34 +91,13 @@ private:
 
     DECLARE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* th, int32_t controllerId);
 
-    // --- Outline colors (NPCs, items...) ---
-    // The glow/outline colors seen during Instinct are SColorRGBA properties (e.g. m_GlowCivilianOutlineColor) on
-    // entities of the scene. We spot those entities when the game activates them, and while Instinct is on we
-    // overwrite the properties with the user's colors (the original values are restored afterwards).
-    struct SGlowEntry {
-        ZEntityRef m_Ref;
-        uint32_t m_Id = 0;
-        std::string m_Name;
-        bool m_HasOrig = false;
-        SColorRGBA m_Orig{0.f, 0.f, 0.f, 1.f};
-        bool m_Applied = false;
-    };
-    struct SGlowSetting {
-        bool m_Enabled = false;
-        bool m_Init = false;               // color was initialised from the game's own value
-        float m_Color[4] = {1.f, 1.f, 1.f, 1.f};
-    };
-    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3);
-    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntitySceneContext_ClearScene, ZEntitySceneContext* th, bool bFullyUnloadScene);
-    void UpdateGlow(bool p_Active);
-    void RestoreGlow();
-    void DrawGlowUI(bool& p_Changed);
-    std::mutex m_GlowMutex;
-    std::vector<SGlowEntry> m_GlowEntries;          // guarded by m_GlowMutex
-    std::map<std::string, SGlowSetting> m_GlowSettings; // guarded by m_GlowMutex (persisted in the config file)
-    std::atomic<bool> m_GlowDirty{true};
-    std::atomic<uint32_t> m_GlowSeen{0};            // entities the activation hook has looked at
-    bool m_GlowEnabled = false;                     // off by default
+    // Weapon detection for Aim Focus: the game asks a weapon "IsFiring?" while 47 handles it. We note when that
+    // happens for a weapon owned by the local player, so Aim Focus only works with a weapon in hand (not with coins, etc.).
+    DECLARE_PLUGIN_DETOUR(BetterInstinct, bool, ZHM5ItemWeapon_IsFiring, IFirearm* th);
+    std::atomic<void*> m_LocalPlayerEntity{nullptr};   // entity pointer of Agent 47 (set every frame)
+    std::atomic<int64_t> m_LastWeaponPollTicks{0};     // last time his own weapon was polled
+    std::atomic<int> m_HeldWeaponType{-1};             // eWeaponType of that weapon (debug)
+    std::atomic<uint32_t> m_WeaponPolls{0};            // debug counter
 
     static bool IsKeyDown(int p_Vk);
     static std::string KeyName(int p_Vk);
@@ -177,6 +154,16 @@ private:
     float m_RechargeSeconds = 30.0f; // real seconds from empty to full
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
+    bool m_InstinctSlowdown = true;  // false = Instinct does NOT slow time (meter, color, sound still work)
+
+    // Aim Focus (inspired by the Focus mod): slow time while aiming AND holding the focus key. Works with every weapon.
+    bool m_AimFocusEnabled = false;  // off by default
+    int m_AimButton = 0x02;          // VK_RBUTTON: your in-game aim button
+    int m_AimFocusKey = 0x10;        // VK_SHIFT (either): hold together with aim to slow time
+    float m_AimFocusScale = 0.35f;   // time scale while Aim Focus is active
+    std::atomic<bool> m_AimFocusActive{false};
+    bool m_AimWeaponOnly = true;     // Aim Focus needs a weapon in hand (turn off if weapon detection fails for you)
+    int m_BindTarget = 0;            // which key the open "press a key" prompt is for: 0 Instinct, 1 aim button, 2 focus key
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
