@@ -1442,11 +1442,9 @@ void BetterInstinct::WriteGlowSlots(bool p_NotifyGame) {
                     SColorRGBA s_Color;
                     s_Color.r = s_V[0]; s_Color.g = s_V[1]; s_Color.b = s_V[2]; s_Color.a = s_V[3];
                     s_Slot.Ref.SetProperty<SColorRGBA>(s_Slot.PropId, s_Color, true);
-                } else {
-                    SColorRGB s_Color;
-                    s_Color.r = s_V[0]; s_Color.g = s_V[1]; s_Color.b = s_V[2];
-                    s_Slot.Ref.SetProperty<SColorRGB>(s_Slot.PropId, s_Color, true);
                 }
+                // RGB-only (size 12) slots: SetProperty<SColorRGB> by property id doesn't compile in this SDK,
+                // so those rely on the direct memory write above.
             } catch (...) {
             }
         }
