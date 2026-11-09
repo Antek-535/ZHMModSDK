@@ -1226,6 +1226,22 @@ inline void HashMix(uint32_t& p_H, uint32_t p_V) {
     p_H ^= p_V + 0x9E3779B9u + (p_H << 6) + (p_H >> 2);
 }
 
+// Runs a callable and survives access violations (entities that are half-constructed while a mission loads).
+// Kept free of C++ objects with destructors, which is what __try requires.
+bool SehInvoke(void (*p_Fn)(void*), void* p_Ctx) {
+    __try {
+        p_Fn(p_Ctx);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <class F>
+bool SafeCall(F& p_Callable) {
+    return SehInvoke([](void* p_C) { (*static_cast<F*>(p_C))(); }, &p_Callable);
+}
+
 inline uint32_t FloatBits(float p_F) {
     uint32_t s_B = 0;
     std::memcpy(&s_B, &p_F, sizeof(s_B));
@@ -1410,40 +1426,54 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
             }
         };
 
+        uint32_t s_Faults = 0;
+        auto s_Guarded = [&](const ZEntityRef& p_Ref) {
+            auto s_Run = [&]() { s_Process(p_Ref); };
+            if (!SafeCall(s_Run)) ++s_Faults;
+        };
+
         // Source 1: the entity manager's list (only part of the scene).
-        for (const auto& s_Pair : Globals::EntityManager->m_Entities) s_Process(s_Pair.second);
+        for (const auto& s_Pair : Globals::EntityManager->m_Entities) s_Guarded(s_Pair.second);
         const uint32_t s_FromManager = s_Scanned;
 
         // Source 2: every entity of the loaded scene and its bricks, walked through the blueprint factories
         // (this is where the static Instinct config entity lives).
         auto s_WalkRoot = [&](const ZEntityRef& p_Root) {
-            if (!p_Root) return;
-            s_Process(p_Root);
-            try {
-                ZEntityBlueprintFactoryBase* s_Factory = p_Root.GetBlueprintFactory();
-                if (!s_Factory) return;
-                const int64_t s_Count = s_Factory->GetSubEntitiesCount();
-                if (s_Count <= 0 || s_Count > 5000000) return;
-                for (int64_t i = 0; i < s_Count; ++i) {
-                    ZEntityType** s_Sub = s_Factory->GetSubEntity(p_Root.m_pObj, static_cast<int>(i));
-                    if (s_Sub) s_Process(ZEntityRef(s_Sub));
-                }
-            } catch (...) {
+            ZEntityBlueprintFactoryBase* s_Factory = nullptr;
+            int64_t s_Count = 0;
+            auto s_GetFactory = [&]() {
+                if (!p_Root) return;
+                s_Factory = p_Root.GetBlueprintFactory();
+                if (s_Factory) s_Count = s_Factory->GetSubEntitiesCount();
+            };
+            if (!SafeCall(s_GetFactory)) { ++s_Faults; return; }
+            s_Guarded(p_Root);
+            if (!s_Factory || s_Count <= 0 || s_Count > 2000000) return;
+            for (int64_t i = 0; i < s_Count; ++i) {
+                ZEntityType** s_Sub = nullptr;
+                auto s_GetSub = [&]() { s_Sub = s_Factory->GetSubEntity(p_Root.m_pObj, static_cast<int>(i)); };
+                if (!SafeCall(s_GetSub)) { ++s_Faults; break; } // this brick's factory is not usable (yet)
+                if (s_Sub) s_Guarded(ZEntityRef(s_Sub));
             }
         };
-        s_Detail += "Entities with \"glow\" in a property name:\n" + s_Cand;
-        if (Globals::Hitman5Module && Globals::Hitman5Module->m_pEntitySceneContext) {
-            ZEntitySceneContext* s_Ctx = Globals::Hitman5Module->m_pEntitySceneContext;
-            try {
+        ZEntitySceneContext* s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
+        if (s_Ctx && s_Ctx->m_LoadingStage == ESceneLoadingStage::eLoading_ScenePlaying) {
+            uint32_t s_BrickCount = 0;
+            auto s_WalkAll = [&]() {
                 s_WalkRoot(s_Ctx->m_pScene.m_entityRef);
-                for (const SBrickAllocationInfo& s_Brick : s_Ctx->m_aLoadedBricks) s_WalkRoot(s_Brick.m_EntityRef);
-                s_Detail = "Entities from entity manager: " + std::to_string(s_FromManager) +
-                           "\nEntities from scene/bricks: " + std::to_string(s_Scanned - s_FromManager) +
-                           "\nLoaded bricks: " + std::to_string(s_Ctx->m_aLoadedBricks.size()) + "\n" + s_Detail;
-            } catch (...) {
-            }
+                for (const SBrickAllocationInfo& s_Brick : s_Ctx->m_aLoadedBricks) {
+                    ++s_BrickCount;
+                    s_WalkRoot(s_Brick.m_EntityRef);
+                }
+            };
+            if (!SafeCall(s_WalkAll)) ++s_Faults;
+            s_Detail = "Entities from entity manager: " + std::to_string(s_FromManager) +
+                       "\nEntities from scene/bricks: " + std::to_string(s_Scanned - s_FromManager) +
+                       "\nBricks walked: " + std::to_string(s_BrickCount) +
+                       "\nAccess faults survived: " + std::to_string(s_Faults) + "\n" + s_Detail;
         } else {
-            s_Detail = "No scene context available.\n" + s_Detail;
+            s_Detail = std::string("Scene not in the playing state yet (stage ") +
+                       (s_Ctx ? std::to_string(static_cast<int>(s_Ctx->m_LoadingStage)) : std::string("n/a")) + "): scene walk skipped.\n" + s_Detail;
         }
     } catch (...) {
         m_GlowSlots.clear();
@@ -1567,7 +1597,7 @@ void BetterInstinct::UpdateGlowColors(float p_Dt) {
             ScanGlowSlots(m_GlowKeepSnap);
             m_GlowKeepSnap = false;
             if (m_GlowSlots.empty()) {
-                m_GlowWait = 6.0f; // nothing yet (the mission is still loading): try again in a few seconds
+                m_GlowWait = 20.0f; // nothing yet (the mission is still loading): try again later (a scene scan is not cheap)
             } else {
                 m_GlowNeedScan = false;
             }
