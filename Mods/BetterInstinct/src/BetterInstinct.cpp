@@ -1306,19 +1306,43 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
             }
         }
 
-        for (const auto& s_Pair : Globals::EntityManager->m_Entities) {
+        std::set<ZEntityImpl*> s_Visited;
+        uint32_t s_Candidates = 0;
+        std::string s_Cand;
+        auto s_Process = [&](const ZEntityRef& s_Ref) {
             ++s_Scanned;
-            const ZEntityRef& s_Ref = s_Pair.second;
             ZEntityImpl* s_Entity = s_Ref.GetEntity();
-            if (!s_Entity) continue;
+            if (!s_Entity) return;
+            if (!s_Visited.insert(s_Entity).second) return; // already looked at
             ZEntityType* s_Type = s_Entity->GetType();
-            if (!s_Type || !s_Type->m_pPropertyData) continue;
+            if (!s_Type || !s_Type->m_pPropertyData) return;
 
             bool s_IsConfig = false;
             for (const uint32_t s_Id : s_Anchors) {
                 if (s_Type->FindProperty(s_Id)) { s_IsConfig = true; break; }
             }
-            if (!s_IsConfig) continue;
+            if (!s_IsConfig) {
+                // Diagnostics: any entity with a property whose name contains "glow" (names may differ from our table).
+                if (s_Candidates < 15) {
+                    std::string s_Names;
+                    uint32_t s_N = 0;
+                    for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+                        const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                        if (!s_NI || !s_NI->m_pszPropertyName) continue;
+                        std::string s_Name = s_NI->m_pszPropertyName;
+                        std::string s_Lower = s_Name;
+                        for (char& s_C : s_Lower) s_C = static_cast<char>(std::tolower(static_cast<unsigned char>(s_C)));
+                        if (s_Lower.find("glow") != std::string::npos) {
+                            if (++s_N <= 40) s_Names += s_Name + " ";
+                        }
+                    }
+                    if (s_N > 0) {
+                        ++s_Candidates;
+                        s_Cand += "  entity with " + std::to_string(s_N) + " glow-named properties: " + s_Names + "\n";
+                    }
+                }
+                return;
+            }
             ++s_Entities;
 
             for (const SProp& s_Prop : s_Props) {
@@ -1384,6 +1408,42 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 }
                 m_GlowSlots.push_back(s_Slot);
             }
+        };
+
+        // Source 1: the entity manager's list (only part of the scene).
+        for (const auto& s_Pair : Globals::EntityManager->m_Entities) s_Process(s_Pair.second);
+        const uint32_t s_FromManager = s_Scanned;
+
+        // Source 2: every entity of the loaded scene and its bricks, walked through the blueprint factories
+        // (this is where the static Instinct config entity lives).
+        auto s_WalkRoot = [&](const ZEntityRef& p_Root) {
+            if (!p_Root) return;
+            s_Process(p_Root);
+            try {
+                ZEntityBlueprintFactoryBase* s_Factory = p_Root.GetBlueprintFactory();
+                if (!s_Factory) return;
+                const int64_t s_Count = s_Factory->GetSubEntitiesCount();
+                if (s_Count <= 0 || s_Count > 5000000) return;
+                for (int64_t i = 0; i < s_Count; ++i) {
+                    ZEntityType** s_Sub = s_Factory->GetSubEntity(p_Root.m_pObj, static_cast<int>(i));
+                    if (s_Sub) s_Process(ZEntityRef(s_Sub));
+                }
+            } catch (...) {
+            }
+        };
+        s_Detail += "Entities with \"glow\" in a property name:\n" + s_Cand;
+        if (Globals::Hitman5Module && Globals::Hitman5Module->m_pEntitySceneContext) {
+            ZEntitySceneContext* s_Ctx = Globals::Hitman5Module->m_pEntitySceneContext;
+            try {
+                s_WalkRoot(s_Ctx->m_pScene.m_entityRef);
+                for (const SBrickAllocationInfo& s_Brick : s_Ctx->m_aLoadedBricks) s_WalkRoot(s_Brick.m_EntityRef);
+                s_Detail = "Entities from entity manager: " + std::to_string(s_FromManager) +
+                           "\nEntities from scene/bricks: " + std::to_string(s_Scanned - s_FromManager) +
+                           "\nLoaded bricks: " + std::to_string(s_Ctx->m_aLoadedBricks.size()) + "\n" + s_Detail;
+            } catch (...) {
+            }
+        } else {
+            s_Detail = "No scene context available.\n" + s_Detail;
         }
     } catch (...) {
         m_GlowSlots.clear();
