@@ -37,6 +37,7 @@
 #include "Glacier/ZCameraEntity.h"
 #include "Glacier/ZCollision.h"
 #include "Glacier/ZEntity.h"
+#include "Glacier/ZEntityManager.h"
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZHitman5.h"
 #include "Glacier/ZObject.h"
@@ -655,6 +656,7 @@ void BetterInstinct::LoadSettings() {
     m_LowColor[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "low_b", m_LowColor[2])), 0.0f, 1.0f);
 
     m_TintEnabled = GetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    m_TintRemove = GetSettingBool(kSection, "tint_remove", m_TintRemove);
     m_InstinctTint[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_r", m_InstinctTint[0])), 0.0f, 1.0f);
     m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
     m_InstinctTint[2] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_b", m_InstinctTint[2])), 0.0f, 1.0f);
@@ -703,6 +705,7 @@ void BetterInstinct::SaveSettings() {
     SetSettingDouble(kSection, "low_b", m_LowColor[2]);
 
     SetSettingBool(kSection, "tint_enabled", m_TintEnabled);
+    SetSettingBool(kSection, "tint_remove", m_TintRemove);
     SetSettingDouble(kSection, "tint_r", m_InstinctTint[0]);
     SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
     SetSettingDouble(kSection, "tint_b", m_InstinctTint[2]);
@@ -793,6 +796,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("low_b", m_LowColor[2]);
 
         s_Bool("tint_enabled", m_TintEnabled);
+        s_Bool("tint_remove", m_TintRemove);
         s_Flt("tint_r", m_InstinctTint[0]);
         s_Flt("tint_g", m_InstinctTint[1]);
         s_Flt("tint_b", m_InstinctTint[2]);
@@ -893,6 +897,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("low_b", m_LowColor[2], 0.0f, 1.0f);
 
     s_Bool("tint_enabled", m_TintEnabled);
+    s_Bool("tint_remove", m_TintRemove);
     s_Flt("tint_r", m_InstinctTint[0], 0.0f, 1.0f);
     s_Flt("tint_g", m_InstinctTint[1], 0.0f, 1.0f);
     s_Flt("tint_b", m_InstinctTint[2], 0.0f, 1.0f);
@@ -1135,6 +1140,93 @@ std::string BetterInstinct::KeyName(int p_Vk) {
 }
 
 // ---------------------------------------------------------------------------
+// Glow entity scan (debug): finds every entity that has GlowType / GlowColor1 / GlowColor2 properties and lists their
+// current values. This only READS. It runs on the game thread when the Debug button is pressed.
+// ---------------------------------------------------------------------------
+
+void BetterInstinct::ScanGlowEntities() {
+    std::vector<std::string> s_Lines;
+    char s_Buf[512];
+
+    try {
+        if (!Globals::EntityManager) {
+            s_Lines.push_back("Entity manager not available yet.");
+        } else {
+            static const char* const s_Names[3] = {"GlowType", "GlowColor1", "GlowColor2"};
+            const uint32_t s_Ids[3] = {Hash::Crc32("GlowType"), Hash::Crc32("GlowColor1"), Hash::Crc32("GlowColor2")};
+
+            size_t s_Total = 0, s_Hits = 0;
+            for (const auto& s_Pair : Globals::EntityManager->m_Entities) {
+                ++s_Total;
+                const ZEntityRef& s_Ref = s_Pair.second;
+                ZEntityImpl* s_Entity = s_Ref.GetEntity();
+                if (!s_Entity) continue;
+                ZEntityType* s_Type = s_Entity->GetType();
+                if (!s_Type || !s_Type->m_pPropertyData) continue;
+
+                SPropertyData* s_Props[3] = {};
+                bool s_Any = false;
+                for (int i = 0; i < 3; ++i) {
+                    s_Props[i] = s_Type->FindProperty(s_Ids[i]);
+                    if (s_Props[i]) s_Any = true;
+                }
+                if (!s_Any) continue;
+
+                ++s_Hits;
+                if (s_Hits > 150) continue; // keep the list readable; the total is still counted
+
+                std::string s_Line;
+                std::snprintf(s_Buf, sizeof(s_Buf), "#%zu entity %p:", s_Hits, static_cast<void*>(s_Ref.m_pObj));
+                s_Line = s_Buf;
+
+                for (int i = 0; i < 3; ++i) {
+                    if (!s_Props[i]) continue;
+                    const SPropertyData* s_P = s_Props[i];
+                    const SPropertyInfo& s_Info = s_P->GetPropertyInfo()->m_propertyInfo;
+                    const IType* s_TypeInfo = s_Info.m_Type ? s_Info.m_Type->GetTypeInfo() : nullptr;
+                    const uint32_t s_Size = s_TypeInfo ? s_TypeInfo->m_nTypeSize : 0;
+
+                    std::snprintf(s_Buf, sizeof(s_Buf), "  %s [type=%s size=%u flags=%u]", s_Names[i],
+                                  s_TypeInfo && s_TypeInfo->pszTypeName ? s_TypeInfo->pszTypeName : "?", s_Size, s_Info.m_Flags);
+                    s_Line += s_Buf;
+
+                    if (!(s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) && s_Size > 0 && s_Size <= 16) {
+                        const uint8_t* s_Raw = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_P->m_nPropertyOffset);
+                        s_Line += " =";
+                        for (uint32_t b = 0; b < s_Size; ++b) {
+                            std::snprintf(s_Buf, sizeof(s_Buf), " %02X", s_Raw[b]);
+                            s_Line += s_Buf;
+                        }
+                        if (s_Size == 12 || s_Size == 16) {
+                            float s_F[4] = {};
+                            std::memcpy(s_F, s_Raw, s_Size);
+                            std::snprintf(s_Buf, sizeof(s_Buf), "  (floats %.3f %.3f %.3f%s)", s_F[0], s_F[1], s_F[2],
+                                          s_Size == 16 ? " +a" : "");
+                            s_Line += s_Buf;
+                        } else if (s_Size == 1) {
+                            std::snprintf(s_Buf, sizeof(s_Buf), "  (int8 %d)", static_cast<int>(static_cast<int8_t>(s_Raw[0])));
+                            s_Line += s_Buf;
+                        }
+                    } else if (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) {
+                        s_Line += " (uses getter/setter, value not read)";
+                    }
+                }
+                s_Lines.push_back(s_Line);
+            }
+
+            std::snprintf(s_Buf, sizeof(s_Buf), "Scanned %zu entities, %zu have glow properties%s.", s_Total, s_Hits,
+                          s_Hits > 150 ? " (first 150 shown)" : "");
+            s_Lines.insert(s_Lines.begin(), s_Buf);
+        }
+    } catch (...) {
+        s_Lines.push_back("The scan failed with an exception.");
+    }
+
+    std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
+    m_GlowLines = std::move(s_Lines);
+}
+
+// ---------------------------------------------------------------------------
 // Game loop
 // ---------------------------------------------------------------------------
 
@@ -1184,6 +1276,10 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
         return;
     }
     m_NoPlayerTime = 0.0f;
+
+    if (m_GlowScanRequest.exchange(false)) {
+        ScanGlowEntities();
+    }
 
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
@@ -1745,6 +1841,93 @@ std::vector<uint8_t> LutRecolor(const std::vector<uint8_t>& p_Base, const float*
     return s_Out;
 }
 
+// "No Instinct color": an identity LUT (every color maps to itself), so Instinct's grading changes nothing on screen.
+// The layout of the game's LUT is not known in advance, so it is worked out from the vanilla (grey) data itself: the
+// vanilla LUT outputs a luminance of its input, so the right layout is the one where "luminance of the input color the
+// texel stands for" matches the vanilla texel. If no layout matches well, nothing is written (the picture stays vanilla).
+std::vector<uint8_t> LutIdentity(const std::vector<uint8_t>& p_Base, int p_W, int p_H, std::string& p_Err) {
+    int s_N = 0;
+    for (int n = 2; n <= 64; ++n) if (n * n * n == p_W * p_H) s_N = n;
+    if (s_N == 0 || p_W % s_N != 0 || p_H % s_N != 0 || (p_W / s_N) * (p_H / s_N) != s_N ||
+        p_Base.size() < static_cast<size_t>(p_W) * p_H * 4) {
+        p_Err = "the Instinct texture is not a 3D color LUT layout I recognise";
+        return {};
+    }
+
+    const int s_TilesX = p_W / s_N;
+    const float s_Den = static_cast<float>(s_N - 1);
+    const int s_Count = p_W * p_H;
+
+    std::vector<float> s_BaseLum(s_Count);
+    double s_Mean = 0.0;
+    for (int i = 0; i < s_Count; ++i) {
+        const float s_L = 0.2126f * p_Base[i * 4 + 0] + 0.7152f * p_Base[i * 4 + 1] + 0.0722f * p_Base[i * 4 + 2];
+        s_BaseLum[i] = s_L / 255.0f;
+        s_Mean += s_BaseLum[i];
+    }
+    s_Mean /= s_Count;
+    double s_VarBase = 0.0;
+    for (int i = 0; i < s_Count; ++i) s_VarBase += (s_BaseLum[i] - s_Mean) * (s_BaseLum[i] - s_Mean);
+    if (s_VarBase < 1e-6) {
+        p_Err = "the vanilla Instinct texture has no brightness variation to learn its layout from";
+        return {};
+    }
+
+    static const int s_Perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    double s_BestCorr = -2.0;
+    int s_BestPerm = 0, s_BestFlip = 0;
+
+    auto s_InputAt = [&](int p_Texel, int p_Perm, int p_Flip, float* p_Rgb) {
+        const int x = p_Texel % p_W, y = p_Texel / p_W;
+        const int s_Tile = (y / s_N) * s_TilesX + (x / s_N);
+        const int s_Axes[3] = {x % s_N, y % s_N, s_Tile}; // 0 = across the tile, 1 = down the tile, 2 = which tile
+        for (int a = 0; a < 3; ++a) {
+            float s_V = static_cast<float>(s_Axes[a]) / s_Den;
+            if (p_Flip & (1 << a)) s_V = 1.0f - s_V;
+            p_Rgb[s_Perms[p_Perm][a]] = s_V;
+        }
+    };
+
+    for (int s_P = 0; s_P < 6; ++s_P) {
+        for (int s_F = 0; s_F < 8; ++s_F) {
+            double s_MeanIn = 0.0;
+            std::vector<float> s_InLum(s_Count);
+            for (int i = 0; i < s_Count; ++i) {
+                float s_Rgb[3];
+                s_InputAt(i, s_P, s_F, s_Rgb);
+                s_InLum[i] = 0.2126f * s_Rgb[0] + 0.7152f * s_Rgb[1] + 0.0722f * s_Rgb[2];
+                s_MeanIn += s_InLum[i];
+            }
+            s_MeanIn /= s_Count;
+            double s_Cov = 0.0, s_VarIn = 0.0;
+            for (int i = 0; i < s_Count; ++i) {
+                s_Cov += (s_InLum[i] - s_MeanIn) * (s_BaseLum[i] - s_Mean);
+                s_VarIn += (s_InLum[i] - s_MeanIn) * (s_InLum[i] - s_MeanIn);
+            }
+            const double s_Corr = s_VarIn > 1e-9 ? s_Cov / std::sqrt(s_VarIn * s_VarBase) : -2.0;
+            if (s_Corr > s_BestCorr) { s_BestCorr = s_Corr; s_BestPerm = s_P; s_BestFlip = s_F; }
+        }
+    }
+
+    if (s_BestCorr < 0.97) {
+        char s_Buf[128];
+        std::snprintf(s_Buf, sizeof(s_Buf), "could not work out the Instinct texture layout (best match %.2f)", s_BestCorr);
+        p_Err = s_Buf;
+        return {};
+    }
+
+    std::vector<uint8_t> s_Out(p_Base.size());
+    for (int i = 0; i < s_Count; ++i) {
+        float s_Rgb[3];
+        s_InputAt(i, s_BestPerm, s_BestFlip, s_Rgb);
+        for (int c = 0; c < 3; ++c) {
+            s_Out[i * 4 + c] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(s_Rgb[c] * 255.0f)), 0, 255));
+        }
+        s_Out[i * 4 + 3] = p_Base[i * 4 + 3];
+    }
+    return s_Out;
+}
+
 fs::path LutCachePath() {
     const std::wstring s_Dir = ConfigDir();
     return s_Dir.empty() ? fs::path() : fs::path(s_Dir) / L"instinct_lut_base.bin";
@@ -1889,7 +2072,8 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
         m_LutPoll = 0.0f;
     }
 
-    if (!m_TintEnabled && !m_Lut) return; // nothing to do and nothing to undo
+    const bool s_Mod = m_TintEnabled || m_TintRemove; // do we want the texture changed at all?
+    if (!s_Mod && !m_Lut) return; // nothing to do and nothing to undo
 
     m_LutPoll -= p_Dt;
     m_LutCooldown -= p_Dt;
@@ -1897,7 +2081,7 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     if (m_Lut && !LutStillValid()) ReleaseLut();
 
     if (!m_Lut) {
-        if (!m_TintEnabled || m_LutPoll > 0.0f) return;
+        if (!s_Mod || m_LutPoll > 0.0f) return;
         m_LutPoll = 2.0f; // searching walks the whole resource list: only every couple of seconds
         if (!EnsureLut()) return;
     }
@@ -1905,8 +2089,8 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     // What should the texture contain right now?
     uint32_t s_Sig = 2166136261u;
     auto s_Mix = [&](uint32_t p_Value) { s_Sig = (s_Sig ^ p_Value) * 16777619u; };
-    s_Mix(m_TintEnabled ? 1u : 0u);
-    if (m_TintEnabled) {
+    s_Mix(m_TintRemove ? 2u : (m_TintEnabled ? 1u : 0u));
+    if (m_TintEnabled && !m_TintRemove) {
         for (int i = 0; i < 3; ++i) s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_InstinctTint[i], 0.0f, 1.0f) * 255.0f)));
         s_Mix(static_cast<uint32_t>(std::lround(std::clamp(m_TintStrength, 0.0f, 1.0f) * 255.0f)));
         s_Mix(m_TintKeepBrightness ? 1u : 0u);
@@ -1914,7 +2098,7 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     }
 
     if (m_LutApplied && s_Sig == m_LutAppliedSig) return; // already up to date
-    if (!m_LutApplied && !m_TintEnabled) {                // vanilla is already in place: let go of the texture
+    if (!m_LutApplied && !s_Mod) {                // vanilla is already in place: let go of the texture
         ReleaseLut();
         return;
     }
@@ -1924,14 +2108,25 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     m_LutCooldown = 0.1f;
 
     std::string s_Err;
-    if (m_TintEnabled) {
-        const std::vector<uint8_t> s_Image = LutRecolor(m_Lut->m_Base, m_InstinctTint, std::clamp(m_TintStrength, 0.0f, 1.0f),
-                                                        m_TintKeepBrightness, m_TintBrightness);
-        if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
+    if (s_Mod) {
+        std::vector<uint8_t> s_Image;
+        bool s_Built = true;
+        if (m_TintRemove) {
+            s_Image = LutIdentity(m_Lut->m_Base, static_cast<int>(m_Lut->m_Desc.Width), static_cast<int>(m_Lut->m_Desc.Height), s_Err);
+            s_Built = !s_Image.empty();
+        } else {
+            s_Image = LutRecolor(m_Lut->m_Base, m_InstinctTint, std::clamp(m_TintStrength, 0.0f, 1.0f),
+                                 m_TintKeepBrightness, m_TintBrightness);
+        }
+        if (!s_Built) {
+            SetLutStatus(2, "Could not remove the Instinct color: " + s_Err + ". The vanilla look stays.");
+            m_LutFailSig.store(s_Sig);
+        } else if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
             m_LutApplied = true;
             m_LutAppliedSig = s_Sig;
             ++m_LutWrites;
-            SetLutStatus(4, "Instinct color is active (the game's grey Instinct LUT has been replaced).");
+            SetLutStatus(4, m_TintRemove ? "Instinct color is removed (no grey overlay, only the outlines remain)."
+                                         : "Instinct color is active (the game's grey Instinct LUT has been replaced).");
         } else {
             SetLutStatus(2, "Could not write the Instinct LUT: " + s_Err + ". Try the other 'GPU state' option under Advanced.");
             m_LutFailSig.store(s_Sig);
@@ -2221,6 +2416,26 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::CollapsingHeader("Debug")) {
             m_CaptureNames = true;
 
+            ImGui::Separator();
+            ImGui::TextUnformatted("Glow entity scan (read only)");
+            ImGui::TextDisabled("Start a mission, turn Instinct on, then press the button. Copy the result lines if you want help reading them.");
+            if (ImGui::Button("Scan glow entities")) m_GlowScanRequest = true;
+            {
+                std::lock_guard<std::mutex> s_GlowLock(m_GlowMutex);
+                if (!m_GlowLines.empty()) {
+                    if (ImGui::Button("Copy result")) {
+                        std::string s_All;
+                        for (const auto& s_L : m_GlowLines) { s_All += s_L; s_All += "\n"; }
+                        ImGui::SetClipboardText(s_All.c_str());
+                    }
+                    if (ImGui::BeginChild("GlowScan", ImVec2(0, 160), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+                        for (const auto& s_L : m_GlowLines) ImGui::TextUnformatted(s_L.c_str());
+                    }
+                    ImGui::EndChild();
+                }
+            }
+            ImGui::Separator();
+
             ImGui::Text("Game updates seen: %u", m_FrameCount.load());
             ImGui::Text("Instinct key down:  Windows=%s  hook=%s", AsyncKeyDown(m_InstinctKey) ? "YES" : "no", HookKeyDown(m_InstinctKey) ? "YES" : "no");
             ImGui::Text("Hook events: keyboard=%u  mouse=%u  last key=0x%02X", g_KbEvents.load(), g_MouseEvents.load(), g_LastVk.load());
@@ -2287,8 +2502,12 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::Separator();
 
         // --- Instinct color ---
+        if (ImGui::Checkbox("Remove the Instinct color completely (no overlay, outlines only)", &m_TintRemove)) s_Changed = true;
+        ImGui::TextDisabled("The screen stays exactly as it is without Instinct; the game's outlines on people and items still show.");
+        ImGui::BeginDisabled(m_TintRemove);
         if (ImGui::Checkbox("Custom Instinct color (replaces the grey)", &m_TintEnabled)) s_Changed = true;
-        ImGui::BeginDisabled(!m_TintEnabled);
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!m_TintEnabled || m_TintRemove);
         if (ImGui::ColorEdit3("Instinct color", m_InstinctTint)) s_Changed = true;
         if (ImGui::SliderFloat("Strength", &m_TintStrength, 0.0f, 1.0f, "%.2f")) s_Changed = true;
         ImGui::TextDisabled("1.00 = the grey is completely replaced by your color. Lower keeps part of the original look.");
@@ -2315,7 +2534,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             const ImVec4 s_LutColor = s_LutState == 4 ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)
                                     : s_LutState == 2 ? ImVec4(0.95f, 0.45f, 0.40f, 1.0f)
                                                       : ImVec4(0.70f, 0.70f, 0.70f, 1.0f);
-            if (s_LutText.empty()) s_LutText = m_TintEnabled ? "Waiting for a mission to load the Instinct texture..." : "Off.";
+            if (s_LutText.empty()) s_LutText = (m_TintEnabled || m_TintRemove) ? "Waiting for a mission to load the Instinct texture..." : "Off.";
             ImGui::PushStyleColor(ImGuiCol_Text, s_LutColor);
             ImGui::TextWrapped("%s", s_LutText.c_str());
             ImGui::PopStyleColor();
