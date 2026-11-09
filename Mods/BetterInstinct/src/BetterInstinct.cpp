@@ -508,7 +508,6 @@ BetterInstinct::~BetterInstinct() {
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
 
-    RestoreGlow();
     RestoreTint();
     CloseSound();
     g_Guard.reset(); // removes the input hooks
@@ -521,8 +520,7 @@ BetterInstinct::~BetterInstinct() {
 void BetterInstinct::Init() {
     // Lets us answer "not pressed" to the game when it asks about the Instinct action.
     Hooks::ZInputAction_Digital->AddDetour(this, &BetterInstinct::ZInputAction_Digital);
-    Hooks::ZEntityManager_ActivateEntity->AddDetour(this, &BetterInstinct::ZEntityManager_ActivateEntity);
-    Hooks::ZEntitySceneContext_ClearScene->AddDetour(this, &BetterInstinct::ZEntitySceneContext_ClearScene);
+    Hooks::ZHM5ItemWeapon_IsFiring->AddDetour(this, &BetterInstinct::ZHM5ItemWeapon_IsFiring);
 }
 
 void BetterInstinct::OnEngineInitialized() {
@@ -630,143 +628,20 @@ DEFINE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* t
     return HookResult<bool>(HookAction::Continue());
 }
 
-
-// ---------------------------------------------------------------------------
-// Outline colors (SColorRGBA "glow" properties on scene entities)
-// ---------------------------------------------------------------------------
-
-// Spots entities that own an outline/glow color property. Runs for every activated entity, so it stays cheap.
-DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3) {
-    if (entity && *entity) {
-        ++m_GlowSeen;
-        ZEntityImpl* s_Impl = entity->GetEntity();
-        ZEntityType* s_Type = s_Impl ? s_Impl->GetType() : nullptr;
-
-        if (s_Type && s_Type->m_pPropertyData && Globals::TypeRegistry && *Globals::TypeRegistry) {
-            static STypeID* s_ColorType = nullptr;
-            if (!s_ColorType) s_ColorType = (*Globals::TypeRegistry)->GetTypeID(ZHMTypeName<SColorRGBA>);
-
-            auto& s_Props = *s_Type->m_pPropertyData;
-            for (uint32_t i = 0; i < s_Props.size(); ++i) {
-                SPropertyData& s_Prop = s_Props[i];
-                if (!s_Prop.m_pPropertyInfo) continue;
-                const SNamedPropertyInfo* s_Info = s_Prop.GetPropertyInfo();
-                if (!s_Info || !s_Info->m_pszPropertyName) continue;
-                if (s_ColorType && s_Info->m_propertyInfo.m_Type != s_ColorType) continue;
-
-                const char* s_Name = s_Info->m_pszPropertyName;
-                if (!ContainsNoCase(s_Name, "glow") && !ContainsNoCase(s_Name, "outline")) continue;
-
-                std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
-                bool s_Known = false;
-                for (const auto& s_E : m_GlowEntries) {
-                    if (s_E.m_Ref == *entity && s_E.m_Id == s_Prop.m_nPropertyID) { s_Known = true; break; }
-                }
-                if (!s_Known && m_GlowEntries.size() < 512) {
-                    SGlowEntry s_New;
-                    s_New.m_Ref = *entity;
-                    s_New.m_Id = s_Prop.m_nPropertyID;
-                    s_New.m_Name = s_Name;
-                    m_GlowEntries.push_back(std::move(s_New));
-                    m_GlowSettings.try_emplace(s_Name);
-                }
+// Called by the game whenever it asks a weapon whether it is firing. We only take a note (never change the result).
+DEFINE_PLUGIN_DETOUR(BetterInstinct, bool, ZHM5ItemWeapon_IsFiring, IFirearm* th) {
+    if (th && m_AimFocusEnabled && m_AimWeaponOnly) {
+        void* s_Local = m_LocalPlayerEntity.load();
+        if (s_Local) {
+            auto* s_Weapon = static_cast<ZHM5ItemWeapon*>(th);
+            if (s_Weapon->m_pOwner.GetEntity() == s_Local) {
+                m_LastWeaponPollTicks.store(std::chrono::steady_clock::now().time_since_epoch().count());
+                m_HeldWeaponType.store(static_cast<int>(s_Weapon->m_WeaponType));
+                ++m_WeaponPolls;
             }
         }
     }
-    return HookResult<void>(HookAction::Continue());
-}
-
-// Scene is going away: the entity references are dead, forget them (no writes, the memory is being freed).
-DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZEntitySceneContext_ClearScene, ZEntitySceneContext* th, bool bFullyUnloadScene) {
-    std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
-    m_GlowEntries.clear();
-    m_GlowDirty = true;
-    return HookResult<void>(HookAction::Continue());
-}
-
-void BetterInstinct::UpdateGlow(bool p_Active) {
-    const bool s_Want = m_GlowEnabled && p_Active;
-
-    std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
-    if (m_GlowEntries.empty()) return;
-
-    const bool s_Dirty = m_GlowDirty.exchange(false);
-
-    for (auto& s_E : m_GlowEntries) {
-        if (!s_E.m_Ref) continue;
-
-        auto s_SetIt = m_GlowSettings.find(s_E.m_Name);
-        if (s_SetIt == m_GlowSettings.end()) continue;
-        SGlowSetting& s_Set = s_SetIt->second;
-
-        if (!s_E.m_HasOrig) { // remember the game's own value before we ever touch it
-            auto s_Val = s_E.m_Ref.GetProperty<SColorRGBA>(s_E.m_Id);
-            s_E.m_Orig = s_Val.Get();
-            s_E.m_HasOrig = true;
-            if (!s_Set.m_Init) {
-                s_Set.m_Color[0] = s_E.m_Orig.r;
-                s_Set.m_Color[1] = s_E.m_Orig.g;
-                s_Set.m_Color[2] = s_E.m_Orig.b;
-                s_Set.m_Color[3] = s_E.m_Orig.a;
-                s_Set.m_Init = true;
-            }
-        }
-
-        const bool s_Custom = s_Want && s_Set.m_Enabled;
-        if (s_Custom) {
-            if (!s_E.m_Applied || s_Dirty) {
-                SColorRGBA s_C{s_Set.m_Color[0], s_Set.m_Color[1], s_Set.m_Color[2], s_Set.m_Color[3]};
-                s_E.m_Ref.SetProperty(s_E.m_Id, s_C);
-                s_E.m_Applied = true;
-            }
-        } else if (s_E.m_Applied) {
-            s_E.m_Ref.SetProperty(s_E.m_Id, s_E.m_Orig);
-            s_E.m_Applied = false;
-        }
-    }
-}
-
-void BetterInstinct::RestoreGlow() {
-    std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
-    for (auto& s_E : m_GlowEntries) {
-        if (s_E.m_Applied && s_E.m_Ref) s_E.m_Ref.SetProperty(s_E.m_Id, s_E.m_Orig);
-        s_E.m_Applied = false;
-    }
-}
-
-void BetterInstinct::DrawGlowUI(bool& p_Changed) {
-    if (ImGui::Checkbox("Custom outline colors (NPCs, items...)", &m_GlowEnabled)) {
-        m_GlowDirty = true;
-        p_Changed = true;
-    }
-    ImGui::TextDisabled("Applied while Instinct is on, the game's own colors come back afterwards.");
-
-    std::lock_guard<std::mutex> s_Lock(m_GlowMutex);
-    size_t s_Live = 0;
-    for (const auto& s_E : m_GlowEntries) if (s_E.m_Ref) ++s_Live;
-
-    ImGui::TextDisabled("Outline entities in this mission: %zu   (entities checked: %u)", s_Live, m_GlowSeen.load());
-    if (m_GlowSettings.empty()) {
-        ImGui::TextDisabled("Nothing found yet. Load a mission (restart it if the mod was loaded mid-mission).");
-        return;
-    }
-
-    ImGui::BeginDisabled(!m_GlowEnabled);
-    ImGui::TextDisabled("Alpha 0 hides that outline completely.");
-    for (auto& s_Pair : m_GlowSettings) {
-        ImGui::PushID(s_Pair.first.c_str());
-        SGlowSetting& s_Set = s_Pair.second;
-        if (ImGui::Checkbox("##en", &s_Set.m_Enabled)) { m_GlowDirty = true; p_Changed = true; }
-        ImGui::SameLine();
-        if (ImGui::ColorEdit4(s_Pair.first.c_str(), s_Set.m_Color, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_NoInputs)) {
-            s_Set.m_Enabled = true;
-            s_Set.m_Init = true;
-            m_GlowDirty = true;
-            p_Changed = true;
-        }
-        ImGui::PopID();
-    }
-    ImGui::EndDisabled();
+    return HookResult<bool>(HookAction::Continue());
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +652,12 @@ void BetterInstinct::LoadSettings() {
     m_InstinctKey = static_cast<int>(GetSettingInt(kSection, "instinct_key", m_InstinctKey));
     m_ToggleMode = GetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     m_BlockEnabled = GetSettingBool(kSection, "block_enabled", m_BlockEnabled);
+    m_InstinctSlowdown = GetSettingBool(kSection, "instinct_slowdown", m_InstinctSlowdown);
+    m_AimFocusEnabled = GetSettingBool(kSection, "aim_focus_enabled", m_AimFocusEnabled);
+    m_AimWeaponOnly = GetSettingBool(kSection, "aim_weapon_only", m_AimWeaponOnly);
+    m_AimButton = std::clamp(static_cast<int>(GetSettingInt(kSection, "aim_button", m_AimButton)), 1, 254);
+    m_AimFocusKey = std::clamp(static_cast<int>(GetSettingInt(kSection, "aim_focus_key", m_AimFocusKey)), 1, 254);
+    m_AimFocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "aim_focus_scale", m_AimFocusScale)), 0.05f, 0.95f);
     m_FocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "focus_scale", m_FocusScale)), 0.05f, 0.95f);
     m_BlendSpeed = std::clamp(static_cast<float>(GetSettingDouble(kSection, "blend_speed", m_BlendSpeed)), 1.0f, 30.0f);
     m_DrainSeconds = std::clamp(static_cast<float>(GetSettingDouble(kSection, "drain_seconds", m_DrainSeconds)), 2.0f, 120.0f);
@@ -825,6 +706,12 @@ void BetterInstinct::SaveSettings() {
     SetSettingInt(kSection, "hud_style", 2);
     SetSettingBool(kSection, "toggle_mode", m_ToggleMode);
     SetSettingBool(kSection, "block_enabled", m_BlockEnabled);
+    SetSettingBool(kSection, "instinct_slowdown", m_InstinctSlowdown);
+    SetSettingBool(kSection, "aim_focus_enabled", m_AimFocusEnabled);
+    SetSettingBool(kSection, "aim_weapon_only", m_AimWeaponOnly);
+    SetSettingInt(kSection, "aim_button", m_AimButton);
+    SetSettingInt(kSection, "aim_focus_key", m_AimFocusKey);
+    SetSettingDouble(kSection, "aim_focus_scale", m_AimFocusScale);
     SetSettingDouble(kSection, "focus_scale", m_FocusScale);
     SetSettingDouble(kSection, "blend_speed", m_BlendSpeed);
     SetSettingDouble(kSection, "drain_seconds", m_DrainSeconds);
@@ -915,6 +802,12 @@ bool BetterInstinct::SaveConfigFile() {
         s_Int("instinct_key", m_InstinctKey);
         s_Bool("toggle_mode", m_ToggleMode);
         s_Bool("block_enabled", m_BlockEnabled);
+        s_Bool("instinct_slowdown", m_InstinctSlowdown);
+        s_Bool("aim_focus_enabled", m_AimFocusEnabled);
+        s_Bool("aim_weapon_only", m_AimWeaponOnly);
+        s_Int("aim_button", m_AimButton);
+        s_Int("aim_focus_key", m_AimFocusKey);
+        s_Flt("aim_focus_scale", m_AimFocusScale);
         s_Flt("focus_scale", m_FocusScale);
         s_Flt("blend_speed", m_BlendSpeed);
         s_Flt("drain_seconds", m_DrainSeconds);
@@ -954,16 +847,6 @@ bool BetterInstinct::SaveConfigFile() {
         s_Str("preset_name", m_PresetName);
         s_Str("custom_path", m_CustomPath);
         s_Str("action_patterns", m_ActionPatterns);
-
-        s_Bool("glow_enabled", m_GlowEnabled);
-        {
-            std::lock_guard<std::mutex> s_GlowLock(m_GlowMutex);
-            for (const auto& s_Pair : m_GlowSettings) {
-                const SGlowSetting& s = s_Pair.second;
-                s_File << "glowc:" << s_Pair.first << "=" << (s.m_Enabled ? 1 : 0) << "," << (s.m_Init ? 1 : 0) << ","
-                       << s.m_Color[0] << "," << s.m_Color[1] << "," << s.m_Color[2] << "," << s.m_Color[3] << "\n";
-            }
-        }
 
         s_File.flush();
         if (!s_File.good()) return false;
@@ -1025,6 +908,12 @@ bool BetterInstinct::LoadConfigFile() {
     s_Int("instinct_key", m_InstinctKey, 1, 254);
     s_Bool("toggle_mode", m_ToggleMode);
     s_Bool("block_enabled", m_BlockEnabled);
+    s_Bool("instinct_slowdown", m_InstinctSlowdown);
+    s_Bool("aim_focus_enabled", m_AimFocusEnabled);
+    s_Bool("aim_weapon_only", m_AimWeaponOnly);
+    s_Int("aim_button", m_AimButton, 1, 254);
+    s_Int("aim_focus_key", m_AimFocusKey, 1, 254);
+    s_Flt("aim_focus_scale", m_AimFocusScale, 0.05f, 0.95f);
     s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
     s_Flt("blend_speed", m_BlendSpeed, 1.0f, 30.0f);
     s_Flt("drain_seconds", m_DrainSeconds, 2.0f, 120.0f);
@@ -1051,24 +940,6 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("lut_strength", m_TintStrength, 0.0f, 1.0f);
     s_Bool("tint_keep_brightness", m_TintKeepBrightness);
     s_Flt("lut_brightness", m_TintBrightness, 0.25f, 3.0f);
-    s_Bool("glow_enabled", m_GlowEnabled);
-    {
-        std::lock_guard<std::mutex> s_GlowLock(m_GlowMutex);
-        for (const auto& s_Kv : s_Map) {
-            if (s_Kv.first.rfind("glowc:", 0) != 0) continue;
-            int s_En = 0, s_In = 0;
-            float s_R = 1, s_G = 1, s_B = 1, s_A = 1;
-            if (std::sscanf(s_Kv.second.c_str(), "%d,%d,%f,%f,%f,%f", &s_En, &s_In, &s_R, &s_G, &s_B, &s_A) == 6) {
-                SGlowSetting& s = m_GlowSettings[s_Kv.first.substr(6)];
-                s.m_Enabled = s_En != 0;
-                s.m_Init = s_In != 0;
-                s.m_Color[0] = std::clamp(s_R, 0.0f, 1.0f);
-                s.m_Color[1] = std::clamp(s_G, 0.0f, 1.0f);
-                s.m_Color[2] = std::clamp(s_B, 0.0f, 1.0f);
-                s.m_Color[3] = std::clamp(s_A, 0.0f, 1.0f);
-            }
-        }
-    }
     s_Int("lut_barrier", m_LutBarrier, 0, 1);
 
     s_Bool("sound_enabled", m_SoundEnabled);
@@ -1325,12 +1196,16 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     bool s_HasPlayer = false;
     if (auto s_LocalHitman = SDK()->GetLocalPlayer()) {
         s_HasPlayer = true;
+        m_LocalPlayerEntity.store(s_LocalHitman.m_entityRef.GetEntity());
+    } else {
+        m_LocalPlayerEntity.store(nullptr);
     }
     m_HasPlayer = s_HasPlayer;
 
     if (!s_HasPlayer) {
         m_NoPlayerTime += s_Dt;
         m_Active.store(false);
+        m_AimFocusActive.store(false);
         m_InputBlock = false;
         g_Block = false;
         m_PrevDown = false;
@@ -1424,7 +1299,6 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
 
     m_Active.store(s_Want);
     UpdateTint(s_Dt, s_Want);
-    UpdateGlow(s_Want);
 
     // Meter: drains while active, recharges (after a short delay) otherwise.
     if (s_Want) {
@@ -1448,11 +1322,24 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     }
 
     // Time scale.
-    const float s_Target = s_Want ? m_FocusScale : 1.0f;
+    // Aim Focus: aim button + focus key held together (any weapon). Doesn't use the Instinct meter.
+    // With "weapon only" on, a weapon owned by 47 must have been polled by the game within the last 0.3 s.
+    bool s_WeaponOk = true;
+    if (m_AimWeaponOnly) {
+        const int64_t s_Last = m_LastWeaponPollTicks.load();
+        const auto s_Age = s_Now - clock::time_point(clock::duration(s_Last));
+        s_WeaponOk = s_Last != 0 && std::chrono::duration<float>(s_Age).count() < 0.3f;
+    }
+    const bool s_AimFocus = m_AimFocusEnabled && s_GameFocused && s_WeaponOk && PhysKeyDown(m_AimButton) && PhysKeyDown(m_AimFocusKey);
+    m_AimFocusActive.store(s_AimFocus);
+
+    float s_Target = 1.0f;
+    if (s_Want && m_InstinctSlowdown) s_Target = m_FocusScale;
+    if (s_AimFocus) s_Target = std::min(s_Target, m_AimFocusScale);
     const float s_T = std::clamp(m_BlendSpeed * s_Dt, 0.0f, 1.0f);
     m_CurrentScale += (s_Target - m_CurrentScale) * s_T;
 
-    if (s_Want || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
+    if (s_Target < 1.0f || std::abs(m_CurrentScale - 1.0f) > 0.002f) {
         Globals::GameTimeManager->m_fGameTimeMultiplier = m_CurrentScale;
         m_Touched = true;
     } else if (m_Touched) {
@@ -2339,39 +2226,46 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Better Instinct", &m_ShowUI)) {
-        // --- Key binding ---
-        ImGui::TextUnformatted("Instinct key (set this to your in-game Instinct bind)");
-        if (m_Binding) {
-            ImGui::Button("Press a key or mouse button... (Esc cancels)", ImVec2(-1, 0));
+        // --- Key binding (shared by the Instinct key, the aim button and the Aim Focus key) ---
+        auto s_KeyBind = [&](const char* p_Id, int& p_Key, int p_Target) {
+            ImGui::PushID(p_Id);
+            if (m_Binding && m_BindTarget == p_Target) {
+                ImGui::Button("Press a key or mouse button... (Esc cancels)", ImVec2(-1, 0));
 
-            bool s_AnyDown = false;
-            for (int vk = 1; vk < 255; ++vk) {
-                if (vk >= VK_SHIFT && vk <= VK_MENU) continue; // generic modifiers; L/R variants are captured instead
-                if (IsKeyDown(vk)) { s_AnyDown = true; break; }
-            }
-
-            if (!m_BindArmed) {
-                m_BindArmed = !s_AnyDown; // wait for the click that started binding to be released
-            } else {
+                bool s_AnyDown = false;
                 for (int vk = 1; vk < 255; ++vk) {
-                    if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
-                    if (!IsKeyDown(vk)) continue;
+                    if (vk >= VK_SHIFT && vk <= VK_MENU) continue; // generic modifiers; L/R variants are captured instead
+                    if (IsKeyDown(vk)) { s_AnyDown = true; break; }
+                }
 
-                    if (vk != VK_ESCAPE) {
-                        m_InstinctKey = vk;
-                        s_Changed = true;
+                if (!m_BindArmed) {
+                    m_BindArmed = !s_AnyDown; // wait for the click that started binding to be released
+                } else {
+                    for (int vk = 1; vk < 255; ++vk) {
+                        if (vk >= VK_SHIFT && vk <= VK_MENU) continue;
+                        if (!IsKeyDown(vk)) continue;
+
+                        if (vk != VK_ESCAPE) {
+                            p_Key = vk;
+                            s_Changed = true;
+                        }
+                        m_Binding = false;
+                        break;
                     }
-                    m_Binding = false;
-                    break;
+                }
+            } else {
+                const std::string s_Text = KeyName(p_Key) + "  (click to change)";
+                if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
+                    m_Binding = true;
+                    m_BindArmed = false;
+                    m_BindTarget = p_Target;
                 }
             }
-        } else {
-            const std::string s_Text = KeyName(m_InstinctKey) + "  (click to change)";
-            if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
-                m_Binding = true;
-                m_BindArmed = false;
-            }
-        }
+            ImGui::PopID();
+        };
+
+        ImGui::TextUnformatted("Instinct key (set this to your in-game Instinct bind)");
+        s_KeyBind("instinct_key", m_InstinctKey, 0);
 
         int s_Mode = m_ToggleMode ? 1 : 0;
         if (ImGui::RadioButton("Hold", &s_Mode, 0)) { m_ToggleMode = false; s_Changed = true; }
@@ -2382,6 +2276,9 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
         if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
+
+        if (ImGui::Checkbox("Instinct slows time", &m_InstinctSlowdown)) s_Changed = true;
+        ImGui::TextDisabled("Off = Instinct no longer slows the game (meter, color and sound still work).");
 
         if (ImGui::InputText("Instinct action name(s)", m_ActionPatterns, sizeof(m_ActionPatterns))) {
             RebuildPatterns();
@@ -2397,6 +2294,8 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::Text("Hook events: keyboard=%u  mouse=%u  last key=0x%02X", g_KbEvents.load(), g_MouseEvents.load(), g_LastVk.load());
             ImGui::Text("Active=%s  Blocked=%s  Locked=%s  NeedRelease=%s", m_Active.load() ? "yes" : "no", m_Blocked ? "yes" : "no",
                         m_Locked ? "yes" : "no", m_NeedRelease ? "yes" : "no");
+            ImGui::Text("Aim Focus active=%s", m_AimFocusActive.load() ? "yes" : "no");
+            ImGui::Text("Weapon polls=%u  weapon type=%d  (aim with a gun: polls should rise)", m_WeaponPolls.load(), m_HeldWeaponType.load());
             ImGui::Text("Meter=%.2f  time scale=%.2f", m_Meter, m_CurrentScale);
             ImGui::Text("Instinct color: state=%d  LUT writes=%u", m_LutState.load(), m_LutWrites.load());
             ImGui::Text("Game-level block: %s   blocked polls=%u", m_InputBlock.load() ? "ON" : "off", m_BlockedPolls.load());
@@ -2509,8 +2408,23 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
         ImGui::Separator();
 
-        // --- Outline colors ---
-        DrawGlowUI(s_Changed);
+        // --- Aim Focus ---
+        if (ImGui::Checkbox("Aim Focus: slow time while aiming with a weapon", &m_AimFocusEnabled)) s_Changed = true;
+        ImGui::BeginDisabled(!m_AimFocusEnabled);
+        if (ImGui::Checkbox("Only with a weapon in hand (not coins, tools, empty hands)", &m_AimWeaponOnly)) s_Changed = true;
+        ImGui::TextUnformatted("Aim button (your in-game aim bind)");
+        s_KeyBind("aim_button", m_AimButton, 1);
+        ImGui::TextUnformatted("Focus key (hold while aiming)");
+        s_KeyBind("aim_focus_key", m_AimFocusKey, 2);
+        if (ImGui::SliderFloat("Aim Focus time scale", &m_AimFocusScale, 0.05f, 0.95f, "%.2fx")) s_Changed = true;
+        if (ImGui::Button("Reset Aim Focus")) {
+            m_AimButton = 0x02;
+            m_AimFocusKey = 0x10;
+            m_AimFocusScale = 0.35f;
+            s_Changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Hold the aim button and the focus key together. It does not use the Instinct meter.");
 
         ImGui::Separator();
 
