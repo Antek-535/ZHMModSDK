@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include <Glacier/ZItem.h>
 #include <Glacier/ZModule.h>
 #include <Glacier/ZScene.h>
+#include <Glacier/SColorRGBA.h>
 
 // Better Instinct: Instinct slows time and drains a meter. When the meter is too low Instinct is
 // blocked entirely, and the looping Instinct sound only plays while Instinct is really usable.
@@ -81,12 +83,6 @@ private:
     void StopSound();
     void UpdateSound(float p_Dt, bool p_InPlay);
 
-    // Debug: lists entities that have glow properties (GlowType / GlowColor1 / GlowColor2). Runs on the game thread.
-    void ScanGlowEntities();
-    std::atomic<bool> m_GlowScanRequest{false};
-    std::mutex m_GlowMutex;
-    std::vector<std::string> m_GlowLines;       // guarded by m_GlowMutex
-
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
 
@@ -96,6 +92,35 @@ private:
     bool ActionMatches(const char* p_Name);
 
     DECLARE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* th, int32_t controllerId);
+
+    // --- Outline colors (NPCs, items...) ---
+    // The glow/outline colors seen during Instinct are SColorRGBA properties (e.g. m_GlowCivilianOutlineColor) on
+    // entities of the scene. We spot those entities when the game activates them, and while Instinct is on we
+    // overwrite the properties with the user's colors (the original values are restored afterwards).
+    struct SGlowEntry {
+        ZEntityRef m_Ref;
+        uint32_t m_Id = 0;
+        std::string m_Name;
+        bool m_HasOrig = false;
+        SColorRGBA m_Orig{0.f, 0.f, 0.f, 1.f};
+        bool m_Applied = false;
+    };
+    struct SGlowSetting {
+        bool m_Enabled = false;
+        bool m_Init = false;               // color was initialised from the game's own value
+        float m_Color[4] = {1.f, 1.f, 1.f, 1.f};
+    };
+    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3);
+    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntitySceneContext_ClearScene, ZEntitySceneContext* th, bool bFullyUnloadScene);
+    void UpdateGlow(bool p_Active);
+    void RestoreGlow();
+    void DrawGlowUI(bool& p_Changed);
+    std::mutex m_GlowMutex;
+    std::vector<SGlowEntry> m_GlowEntries;          // guarded by m_GlowMutex
+    std::map<std::string, SGlowSetting> m_GlowSettings; // guarded by m_GlowMutex (persisted in the config file)
+    std::atomic<bool> m_GlowDirty{true};
+    std::atomic<uint32_t> m_GlowSeen{0};            // entities the activation hook has looked at
+    bool m_GlowEnabled = false;                     // off by default
 
     static bool IsKeyDown(int p_Vk);
     static std::string KeyName(int p_Vk);
@@ -162,7 +187,6 @@ private:
     float m_FillColor[3] = {1.00f, 0.78f, 0.28f}; // gold
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
 
-    bool m_TintRemove = false;       // no Instinct color at all: the grey grading is replaced by an identity LUT (outlines only)
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
     float m_InstinctTint[3] = {0.30f, 0.70f, 1.00f}; // the color that replaces Instinct's grey
     float m_TintStrength = 1.00f;    // 1 = the grey is completely replaced, lower keeps part of the vanilla look
