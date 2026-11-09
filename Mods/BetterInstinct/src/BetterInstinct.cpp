@@ -1283,6 +1283,7 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
     m_GlowSlots.clear();
 
     uint32_t s_Scanned = 0, s_Entities = 0, s_Skipped = 0;
+    std::string s_Detail; // one line per matching property, written to the log
 
     try {
         if (!Globals::EntityManager) {
@@ -1325,20 +1326,27 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 if (!s_Data) continue;
 
                 const SPropertyInfo& s_Info = s_Data->GetPropertyInfo()->m_propertyInfo;
-                if (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) { ++s_Skipped; continue; } // can't be written directly
+                const bool s_ViaSetter = (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) != 0;
 
                 const IType* s_TypeInfo = s_Info.m_Type ? s_Info.m_Type->GetTypeInfo() : nullptr;
                 const uint32_t s_Size = s_TypeInfo ? s_TypeInfo->m_nTypeSize : 0;
-                if (s_Size != 16 && s_Size != 12) { ++s_Skipped; continue; } // not an RGBA / RGB float color
+                s_Detail += "  " + std::string(kGlowCats[s_Prop.Cat].Key) + (s_Prop.Outline ? " outline" : " fill") +
+                            ": size=" + std::to_string(s_Size) + (s_ViaSetter ? " getter/setter" : " direct") + "\n";
+                if (s_Size != 16 && s_Size != 12) { ++s_Skipped; s_Detail += "    -> skipped (not a color type)\n"; continue; }
 
-                uint8_t* s_Ptr = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Data->m_nPropertyOffset);
-                if (!CanWriteMemory(s_Ptr, s_Size)) { ++s_Skipped; continue; }
+                // Properties with a getter/setter have no plain memory behind them: those are only changed through
+                // SetProperty (Ptr stays null).
+                uint8_t* s_Ptr = nullptr;
+                if (!s_ViaSetter) {
+                    s_Ptr = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Data->m_nPropertyOffset);
+                    if (!CanWriteMemory(s_Ptr, s_Size)) { ++s_Skipped; s_Detail += "    -> skipped (memory not writable)\n"; continue; }
 
-                bool s_Dup = false;
-                for (const SGlowSlot& s_Existing : m_GlowSlots) {
-                    if (s_Existing.Ptr == s_Ptr) { s_Dup = true; break; }
+                    bool s_Dup = false;
+                    for (const SGlowSlot& s_Existing : m_GlowSlots) {
+                        if (s_Existing.Ptr == s_Ptr) { s_Dup = true; break; }
+                    }
+                    if (s_Dup) continue;
                 }
-                if (s_Dup) continue;
 
                 SGlowSlot s_Slot;
                 s_Slot.Ptr = s_Ptr;
@@ -1350,20 +1358,28 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
 
                 bool s_FromOld = false;
                 for (const SGlowSlot& s_OldSlot : s_Old) {
-                    if (s_OldSlot.Ptr == s_Ptr) {
+                    if (s_Ptr ? (s_OldSlot.Ptr == s_Ptr)
+                              : (!s_OldSlot.Ptr && s_OldSlot.PropId == s_Prop.Id && s_OldSlot.Ref.GetEntity() == s_Ref.GetEntity())) {
                         std::memcpy(s_Slot.Vanilla, s_OldSlot.Vanilla, sizeof(s_Slot.Vanilla));
                         s_FromOld = true;
                         break;
                     }
                 }
-                if (!s_FromOld) {
+                if (!s_FromOld && !s_Ptr) {
+                    // No readable memory: the game's colors are taken from the built-in table.
+                    const int s_Rgb = s_Prop.Outline ? kGlowCats[s_Prop.Cat].OutlineRgb : kGlowCats[s_Prop.Cat].FillRgb;
+                    s_Slot.Vanilla[0] = ((s_Rgb >> 16) & 0xFF) / 255.0f;
+                    s_Slot.Vanilla[1] = ((s_Rgb >> 8) & 0xFF) / 255.0f;
+                    s_Slot.Vanilla[2] = (s_Rgb & 0xFF) / 255.0f;
+                    s_Slot.Vanilla[3] = s_Prop.Outline ? kGlowDefOutlineAlpha : kGlowDefFillAlpha;
+                } else if (!s_FromOld) {
                     float s_Raw[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     std::memcpy(s_Raw, s_Ptr, s_Size);
                     bool s_Sane = true;
                     for (int k = 0; k < 4; ++k) {
                         if (!std::isfinite(s_Raw[k]) || s_Raw[k] < -0.01f || s_Raw[k] > 16.0f) s_Sane = false;
                     }
-                    if (!s_Sane) { ++s_Skipped; continue; } // doesn't look like a color: leave it alone
+                    if (!s_Sane) { ++s_Skipped; s_Detail += "    -> skipped (value doesn't look like a color)\n"; continue; } // leave it alone
                     std::memcpy(s_Slot.Vanilla, s_Raw, sizeof(s_Slot.Vanilla));
                 }
                 m_GlowSlots.push_back(s_Slot);
@@ -1412,6 +1428,7 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
             for (const SGlowSlot& s_Slot : m_GlowSlots) if (s_Slot.Cat == i) ++s_N;
             s_Log += std::string("  ") + kGlowCats[i].Key + ": " + std::to_string(s_N) + "\n";
         }
+        s_Log += "Matching properties:\n" + s_Detail;
         GlowLog(s_Log);
     }
 }
@@ -1431,8 +1448,10 @@ void BetterInstinct::WriteGlowSlots(bool p_NotifyGame) {
             if (!s_On) s_V[3] = 0.0f; // hidden = fully transparent
         }
 
-        if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
-        std::memcpy(s_Slot.Ptr, s_V, s_Slot.Size); // size 12 (RGB only) just drops the alpha
+        if (s_Slot.Ptr) {
+            if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
+            std::memcpy(s_Slot.Ptr, s_V, s_Slot.Size); // size 12 (RGB only) just drops the alpha
+        }
 
         // Writing the memory alone isn't enough when the game only reads these colors when they change:
         // set the property the normal way too, so the game's change handlers run.
@@ -1454,9 +1473,24 @@ void BetterInstinct::WriteGlowSlots(bool p_NotifyGame) {
 }
 
 void BetterInstinct::RestoreGlowColors() {
-    for (const SGlowSlot& s_Slot : m_GlowSlots) {
-        if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
-        std::memcpy(s_Slot.Ptr, s_Slot.Vanilla, s_Slot.Size);
+    for (SGlowSlot& s_Slot : m_GlowSlots) {
+        if (s_Slot.Ptr) {
+            if (!CanWriteMemory(s_Slot.Ptr, s_Slot.Size)) continue;
+            std::memcpy(s_Slot.Ptr, s_Slot.Vanilla, s_Slot.Size);
+        } else {
+            try { // getter/setter property: put the game's color back through the setter
+                if (s_Slot.Size == 16) {
+                    SColorRGBA s_Color;
+                    s_Color.r = s_Slot.Vanilla[0]; s_Color.g = s_Slot.Vanilla[1]; s_Color.b = s_Slot.Vanilla[2]; s_Color.a = s_Slot.Vanilla[3];
+                    s_Slot.Ref.SetProperty<SColorRGBA>(s_Slot.PropId, s_Color, true);
+                } else {
+                    SColorRGB s_Color;
+                    s_Color.r = s_Slot.Vanilla[0]; s_Color.g = s_Slot.Vanilla[1]; s_Color.b = s_Slot.Vanilla[2];
+                    s_Slot.Ref.SetProperty<SColorRGB>(s_Slot.PropId, s_Color, true);
+                }
+            } catch (...) {
+            }
+        }
     }
 }
 
