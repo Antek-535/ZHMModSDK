@@ -99,6 +99,8 @@ private:
     struct SGlowSlot {
         uint8_t* Ptr = nullptr;       // address of the color inside the game's entity
         uint32_t Size = 16;           // 16 = RGBA floats, 12 = RGB floats
+        ZEntityRef Ref;               // the entity the color belongs to
+        uint32_t PropId = 0;          // property id (so the game's change handlers can be told about the new color)
         int Cat = 0;
         bool Outline = false;
         float Vanilla[4] = {};
@@ -106,7 +108,7 @@ private:
     void InitGlowDefaults();
     void ScanGlowSlots(bool p_KeepSnapshots);
     void UpdateGlowColors(float p_Dt);
-    void WriteGlowSlots();
+    void WriteGlowSlots(bool p_NotifyGame);
     void RestoreGlowColors();
     uint32_t GlowSignature() const;
     SGlowSetting m_Glow[kGlowCatCount];
