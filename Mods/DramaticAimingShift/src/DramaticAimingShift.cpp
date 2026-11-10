@@ -6,6 +6,7 @@
 #include <Functions.h>
 
 #include <Glacier/ZGameLoopManager.h>
+#include <Glacier/ZGameTime.h>
 
 #include <imgui.h>
 
@@ -157,11 +158,10 @@ void DramaticAimingShift::EndEffect() {
 // ---------------------------------------------------------------------------
 // Game-facing shim #1: game time multiplier.
 // The original mod set "m_fLevelSetupMultiplier" on a ZDebugHM5GameTimeMultiplierEnt.
-// Adjust this one function to whatever time-scale accessor your ZHMModSDK version exposes.
 // ---------------------------------------------------------------------------
 void DramaticAimingShift::SetTimeScale(float p_Scale) {
-    // VERIFY AGAINST YOUR SDK HEADERS: name/location of the game-time manager.
-    Globals::GameTimeManager->m_fTimeMultiplier = p_Scale;
+    if (Globals::GameTimeManager)
+        Globals::GameTimeManager->m_fGameTimeMultiplier = p_Scale;
 }
 
 // ---------------------------------------------------------------------------
