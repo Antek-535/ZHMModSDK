@@ -1471,7 +1471,11 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 ZEntityImpl* s_SubEntity = nullptr;
                 auto s_Check = [&]() {
                     s_SubEntity = s_SubRef.GetEntity();
-                    s_IsNestedRoot = s_SubEntity && s_SubEntity != p_Root.GetEntity() && s_SubRef.GetBlueprintFactory() != nullptr;
+                    if (!s_SubEntity || s_SubEntity == p_Root.GetEntity()) return;
+                    // A template root is flagged on its entity type; testing the flag directly avoids QueryInterface,
+                    // which crashes on ordinary entities.
+                    const ZEntityType* s_SubType = s_SubEntity->GetType();
+                    s_IsNestedRoot = s_SubType && (s_SubType->m_nBorrowedPointersMask & 0x200) != 0;
                 };
                 if (!SafeCall(s_Check)) { ++s_Faults; continue; }
                 if (s_IsNestedRoot && s_WalkedRoots.insert(s_SubEntity).second) {
