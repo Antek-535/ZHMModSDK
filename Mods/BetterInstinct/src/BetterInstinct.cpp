@@ -18,6 +18,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <iterator>
@@ -1344,8 +1345,9 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                     std::string s_Name = s_NI->m_pszPropertyName;
                     std::string s_Lower = s_Name;
                     for (char& s_C : s_Lower) s_C = static_cast<char>(std::tolower(static_cast<unsigned char>(s_C)));
-                    if (s_Lower.find("glow") != std::string::npos || s_Lower.find("instinct") != std::string::npos ||
-                        s_Lower.find("civilian") != std::string::npos || s_Lower.find("outlinecolor") != std::string::npos) {
+                    if (s_Lower.find("color") != std::string::npos &&
+                        (s_Lower.find("glow") != std::string::npos || s_Lower.find("outline") != std::string::npos ||
+                         s_Lower.find("instinct") != std::string::npos)) {
                         if (++s_N <= 60) s_Names += s_Name + " ";
                     }
                 }
@@ -1441,7 +1443,11 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
 
         // Source 2: every entity of the loaded scene and its bricks, walked through the blueprint factories
         // (this is where the static Instinct config entity lives).
-        auto s_WalkRoot = [&](const ZEntityRef& p_Root) {
+        // Nested templates (a sub-entity that is itself the root of another template) are walked too, because the
+        // Instinct config entity lives inside one of them, not directly in a top-level brick.
+        std::set<ZEntityImpl*> s_WalkedRoots;
+        uint32_t s_NestedRoots = 0;
+        std::function<void(const ZEntityRef&, int)> s_WalkRoot = [&](const ZEntityRef& p_Root, int p_Depth) {
             ZEntityBlueprintFactoryBase* s_Factory = nullptr;
             int64_t s_Count = 0;
             auto s_GetFactory = [&]() {
@@ -1456,24 +1462,41 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 ZEntityType** s_Sub = nullptr;
                 auto s_GetSub = [&]() { s_Sub = s_Factory->GetSubEntity(p_Root.m_pObj, static_cast<int>(i)); };
                 if (!SafeCall(s_GetSub)) { ++s_Faults; break; } // this brick's factory is not usable (yet)
-                if (s_Sub) s_Guarded(ZEntityRef(s_Sub));
+                if (!s_Sub) continue;
+                const ZEntityRef s_SubRef(s_Sub);
+                s_Guarded(s_SubRef);
+
+                if (p_Depth >= 48) continue;
+                bool s_IsNestedRoot = false;
+                ZEntityImpl* s_SubEntity = nullptr;
+                auto s_Check = [&]() {
+                    s_SubEntity = s_SubRef.GetEntity();
+                    s_IsNestedRoot = s_SubEntity && s_SubEntity != p_Root.GetEntity() && s_SubRef.GetBlueprintFactory() != nullptr;
+                };
+                if (!SafeCall(s_Check)) { ++s_Faults; continue; }
+                if (s_IsNestedRoot && s_WalkedRoots.insert(s_SubEntity).second) {
+                    ++s_NestedRoots;
+                    s_WalkRoot(s_SubRef, p_Depth + 1);
+                }
             }
         };
+
         ZEntitySceneContext* s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
         if (s_Ctx && s_Ctx->m_LoadingStage == ESceneLoadingStage::eLoading_ScenePlaying) {
             uint32_t s_BrickCount = 0;
             auto s_WalkAll = [&]() {
-                s_WalkRoot(s_Ctx->m_pScene.m_entityRef);
+                s_WalkRoot(s_Ctx->m_pScene.m_entityRef, 0);
                 for (const SBrickAllocationInfo& s_Brick : s_Ctx->m_aLoadedBricks) {
                     ++s_BrickCount;
-                    s_WalkRoot(s_Brick.m_EntityRef);
+                    s_WalkRoot(s_Brick.m_EntityRef, 0);
                 }
             };
             if (!SafeCall(s_WalkAll)) ++s_Faults;
-            s_Detail = std::string("Entity types with glow/instinct/civilian/outlinecolor-named properties:\n") + (s_Cand.empty() ? "  (none)\n" : s_Cand) + "\n" + s_Detail;
+            s_Detail = std::string("Entity types with glow/outline/instinct color properties:\n") + (s_Cand.empty() ? "  (none)\n" : s_Cand) + "\n" + s_Detail;
             s_Detail = "Entities from entity manager: " + std::to_string(s_FromManager) +
                        "\nEntities from scene/bricks: " + std::to_string(s_Scanned - s_FromManager) +
                        "\nBricks walked: " + std::to_string(s_BrickCount) +
+                       "\nNested templates walked: " + std::to_string(s_NestedRoots) +
                        "\nAccess faults survived: " + std::to_string(s_Faults) + "\n" + s_Detail;
         } else {
             s_Detail = std::string("Scene not in the playing state yet (stage ") +
