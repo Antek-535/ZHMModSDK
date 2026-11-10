@@ -128,10 +128,13 @@ void DramaticAimingShift::OnFrameUpdate(const SGameUpdateEvent&) {
         m_ActiveTime += s_Dt;
 
         // "Wait for finish aiming animation" (150 ms) -> game time multiplier 0.3
-        if (!m_TimeApplied && m_ActiveTime >= m_SlowMoDelay) {
-            SetTimeScale(m_TimeScale);
+        if (!m_TimeApplied && m_ActiveTime >= m_SlowMoDelay)
             m_TimeApplied = true;
-        }
+
+        // The game can reset the multiplier on its own (e.g. when movement state changes),
+        // so keep re-applying it every frame while active.
+        if (m_TimeApplied)
+            SetTimeScale(m_TimeScale);
     }
 
     // Grey overlay: starts after 65 ms, blends in/out over 0.2 s.
@@ -263,6 +266,12 @@ void DramaticAimingShift::OnDrawMenu() {
         ImGui::SliderFloat("Time scale", &m_TimeScale, 0.05f, 1.f);
         ImGui::SliderFloat("Overlay strength", &m_OverlayAlphaMax, 0.f, 1.f);
         ImGui::SliderFloat("Music volume", &m_MusicVolume, 0.f, 1.f);
+        ImGui::Separator();
+        ImGui::Text("aimPin=%d  exitIgnored=%d  shift=%d  rmb=%d",
+                    (int)m_AimPin.load(), (int)m_ExitIgnored.load(), (int)IsShiftHeld(),
+                    (int)((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0));
+        ImGui::Text("active=%d  timeApplied=%d  gameScale=%.2f", (int)m_Active, (int)m_TimeApplied,
+                    Globals::GameTimeManager ? Globals::GameTimeManager->m_fGameTimeMultiplier : -1.f);
         ImGui::EndMenu();
     }
 }
