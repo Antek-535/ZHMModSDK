@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cstdint>
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <Windows.h>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
@@ -58,7 +60,7 @@ DramaticAimingShift::DramaticAimingShift() {
 DramaticAimingShift::~DramaticAimingShift() {
     EndEffect();
     Mci(L"close DAMusic");
-    Hooks::SignalOutputPin->RemoveDetour(this, &DramaticAimingShift::OnPinOutput);
+    Hooks::SignalOutputPin->RemoveDetoursWithContext(this);
 
     const ZMemberDelegate<DramaticAimingShift, void(const SGameUpdateEvent&)> s_Delegate(this, &DramaticAimingShift::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
