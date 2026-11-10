@@ -44,6 +44,7 @@ set(MODS
         NoPause
         FocusForAll
         BetterInstinct
+        DramaticAimingShift
 )
 foreach (MOD IN LISTS MODS)
     add_subdirectory("Mods/${MOD}")
