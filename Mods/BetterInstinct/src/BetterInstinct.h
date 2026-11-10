@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -136,6 +137,15 @@ private:
     bool ActionMatches(const char* p_Name);
 
     DECLARE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* th, int32_t controllerId);
+
+    // Entity activation hook: every entity the game activates passes through here, so the Instinct glow config
+    // entity (wherever it is nested in the scene) is caught the moment it is activated.
+    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3);
+    void CatchGlowEntity(const ZEntityRef* p_Ref);
+    std::mutex m_CatchMutex;
+    std::vector<ZEntityRef> m_GlowCaught;           // entities that have the glow color properties
+    std::map<ZEntityType*, bool> m_CatchTypeCache;  // entity type -> has glow color properties
+    std::vector<uint32_t> m_CatchAnchors;           // property ids that identify the glow config entity
 
     static bool IsKeyDown(int p_Vk);
     static std::string KeyName(int p_Vk);
