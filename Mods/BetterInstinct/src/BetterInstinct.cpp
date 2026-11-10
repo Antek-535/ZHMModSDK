@@ -91,6 +91,26 @@ static constexpr float kGlowDefOutlineAlpha = 127.0f / 255.0f;
 
 namespace {
 
+// Runs a callable and survives access violations (entities that are half-constructed while a mission loads).
+// Kept free of C++ objects with destructors, which is what __try requires.
+bool SehInvoke(void (*p_Fn)(void*), void* p_Ctx) {
+    __try {
+        p_Fn(p_Ctx);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <class F>
+bool SafeCall(F& p_Callable) {
+    return SehInvoke([](void* p_C) { (*static_cast<F*>(p_C))(); }, &p_Callable);
+}
+
+} // namespace
+
+namespace {
+
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
@@ -1291,22 +1311,6 @@ bool CanWriteMemory(const void* p_Ptr, size_t p_Size) {
 
 inline void HashMix(uint32_t& p_H, uint32_t p_V) {
     p_H ^= p_V + 0x9E3779B9u + (p_H << 6) + (p_H >> 2);
-}
-
-// Runs a callable and survives access violations (entities that are half-constructed while a mission loads).
-// Kept free of C++ objects with destructors, which is what __try requires.
-bool SehInvoke(void (*p_Fn)(void*), void* p_Ctx) {
-    __try {
-        p_Fn(p_Ctx);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-template <class F>
-bool SafeCall(F& p_Callable) {
-    return SehInvoke([](void* p_C) { (*static_cast<F*>(p_C))(); }, &p_Callable);
 }
 
 inline uint32_t FloatBits(float p_F) {
