@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <string>
 
@@ -56,7 +57,8 @@ private:
     bool  m_PlayMusic       = true;
 
     // ---- runtime state ----
-    bool  m_AimPin       = false;  // between EnterAimAt and ExitAimAt
+    std::atomic<bool> m_AimPin{false};      // between EnterAimAt and ExitAimAt
+    std::atomic<bool> m_ExitIgnored{false}; // an ExitAimAt caused by Shift was ignored
     bool  m_Active       = false;  // effect currently running
     bool  m_TimeApplied  = false;
     float m_ActiveTime   = 0.f;
