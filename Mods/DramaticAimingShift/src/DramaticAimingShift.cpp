@@ -81,10 +81,19 @@ void DramaticAimingShift::OnEngineInitialized() {
 // Aim detection: same signal the original mod used.
 // ---------------------------------------------------------------------------
 DEFINE_PLUGIN_DETOUR(DramaticAimingShift, bool, OnPinOutput, ZEntityRef p_Entity, uint32_t p_PinId, const ZObjectRef& p_Data) {
-    if (p_PinId == m_PinEnterAim)
+    if (p_PinId == m_PinEnterAim) {
         m_AimPin = true;
-    else if (p_PinId == m_PinExitAim)
-        m_AimPin = false;
+        m_ExitIgnored = false;
+    } else if (p_PinId == m_PinExitAim) {
+        // Pressing Shift (a movement key) while aiming makes the game drop its aim state.
+        // If Shift and right-click are both held, treat that as still aiming.
+        if (m_RequireShift && IsShiftHeld() && (GetAsyncKeyState(VK_RBUTTON) & 0x8000)) {
+            m_ExitIgnored = true;
+        } else {
+            m_AimPin = false;
+            m_ExitIgnored = false;
+        }
+    }
 
     return HookResult<bool>(HookAction::Continue());
 }
@@ -101,6 +110,12 @@ void DramaticAimingShift::OnFrameUpdate(const SGameUpdateEvent&) {
     const auto s_Now = std::chrono::steady_clock::now();
     const float s_Dt = std::min(0.1f, std::chrono::duration<float>(s_Now - m_LastTick).count());
     m_LastTick = s_Now;
+
+    // Safety: if we ignored an exit, end the aim once right-click is let go.
+    if (m_ExitIgnored && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) {
+        m_AimPin = false;
+        m_ExitIgnored = false;
+    }
 
     const bool s_Want = m_Enabled && m_AimPin && (!m_RequireShift || IsShiftHeld());
 
