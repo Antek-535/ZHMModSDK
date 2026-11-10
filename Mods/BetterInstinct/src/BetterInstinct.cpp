@@ -1324,6 +1324,7 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
 
         std::set<ZEntityImpl*> s_Visited;
         uint32_t s_Candidates = 0;
+        std::set<ZEntityType*> s_SeenTypes;
         std::string s_Cand;
         auto s_Process = [&](const ZEntityRef& s_Ref) {
             ++s_Scanned;
@@ -1333,30 +1334,32 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
             ZEntityType* s_Type = s_Entity->GetType();
             if (!s_Type || !s_Type->m_pPropertyData) return;
 
+            // Diagnostics, once per entity type: which types have properties named like Instinct colors?
+            if (s_SeenTypes.insert(s_Type).second && s_Candidates < 40) {
+                std::string s_Names;
+                uint32_t s_N = 0;
+                for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+                    const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                    if (!s_NI || !s_NI->m_pszPropertyName) continue;
+                    std::string s_Name = s_NI->m_pszPropertyName;
+                    std::string s_Lower = s_Name;
+                    for (char& s_C : s_Lower) s_C = static_cast<char>(std::tolower(static_cast<unsigned char>(s_C)));
+                    if (s_Lower.find("glow") != std::string::npos || s_Lower.find("instinct") != std::string::npos ||
+                        s_Lower.find("civilian") != std::string::npos || s_Lower.find("outlinecolor") != std::string::npos) {
+                        if (++s_N <= 60) s_Names += s_Name + " ";
+                    }
+                }
+                if (s_N > 0) {
+                    ++s_Candidates;
+                    s_Cand += "  type with " + std::to_string(s_N) + " matching properties: " + s_Names + "\n";
+                }
+            }
+
             bool s_IsConfig = false;
             for (const uint32_t s_Id : s_Anchors) {
                 if (s_Type->FindProperty(s_Id)) { s_IsConfig = true; break; }
             }
             if (!s_IsConfig) {
-                // Diagnostics: any entity with a property whose name contains "glow" (names may differ from our table).
-                if (s_Candidates < 15) {
-                    std::string s_Names;
-                    uint32_t s_N = 0;
-                    for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
-                        const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
-                        if (!s_NI || !s_NI->m_pszPropertyName) continue;
-                        std::string s_Name = s_NI->m_pszPropertyName;
-                        std::string s_Lower = s_Name;
-                        for (char& s_C : s_Lower) s_C = static_cast<char>(std::tolower(static_cast<unsigned char>(s_C)));
-                        if (s_Lower.find("glow") != std::string::npos) {
-                            if (++s_N <= 40) s_Names += s_Name + " ";
-                        }
-                    }
-                    if (s_N > 0) {
-                        ++s_Candidates;
-                        s_Cand += "  entity with " + std::to_string(s_N) + " glow-named properties: " + s_Names + "\n";
-                    }
-                }
                 return;
             }
             ++s_Entities;
@@ -1467,6 +1470,7 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 }
             };
             if (!SafeCall(s_WalkAll)) ++s_Faults;
+            s_Detail = std::string("Entity types with glow/instinct/civilian/outlinecolor-named properties:\n") + (s_Cand.empty() ? "  (none)\n" : s_Cand) + "\n" + s_Detail;
             s_Detail = "Entities from entity manager: " + std::to_string(s_FromManager) +
                        "\nEntities from scene/bricks: " + std::to_string(s_Scanned - s_FromManager) +
                        "\nBricks walked: " + std::to_string(s_BrickCount) +
