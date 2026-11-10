@@ -1326,6 +1326,9 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
         std::set<ZEntityImpl*> s_Visited;
         uint32_t s_Candidates = 0;
         std::set<ZEntityType*> s_SeenTypes;
+        std::map<ZEntityType*, std::pair<int64_t, uint32_t>> s_InstinctTypes; // type -> (offset, size) of m_pInstinctControl
+        std::vector<ZEntityRef> s_Pending;                                    // entities that m_pInstinctControl points at
+        std::string s_LinkInfo;
         std::string s_Cand;
         auto s_Process = [&](const ZEntityRef& s_Ref) {
             ++s_Scanned;
@@ -1345,6 +1348,10 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                     std::string s_Name = s_NI->m_pszPropertyName;
                     std::string s_Lower = s_Name;
                     for (char& s_C : s_Lower) s_C = static_cast<char>(std::tolower(static_cast<unsigned char>(s_C)));
+                    if (s_Name == "m_pInstinctControl") {
+                        const IType* s_LinkType = s_NI->m_propertyInfo.m_Type ? s_NI->m_propertyInfo.m_Type->GetTypeInfo() : nullptr;
+                        s_InstinctTypes[s_Type] = {s_P.m_nPropertyOffset, s_LinkType ? s_LinkType->m_nTypeSize : 0};
+                    }
                     if (s_Lower.find("color") != std::string::npos &&
                         (s_Lower.find("glow") != std::string::npos || s_Lower.find("outline") != std::string::npos ||
                          s_Lower.find("instinct") != std::string::npos)) {
@@ -1354,6 +1361,15 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 if (s_N > 0) {
                     ++s_Candidates;
                     s_Cand += "  type with " + std::to_string(s_N) + " matching properties: " + s_Names + "\n";
+                }
+            }
+
+            {
+                const auto s_Link = s_InstinctTypes.find(s_Type);
+                if (s_Link != s_InstinctTypes.end() && (s_Link->second.second == 16 || s_Link->second.second == 8)) {
+                    ZEntityType** s_Target = *reinterpret_cast<ZEntityType***>(
+                        reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Link->second.first);
+                    if (s_Target) s_Pending.push_back(ZEntityRef(s_Target));
                 }
             }
 
@@ -1484,6 +1500,37 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 }
             }
         };
+
+        // Follow the Instinct control references found above (the glow colors live on, or next to, what they point at).
+        {
+            std::set<ZEntityType**> s_Done;
+            uint32_t s_Followed = 0;
+            for (const ZEntityRef& s_Target : s_Pending) {
+                if (!s_Done.insert(s_Target.m_pObj).second) continue;
+                ++s_Followed;
+                s_Guarded(s_Target);
+                if (s_Followed <= 3) {
+                    std::string s_Names;
+                    auto s_ListProps = [&]() {
+                        ZEntityImpl* s_E = s_Target.GetEntity();
+                        ZEntityType* s_T = s_E ? s_E->GetType() : nullptr;
+                        if (!s_T || !s_T->m_pPropertyData) return;
+                        uint32_t s_N = 0;
+                        for (const SPropertyData& s_P : *s_T->m_pPropertyData) {
+                            const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                            if (s_NI && s_NI->m_pszPropertyName && ++s_N <= 120) s_Names += std::string(s_NI->m_pszPropertyName) + " ";
+                        }
+                    };
+                    if (!SafeCall(s_ListProps)) s_Names += "(unreadable)";
+                    s_LinkInfo += "  target " + std::to_string(s_Followed) + " properties: " + s_Names + "\n";
+                }
+            }
+            std::string s_Types;
+            for (const auto& s_It : s_InstinctTypes) s_Types += "size " + std::to_string(s_It.second.second) + " ";
+            s_Detail = "m_pInstinctControl: found on " + std::to_string(s_InstinctTypes.size()) + " entity type(s) (" + s_Types +
+                       "), referenced " + std::to_string(s_Pending.size()) + " time(s), " + std::to_string(s_Followed) +
+                       " distinct target(s)\n" + s_LinkInfo + s_Detail;
+        }
 
         ZEntitySceneContext* s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
         if (s_Ctx && s_Ctx->m_LoadingStage == ESceneLoadingStage::eLoading_ScenePlaying) {
