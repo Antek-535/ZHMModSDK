@@ -554,6 +554,8 @@ BetterInstinct::~BetterInstinct() {
 void BetterInstinct::Init() {
     // Lets us answer "not pressed" to the game when it asks about the Instinct action.
     Hooks::ZInputAction_Digital->AddDetour(this, &BetterInstinct::ZInputAction_Digital);
+    // Catches the Instinct glow config entity when the game activates it.
+    Hooks::ZEntityManager_ActivateEntity->AddDetour(this, &BetterInstinct::ZEntityManager_ActivateEntity);
 }
 
 void BetterInstinct::OnEngineInitialized() {
@@ -631,6 +633,70 @@ bool BetterInstinct::ActionMatches(const char* p_Name) {
         if (ContainsNoCase(p_Name, s_Pattern)) return true;
     }
     return false;
+}
+
+// Called for every entity the game activates. Cheap: the answer is cached per entity type.
+DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3) {
+    CatchGlowEntity(entity);
+    return HookResult<void>(HookAction::Continue());
+}
+
+void BetterInstinct::CatchGlowEntity(const ZEntityRef* p_Ref) {
+    if (!p_Ref) return;
+
+    // Anything that can fault (reading the entity) runs outside the lock: after an access violation the lock's
+    // destructor would not run and the mutex would stay locked forever.
+    ZEntityImpl* s_Entity = nullptr;
+    ZEntityType* s_Type = nullptr;
+    auto s_ReadType = [&]() {
+        s_Entity = p_Ref->GetEntity();
+        s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+        if (s_Type && !s_Type->m_pPropertyData) s_Type = nullptr;
+    };
+    if (!SafeCall(s_ReadType) || !s_Type) return;
+
+    std::vector<uint32_t> s_Anchors;
+    int s_Known = -1; // -1 = type not seen yet, 0 = no, 1 = yes
+    {
+        std::lock_guard<std::mutex> s_Lock(m_CatchMutex);
+        if (m_CatchAnchors.empty()) {
+            for (int i = 0; i < kGlowCatCount; ++i) {
+                for (const char* s_Stem : kGlowCats[i].Names) {
+                    if (!s_Stem) continue;
+                    if (i == 0 || i == 3 || i == 4 || i == 10) {
+                        m_CatchAnchors.push_back(Hash::Crc32((std::string(s_Stem) + "Color").c_str()));
+                    }
+                }
+            }
+        }
+        const auto s_Cached = m_CatchTypeCache.find(s_Type);
+        if (s_Cached != m_CatchTypeCache.end()) s_Known = s_Cached->second ? 1 : 0;
+        else s_Anchors = m_CatchAnchors;
+    }
+
+    if (s_Known < 0) {
+        bool s_Has = false;
+        auto s_Check = [&]() {
+            for (const uint32_t s_Id : s_Anchors) {
+                if (s_Type->FindProperty(s_Id)) { s_Has = true; break; }
+            }
+        };
+        SafeCall(s_Check);
+        s_Known = s_Has ? 1 : 0;
+        std::lock_guard<std::mutex> s_Lock(m_CatchMutex);
+        m_CatchTypeCache[s_Type] = s_Has;
+    }
+    if (s_Known != 1) return;
+
+    {
+        std::lock_guard<std::mutex> s_Lock(m_CatchMutex);
+        for (const ZEntityRef& s_Old : m_GlowCaught) {
+            if (s_Old.m_pObj == p_Ref->m_pObj) return;
+        }
+        if (m_GlowCaught.size() >= 16) m_GlowCaught.erase(m_GlowCaught.begin()); // only the newest few matter
+        m_GlowCaught.push_back(*p_Ref);
+    }
+    m_GlowRescanRequest.store(true);
 }
 
 // The game polls this for every input action, many times per frame, possibly from several threads.
@@ -1453,8 +1519,21 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
             if (!SafeCall(s_Run)) ++s_Faults;
         };
 
-        // Source 1: the entity manager's list (only part of the scene).
-        for (const auto& s_Pair : Globals::EntityManager->m_Entities) s_Guarded(s_Pair.second);
+        // Source 0: entities caught by the activation hook (this is where the config entity normally comes from).
+        uint32_t s_FromCaught = 0;
+        {
+            std::vector<ZEntityRef> s_Caught;
+            {
+                std::lock_guard<std::mutex> s_Lock(m_CatchMutex);
+                s_Caught = m_GlowCaught;
+            }
+            for (const ZEntityRef& s_C : s_Caught) { s_Guarded(s_C); ++s_FromCaught; }
+        }
+        s_Detail += "Entities caught at activation: " + std::to_string(s_FromCaught) + "\n";
+
+        // Source 1: the entity manager's list (only part of the scene). Skipped when the hook already found the config.
+        if (s_Entities == 0)
+            for (const auto& s_Pair : Globals::EntityManager->m_Entities) s_Guarded(s_Pair.second);
         const uint32_t s_FromManager = s_Scanned;
 
         // Source 2: every entity of the loaded scene and its bricks, walked through the blueprint factories
@@ -1533,7 +1612,9 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
         }
 
         ZEntitySceneContext* s_Ctx = Globals::Hitman5Module ? Globals::Hitman5Module->m_pEntitySceneContext : nullptr;
-        if (s_Ctx && s_Ctx->m_LoadingStage == ESceneLoadingStage::eLoading_ScenePlaying) {
+        if (s_Entities > 0) {
+            s_Detail = "Config entity found through the activation hook; scene walk skipped.\n" + s_Detail;
+        } else if (s_Ctx && s_Ctx->m_LoadingStage == ESceneLoadingStage::eLoading_ScenePlaying) {
             uint32_t s_BrickCount = 0;
             auto s_WalkAll = [&]() {
                 s_WalkRoot(s_Ctx->m_pScene.m_entityRef, 0);
