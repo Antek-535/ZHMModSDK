@@ -77,6 +77,7 @@ private:
 
     bool  m_UseInstinct     = true;   // overlay is only drawn by the game while its Instinct state is on
     int   m_InstinctKeyIdx  = 0;
+    bool  m_InstinctToggle  = false;  // Instinct is set to Toggle (not Hold) in the game settings
 
     bool  m_TintEnabled     = true;
     float m_InstinctTint[3] = {1.0f, 1.0f, 1.0f}; // white = pure grey
@@ -95,6 +96,10 @@ private:
     bool  m_TimeApplied  = false;
     float m_ActiveTime   = 0.f;
     bool  m_InstinctHeld = false; // we are holding the injected Instinct key
+    bool  m_InstinctToggledOn = false; // toggle mode: we switched Instinct on and must switch it off
+    bool  m_TapPending = false;        // a key tap is waiting for its key-up
+    int   m_TapVk = 0;
+    std::chrono::steady_clock::time_point m_TapReleaseAt{};
 
     uint32_t m_PinEnterAim = 0;
     uint32_t m_PinExitAim  = 0;
