@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -142,6 +143,12 @@ private:
     // entity (wherever it is nested in the scene) is caught the moment it is activated.
     DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3);
     void CatchGlowEntity(const ZEntityRef* p_Ref);
+    // Writes the chosen colors straight into the glow config entity while the game is activating it, i.e. BEFORE the
+    // game reads them (the same moment a data patch would change them).
+    void ApplyGlowOnActivate(const ZEntityRef* p_Ref);
+    std::mutex m_PreMutex;
+    std::map<uintptr_t, std::array<float, 4>> m_PreVanilla; // color address -> the game's own value, remembered before we write
+    std::atomic<uint32_t> m_GlowPreApplied{0};              // how many color values were written at activation (shown in the UI)
     std::mutex m_CatchMutex;
     std::vector<ZEntityRef> m_GlowCaught;           // entities that have the glow color properties
     std::map<ZEntityType*, bool> m_CatchTypeCache;  // entity type -> has glow color properties
