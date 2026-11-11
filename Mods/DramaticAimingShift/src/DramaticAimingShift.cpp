@@ -783,6 +783,7 @@ DramaticAimingShift::DramaticAimingShift() {
 
 DramaticAimingShift::~DramaticAimingShift() {
     EndEffect();
+    if (m_TapPending) { SendKey(m_TapVk, true); m_TapPending = false; }
     RestoreTint();
     CloseSound();
     Hooks::SignalOutputPin->RemoveDetoursWithContext(this);
@@ -820,6 +821,7 @@ void DramaticAimingShift::LoadSettings() {
     m_SoundVolume = std::clamp(static_cast<float>(GetSettingDouble(kSection, "sound_volume", m_SoundVolume)), 0.0f, 1.0f);
     m_UseInstinct = GetSettingBool(kSection, "use_instinct_state", m_UseInstinct);
     m_InstinctKeyIdx = std::clamp(static_cast<int>(GetSettingInt(kSection, "instinct_key_index", m_InstinctKeyIdx)), 0, kKeyCount - 1);
+    m_InstinctToggle = GetSettingBool(kSection, "instinct_toggle", m_InstinctToggle);
     m_TintEnabled = GetSettingBool(kSection, "tint_enabled", m_TintEnabled);
     m_InstinctTint[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_r", m_InstinctTint[0])), 0.0f, 1.0f);
     m_InstinctTint[1] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "tint_g", m_InstinctTint[1])), 0.0f, 1.0f);
@@ -838,6 +840,7 @@ void DramaticAimingShift::SaveSettings() {
     SetSettingDouble(kSection, "sound_volume", m_SoundVolume);
     SetSettingBool(kSection, "use_instinct_state", m_UseInstinct);
     SetSettingInt(kSection, "instinct_key_index", m_InstinctKeyIdx);
+    SetSettingBool(kSection, "instinct_toggle", m_InstinctToggle);
     SetSettingBool(kSection, "tint_enabled", m_TintEnabled);
     SetSettingDouble(kSection, "tint_r", m_InstinctTint[0]);
     SetSettingDouble(kSection, "tint_g", m_InstinctTint[1]);
@@ -950,6 +953,11 @@ void DramaticAimingShift::OnFrameUpdate(const SGameUpdateEvent&) {
             SetTimeScale(m_TimeScale);
     }
 
+    if (m_TapPending && s_Now >= m_TapReleaseAt) {
+        SendKey(m_TapVk, true);
+        m_TapPending = false;
+    }
+
     UpdateSound(s_Dt);
     UpdateTint(s_Dt, m_Active);
 }
@@ -967,7 +975,15 @@ void DramaticAimingShift::BeginEffect() {
         const int s_Vk = kKeys[m_InstinctKeyIdx].Vk;
         if (!(GetAsyncKeyState(s_Vk) & 0x8000)) {
             SendKey(s_Vk, false);
-            m_InstinctHeld = true;
+            if (m_InstinctToggle) {
+                // Toggle mode: a short tap switches Instinct on; we tap again when the effect ends.
+                m_TapPending = true;
+                m_TapVk = s_Vk;
+                m_TapReleaseAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+                m_InstinctToggledOn = true;
+            } else {
+                m_InstinctHeld = true;
+            }
         }
     }
 }
@@ -988,6 +1004,15 @@ void DramaticAimingShift::EndEffect() {
     if (m_InstinctHeld) {
         SendKey(kKeys[m_InstinctKeyIdx].Vk, true);
         m_InstinctHeld = false;
+    }
+    if (m_InstinctToggledOn) {
+        const int s_Vk = kKeys[m_InstinctKeyIdx].Vk;
+        if (m_TapPending) SendKey(m_TapVk, true); // finish the first tap before starting the second
+        SendKey(s_Vk, false);
+        m_TapPending = true;
+        m_TapVk = s_Vk;
+        m_TapReleaseAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+        m_InstinctToggledOn = false;
     }
 }
 
@@ -1134,6 +1159,7 @@ void DramaticAimingShift::OnDrawMenu() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("The game only draws its colour-grading overlay while Instinct is on.\nThis presses your Instinct key while the effect is active.");
     if (m_UseInstinct) {
+        s_Changed |= ImGui::Checkbox("My Instinct is set to Toggle (not Hold) in the game settings", &m_InstinctToggle);
         if (ImGui::BeginCombo("Instinct key", kKeys[m_InstinctKeyIdx].Name)) {
             for (int i = 0; i < kKeyCount; ++i)
                 if (ImGui::Selectable(kKeys[i].Name, i == m_InstinctKeyIdx)) { m_InstinctKeyIdx = i; s_Changed = true; }
