@@ -658,6 +658,7 @@ bool BetterInstinct::ActionMatches(const char* p_Name) {
 // Called for every entity the game activates. Cheap: the answer is cached per entity type.
 DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZEntityManager_ActivateEntity, ZEntityManager* th, ZEntityRef* entity, void* a3) {
     CatchGlowEntity(entity);
+    ApplyGlowOnActivate(entity); // runs before the game's own activation code reads the colors
     return HookResult<void>(HookAction::Continue());
 }
 
@@ -1363,6 +1364,87 @@ uint32_t BetterInstinct::GlowSignature() const {
     return s_H;
 }
 
+// Called from the activation hook for every entity, before the game activates it. For the Instinct glow config entity
+// this writes the player's colors into the entity's memory, so the game picks them up the same way it would pick up a
+// data patch (a patch changes the values before they are read; changing them later does not always reach the renderer).
+void BetterInstinct::ApplyGlowOnActivate(const ZEntityRef* p_Ref) {
+    if (!p_Ref) return;
+
+    ZEntityImpl* s_Entity = nullptr;
+    ZEntityType* s_Type = nullptr;
+    auto s_ReadType = [&]() {
+        s_Entity = p_Ref->GetEntity();
+        s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+        if (s_Type && !s_Type->m_pPropertyData) s_Type = nullptr;
+    };
+    if (!SafeCall(s_ReadType) || !s_Type) return;
+
+    {
+        std::lock_guard<std::mutex> s_Lock(m_CatchMutex);
+        const auto s_Cached = m_CatchTypeCache.find(s_Type);
+        if (s_Cached == m_CatchTypeCache.end() || !s_Cached->second) return; // not the glow config entity
+    }
+
+    uint32_t s_Written = 0;
+    auto s_Apply = [&]() {
+        for (int i = 0; i < kGlowCatCount; ++i) {
+            const SGlowSetting& s_G = m_Glow[i];
+            for (const char* s_Stem : kGlowCats[i].Names) {
+                if (!s_Stem) continue;
+                for (int s_Out = 0; s_Out < 2; ++s_Out) {
+                    const std::string s_Name = std::string(s_Stem) + (s_Out ? "OutlineColor" : "Color");
+                    SPropertyData* s_Data = s_Type->FindProperty(Hash::Crc32(s_Name.c_str()));
+                    if (!s_Data) continue;
+
+                    const SPropertyInfo& s_Info = s_Data->GetPropertyInfo()->m_propertyInfo;
+                    if (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue; // no plain memory behind it
+                    const IType* s_TypeInfo = s_Info.m_Type ? s_Info.m_Type->GetTypeInfo() : nullptr;
+                    const uint32_t s_Size = s_TypeInfo ? s_TypeInfo->m_nTypeSize : 0;
+                    if (s_Size != 16 && s_Size != 12) continue;
+
+                    uint8_t* s_Ptr = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(p_Ref->m_pObj) + s_Data->m_nPropertyOffset);
+                    if (!CanWriteMemory(s_Ptr, s_Size)) continue;
+
+                    // Remember the game's own value the first time we see this address; later passes must not mistake our
+                    // colors for the game's.
+                    std::array<float, 4> s_Van = {0.0f, 0.0f, 0.0f, 1.0f};
+                    {
+                        std::lock_guard<std::mutex> s_Lock(m_PreMutex);
+                        const auto s_Known = m_PreVanilla.find(reinterpret_cast<uintptr_t>(s_Ptr));
+                        if (s_Known != m_PreVanilla.end()) {
+                            s_Van = s_Known->second;
+                        } else {
+                            float s_Raw[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                            std::memcpy(s_Raw, s_Ptr, s_Size);
+                            bool s_Sane = true;
+                            for (int k = 0; k < 4; ++k) {
+                                if (!std::isfinite(s_Raw[k]) || s_Raw[k] < -0.01f || s_Raw[k] > 16.0f) s_Sane = false;
+                            }
+                            if (!s_Sane) continue; // does not look like a color: leave it alone
+                            for (int k = 0; k < 4; ++k) s_Van[k] = s_Raw[k];
+                            m_PreVanilla[reinterpret_cast<uintptr_t>(s_Ptr)] = s_Van;
+                        }
+                    }
+
+                    float s_V[4];
+                    if (s_G.Mode == 0) {
+                        for (int k = 0; k < 4; ++k) s_V[k] = s_Van[k];
+                    } else {
+                        const float* s_Src = s_Out ? s_G.Outline : s_G.Fill;
+                        const bool s_On = s_Out ? s_G.OutlineOn : s_G.FillOn;
+                        std::memcpy(s_V, s_Src, sizeof(s_V));
+                        if (!s_On) s_V[3] = 0.0f;
+                    }
+                    std::memcpy(s_Ptr, s_V, s_Size);
+                    ++s_Written;
+                }
+            }
+        }
+    };
+    SafeCall(s_Apply);
+    if (s_Written > 0) m_GlowPreApplied.fetch_add(s_Written);
+}
+
 // Finds every glow color in the game's entities. Runs on the game thread (it reads the entity manager).
 void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
     std::vector<SGlowSlot> s_Old;
@@ -1506,6 +1588,11 @@ void BetterInstinct::ScanGlowSlots(bool p_KeepSnapshots) {
                 } else if (!s_FromOld) {
                     float s_Raw[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     std::memcpy(s_Raw, s_Ptr, s_Size);
+                    {   // the game's own value remembered at activation (memory may already hold our colors)
+                        std::lock_guard<std::mutex> s_PreLock(m_PreMutex);
+                        const auto s_PreIt = m_PreVanilla.find(reinterpret_cast<uintptr_t>(s_Ptr));
+                        if (s_PreIt != m_PreVanilla.end()) for (int k = 0; k < 4; ++k) s_Raw[k] = s_PreIt->second[k];
+                    }
                     bool s_Sane = true;
                     for (int k = 0; k < 4; ++k) {
                         if (!std::isfinite(s_Raw[k]) || s_Raw[k] < -0.01f || s_Raw[k] > 16.0f) s_Sane = false;
@@ -3063,6 +3150,13 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 s_Changed = true;
             }
             ImGui::TextDisabled("Pick \"Custom\" for a group, then choose the silhouette (fill) and outline colors. Applies in missions.");
+            ImGui::TextDisabled("The colors are written while a mission loads. If you change them mid-mission and nothing changes, reload the mission.");
+            {
+                const int s_GlowSt = m_GlowState.load();
+                ImGui::TextDisabled("Status: %s | written at load: %u | colors found now: %u",
+                                    s_GlowSt == 2 ? "colors found" : (s_GlowSt == 1 ? "config not found yet" : "waiting for a mission"),
+                                    m_GlowPreApplied.load(), m_GlowFound.load());
+            }
             ImGui::TextDisabled("Unticking Silhouette / Outline hides that part. Alpha = how strong it is.");
 
             for (int i = 0; i < kGlowCatCount; ++i) {
