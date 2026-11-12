@@ -1744,21 +1744,42 @@ void BetterInstinct::ScanCameraFov() {
     auto s_Walk = [&]() {
         auto s_Local = SDK()->GetLocalPlayer();
         if (!s_Local.m_pInterfaceRef) { s_Info = "no player"; return; }
-        // Direct access to the camera entity's own FOV member (the reflection scan below does not see it).
+        // The reflected property names are often not available at runtime, so look the FOV up by name hash instead
+        // (ZCameraEntity itself only has virtual getters, no data members in the SDK header).
         {
             ZEntityRef s_CamRef = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
             ZCameraEntity* s_Cam = s_CamRef ? s_CamRef.QueryInterface<ZCameraEntity>() : nullptr;
             if (s_Cam) {
+                float s_Getter = 0.0f;
+                auto s_ReadGetter = [&]() { s_Getter = s_Cam->GetFovYDeg(); };
+                if (SafeCall(s_ReadGetter)) s_Info += "GetFovYDeg()=" + std::to_string(s_Getter) + " ";
+            }
+            static const char* s_Names[] = {"m_fFovYDeg", "m_fFOV", "m_fFov"};
+            for (const char* s_Name : s_Names) {
                 SCamFov s_F;
-                s_F.Ptr = &s_Cam->m_fFovYDeg;
                 s_F.Ref = s_CamRef;
-                s_F.Name = "camera.m_fFovYDeg";
+                s_F.PropId = Hash::Crc32(s_Name);
+                s_F.Name = std::string("camera.") + s_Name;
+                bool s_Has = false;
+                auto s_Find = [&]() {
+                    ZEntityImpl* s_Entity = s_CamRef.GetEntity();
+                    ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+                    if (!s_Type || !s_Type->m_pPropertyData) return;
+                    SPropertyData* s_Data = s_Type->FindProperty(s_F.PropId);
+                    if (!s_Data) return;
+                    s_Has = true;
+                    if (!(s_Data->GetPropertyInfo()->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER)) {
+                        float* s_Ptr = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(s_CamRef.m_pObj) + s_Data->m_nPropertyOffset);
+                        if (CanWriteMemory(s_Ptr, sizeof(float))) s_F.Ptr = s_Ptr;
+                    }
+                };
+                SafeCall(s_Find);
+                if (!s_Has) { s_Info += std::string(s_Name) + "(not on camera) "; continue; }
                 float s_V = 0.0f;
-                if (CanWriteMemory(s_F.Ptr, sizeof(float)) && ReadCamFov(s_F, s_V) && s_V > 0.01f && s_V < 150.0f) {
-                    s_F.Base = s_V;
-                    m_CamFovs.push_back(s_F);
-                    s_Info += s_F.Name + "=" + std::to_string(s_V) + " ";
-                }
+                if (!ReadCamFov(s_F, s_V) || s_V < 0.01f || s_V > 150.0f) { s_Info += std::string(s_Name) + "(unreadable) "; continue; }
+                s_F.Base = s_V;
+                m_CamFovs.push_back(s_F);
+                s_Info += s_F.Name + "=" + std::to_string(s_V) + (s_F.Ptr ? " " : "(setter) ");
             }
         }
         s_ScanEntity("camera", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
