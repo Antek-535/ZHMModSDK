@@ -184,6 +184,9 @@ private:
     std::string m_CamLive;                         // live values of the camera FOV properties (UI), guarded by m_ZoomMutex
     float m_CamLiveTimer = 0.0f;
     std::atomic<bool> m_ZoomGateNow{false};        // zoom is allowed right now (UI)
+    std::string m_ZoomLogBuf;                      // zoom diagnostics, written to BetterInstinct_zoom.log
+    float m_ZoomLogTimer = 0.0f;
+    bool m_ZoomLogDirty = false;
     std::atomic<int> m_WheelSeen{0};               // total wheel delta the zoom has received (UI)
     std::vector<SZoomProfile> m_ZoomProfiles;      // guarded by m_ZoomMutex
     std::mutex m_ZoomMutex;
