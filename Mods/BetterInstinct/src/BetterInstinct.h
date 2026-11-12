@@ -141,7 +141,22 @@ private:
     struct SZoomProfile {
         ZEntityRef Ref;
         float VanillaFov = 30.0f;
+        const float* Ptr = nullptr;                // where the profile's m_fFOV lives (read back for the UI)
     };
+    // Live camera: float properties with "fov" in their name on the player's main camera entity.
+    struct SCamFov {
+        float* Ptr = nullptr;
+        float Base = 0.0f;                         // the game's own value
+        float Last = 0.0f;                         // what we wrote last (0 = we are not overriding)
+        std::string Name;
+    };
+    std::vector<SCamFov> m_CamFovs;                // game thread only
+    float m_CamScan = 0.0f;
+    void ScanCameraFov();
+    void ApplyCameraFov(float p_Zoom);
+    std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
+    std::atomic<float> m_ZoomReadbackVan{0.0f};
+    std::string m_CamInfo;                         // guarded by m_ZoomMutex
     std::vector<SZoomProfile> m_ZoomProfiles;      // guarded by m_ZoomMutex
     std::mutex m_ZoomMutex;
     float m_ZoomTarget = 1.0f;                     // what the wheel asked for
@@ -244,6 +259,7 @@ private:
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
+    bool m_ZoomLiveCam = true;       // also scale the live camera's FOV (the profile values alone had almost no effect)
     bool m_ZoomAnyItem = false;      // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
 
     bool m_HudEnabled = true;
