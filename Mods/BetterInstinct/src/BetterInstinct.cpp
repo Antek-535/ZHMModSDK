@@ -770,7 +770,11 @@ void BetterInstinct::LoadSettings() {
     m_HudEnabled = GetSettingBool(kSection, "hud_enabled", m_HudEnabled);
     m_HudAlways = GetSettingBool(kSection, "hud_always", m_HudAlways);
     m_HudWidth = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_width", m_HudWidth)), 0.05f, 0.5f);
-    m_HudYOffset = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_y", m_HudYOffset)), 0.0f, 600.0f);
+    m_HudYOffset = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_y", m_HudYOffset)), 0.0f, 1080.0f);
+    m_HudX = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_x", m_HudX)), 0.0f, 1.0f);
+    m_HudVertical = GetSettingBool(kSection, "hud_vertical", m_HudVertical);
+    m_FireFx = GetSettingBool(kSection, "fire_fx", m_FireFx);
+    m_FireAmount = std::clamp(static_cast<float>(GetSettingDouble(kSection, "fire_amount", m_FireAmount)), 0.2f, 2.5f);
     m_HudScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_scale", m_HudScale)), 0.5f, 3.0f);
     m_HudOpacity = std::clamp(static_cast<float>(GetSettingDouble(kSection, "hud_opacity", m_HudOpacity)), 0.1f, 1.0f);
     m_FillColor[0] = std::clamp(static_cast<float>(GetSettingDouble(kSection, "fill_r", m_FillColor[0])), 0.0f, 1.0f);
@@ -820,6 +824,10 @@ void BetterInstinct::SaveSettings() {
     SetSettingBool(kSection, "hud_always", m_HudAlways);
     SetSettingDouble(kSection, "hud_width", m_HudWidth);
     SetSettingDouble(kSection, "hud_y", m_HudYOffset);
+    SetSettingDouble(kSection, "hud_x", m_HudX);
+    SetSettingBool(kSection, "hud_vertical", m_HudVertical);
+    SetSettingBool(kSection, "fire_fx", m_FireFx);
+    SetSettingDouble(kSection, "fire_amount", m_FireAmount);
     SetSettingDouble(kSection, "hud_scale", m_HudScale);
     SetSettingDouble(kSection, "hud_opacity", m_HudOpacity);
     SetSettingDouble(kSection, "fill_r", m_FillColor[0]);
@@ -911,6 +919,10 @@ bool BetterInstinct::SaveConfigFile() {
         s_Bool("hud_always", m_HudAlways);
         s_Flt("hud_width", m_HudWidth);
         s_Flt("hud_y", m_HudYOffset);
+        s_Flt("hud_x", m_HudX);
+        s_Bool("hud_vertical", m_HudVertical);
+        s_Bool("fire_fx", m_FireFx);
+        s_Flt("fire_amount", m_FireAmount);
         s_Flt("hud_scale", m_HudScale);
         s_Flt("hud_opacity", m_HudOpacity);
         s_Flt("fill_r", m_FillColor[0]);
@@ -1025,7 +1037,11 @@ bool BetterInstinct::LoadConfigFile() {
     s_Bool("hud_enabled", m_HudEnabled);
     s_Bool("hud_always", m_HudAlways);
     s_Flt("hud_width", m_HudWidth, 0.05f, 0.5f);
-    s_Flt("hud_y", m_HudYOffset, 0.0f, 600.0f);
+    s_Flt("hud_y", m_HudYOffset, 0.0f, 1080.0f);
+    s_Flt("hud_x", m_HudX, 0.0f, 1.0f);
+    s_Bool("hud_vertical", m_HudVertical);
+    s_Bool("fire_fx", m_FireFx);
+    s_Flt("fire_amount", m_FireAmount, 0.2f, 2.5f);
     s_Flt("hud_scale", m_HudScale, 0.5f, 3.0f);
     s_Flt("hud_opacity", m_HudOpacity, 0.1f, 1.0f);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
@@ -2880,13 +2896,20 @@ void BetterInstinct::DrawHud() {
     const ImVec2 s_Screen = ImGui::GetIO().DisplaySize;
     const float s_Ui = (s_Screen.y / 1080.0f) * m_HudScale;
     const float s_Thick = std::max(1.0f, std::round(s_Ui));
-    const float s_W = s_Screen.x * m_HudWidth * m_HudScale;
-    const float s_H = std::max(5.0f, 9.0f * s_Ui);
-    const float s_Cx = s_Screen.x * 0.5f;
-    const float s_Bottom = s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f);
-    const float s_Top = s_Bottom - s_H;
-    const float s_Left = s_Cx - s_W * 0.5f;
-    const float s_Right = s_Cx + s_W * 0.5f;
+    const bool s_Vert = m_HudVertical;
+    const float s_BarLen = s_Screen.x * m_HudWidth * m_HudScale; // length of the bar along its direction
+    const float s_Girth = std::max(5.0f, 9.0f * s_Ui);           // thickness of the bar
+
+    // Position: the bar's center across the screen, and its lower end measured from the bottom. Kept on screen.
+    const float s_HalfAcross = (s_Vert ? s_Girth : s_BarLen) * 0.5f;
+    const float s_Cx = std::clamp(s_Screen.x * std::clamp(m_HudX, 0.0f, 1.0f), s_HalfAcross,
+                                  std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
+    const float s_LabelRoom = 34.0f * s_Ui;
+    const float s_MinBottom = (s_Vert ? s_BarLen : s_Girth) + s_LabelRoom;
+    const float s_Bottom = std::clamp(s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f), std::min(s_MinBottom, s_Screen.y), s_Screen.y);
+    const float s_Top = s_Bottom - (s_Vert ? s_BarLen : s_Girth);
+    const float s_Left = s_Cx - (s_Vert ? s_Girth : s_BarLen) * 0.5f;
+    const float s_Right = s_Cx + (s_Vert ? s_Girth : s_BarLen) * 0.5f;
 
     const float s_Time = std::chrono::duration<float>(s_Now.time_since_epoch()).count();
     const float s_A = m_HudAlpha * m_HudOpacity;
@@ -2914,7 +2937,8 @@ void BetterInstinct::DrawHud() {
     ImFont* s_Font = ImGui::GetFont();
     const float s_FontSize = std::max(10.0f, ImGui::GetFontSize() * 0.8f * s_Ui);
     const ImVec2 s_TextSize = s_Font->CalcTextSizeA(s_FontSize, FLT_MAX, 0.0f, s_Label);
-    const ImVec2 s_TextPos(s_Cx - s_TextSize.x * 0.5f, s_Top - s_TextSize.y - 6.0f * s_Ui);
+    const float s_TextX = std::clamp(s_Cx - s_TextSize.x * 0.5f, 4.0f, std::max(4.0f, s_Screen.x - s_TextSize.x - 4.0f));
+    const ImVec2 s_TextPos(s_TextX, s_Top - s_TextSize.y - 6.0f * s_Ui);
     s_Dl->AddText(s_Font, s_FontSize, ImVec2(s_TextPos.x + 1.0f, s_TextPos.y + 1.0f), IM_COL32(0, 0, 0, static_cast<int>(160 * s_A)), s_Label);
     s_Dl->AddText(s_Font, s_FontSize, s_TextPos, s_Col(1.0f, 0.93f, 0.75f, 0.85f * s_A), s_Label);
 
@@ -2924,38 +2948,75 @@ void BetterInstinct::DrawHud() {
     const float s_InnerR = s_Right - s_Inset;
     const float s_InnerT = s_Top + s_Inset;
     const float s_InnerB = s_Bottom - s_Inset;
+    const float s_MidX = (s_InnerL + s_InnerR) * 0.5f;
     const float s_MidY = (s_InnerT + s_InnerB) * 0.5f;
 
     s_Dl->AddRectFilled(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), IM_COL32(10, 10, 12, static_cast<int>(170 * s_A)));
     s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_InnerR, s_InnerB), IM_COL32(88, 88, 92, static_cast<int>(120 * s_A)));
 
-    // Gold fill: darker at the start, brighter toward the tip.
-    const float s_HeadX = s_InnerL + (s_InnerR - s_InnerL) * m_Meter;
-    if (s_HeadX - s_InnerL > 0.5f) {
+    // Where the fill ends (the "tip"): horizontal bars fill left to right, vertical bars bottom to top.
+    const float s_HeadX = s_Vert ? s_MidX : s_InnerL + (s_InnerR - s_InnerL) * m_Meter;
+    const float s_HeadY = s_Vert ? s_InnerB - (s_InnerB - s_InnerT) * m_Meter : s_MidY;
+
+    // Fill: darker at the start, brighter toward the tip.
+    const bool s_HasFill = s_Vert ? (s_InnerB - s_HeadY > 0.5f) : (s_HeadX - s_InnerL > 0.5f);
+    if (s_HasFill) {
         const ImU32 s_Dim = s_Col(s_R * 0.50f, s_G * 0.50f, s_B * 0.50f, s_FillA);
         const ImU32 s_Bright = s_Col(s_R + (1.0f - s_R) * 0.35f, s_G + (1.0f - s_G) * 0.35f, s_B + (1.0f - s_B) * 0.35f, s_FillA);
-        s_Dl->AddRectFilledMultiColor(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerB), s_Dim, s_Bright, s_Bright, s_Dim);
-
-        // Thin highlight along the top of the fill.
-        s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerT + s_Thick),
-                            IM_COL32(255, 255, 255, static_cast<int>(70 * s_A)));
+        const ImU32 s_Shine = IM_COL32(255, 255, 255, static_cast<int>(70 * s_A));
+        if (s_Vert) {
+            s_Dl->AddRectFilledMultiColor(ImVec2(s_InnerL, s_HeadY), ImVec2(s_InnerR, s_InnerB), s_Bright, s_Bright, s_Dim, s_Dim);
+            s_Dl->AddRectFilled(ImVec2(s_InnerL, s_HeadY), ImVec2(s_InnerL + s_Thick, s_InnerB), s_Shine); // highlight along the left edge
+        } else {
+            s_Dl->AddRectFilledMultiColor(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerB), s_Dim, s_Bright, s_Bright, s_Dim);
+            s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_HeadX, s_InnerT + s_Thick), s_Shine); // highlight along the top
+        }
     }
 
-    // Sparkle particles: spawn at the tip while Instinct is in use, drift up and fade out.
-    if (s_Active && m_Meter > 0.004f) {
-        m_EmitAcc += s_Dt * 60.0f;
+    // Particles at the tip. While the settings window is open they also run, so the effect can be tuned.
+    const bool s_Emit = (s_Active || s_Preview) && m_Meter > 0.004f;
+    const float s_PxMin = std::max(1.0f, s_Ui);
+    if (s_Emit) {
+        // Fire: more particles per second; classic sparkles keep the old rate.
+        m_EmitAcc += s_Dt * (m_FireFx ? 95.0f * m_FireAmount : 60.0f);
+        const size_t s_MaxParticles = m_FireFx ? 320 : 160;
         while (m_EmitAcc >= 1.0f) {
             m_EmitAcc -= 1.0f;
-            if (m_Particles.size() >= 160) break;
+            if (m_Particles.size() >= s_MaxParticles) break;
 
             Particle s_P;
-            s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
-            s_P.y = s_InnerT + Rand01() * (s_InnerB - s_InnerT);
-            s_P.vx = (Rand01() - 0.5f) * 70.0f * s_Ui;
-            s_P.vy = -(12.0f + 55.0f * Rand01()) * s_Ui;
-            s_P.maxLife = 0.35f + 0.65f * Rand01();
+            if (m_FireFx) {
+                // Flames and embers leave the tip and rise up the screen (whichever way the bar points).
+                const float s_Across = (Rand01() - 0.5f) * s_Girth * 0.6f;
+                s_P.ember = Rand01() < 0.15f;
+                s_P.phase = Rand01() * 6.2831853f;
+                if (s_Vert) {
+                    s_P.x = s_HeadX + s_Across;
+                    s_P.y = s_HeadY + (Rand01() - 0.5f) * 2.0f * s_Ui;
+                } else {
+                    s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
+                    s_P.y = s_HeadY + s_Across;
+                }
+                if (s_P.ember) {
+                    s_P.vx = (Rand01() - 0.5f) * 120.0f * s_Ui;
+                    s_P.vy = -(60.0f + 120.0f * Rand01()) * s_Ui;
+                    s_P.maxLife = 0.6f + 0.9f * Rand01();
+                    s_P.size = (0.7f + 1.0f * Rand01()) * s_PxMin;
+                } else {
+                    s_P.vx = (Rand01() - 0.5f) * 18.0f * s_Ui;
+                    s_P.vy = -(40.0f + 60.0f * Rand01()) * s_Ui;
+                    s_P.maxLife = 0.45f + 0.55f * Rand01();
+                    s_P.size = (2.2f + 3.2f * Rand01()) * s_PxMin;
+                }
+            } else {
+                s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
+                s_P.y = s_InnerT + Rand01() * (s_InnerB - s_InnerT);
+                s_P.vx = (Rand01() - 0.5f) * 70.0f * s_Ui;
+                s_P.vy = -(12.0f + 55.0f * Rand01()) * s_Ui;
+                s_P.maxLife = 0.35f + 0.65f * Rand01();
+                s_P.size = (0.8f + 1.8f * Rand01()) * s_PxMin;
+            }
             s_P.life = s_P.maxLife;
-            s_P.size = (0.8f + 1.8f * Rand01()) * std::max(1.0f, s_Ui);
             m_Particles.push_back(s_P);
         }
     } else {
@@ -2964,34 +3025,81 @@ void BetterInstinct::DrawHud() {
 
     for (auto& s_P : m_Particles) {
         s_P.life -= s_Dt;
-        s_P.x += s_P.vx * s_Dt;
-        s_P.y += s_P.vy * s_Dt;
-        s_P.vy += 40.0f * s_Ui * s_Dt; // slight pull down so the sparks arc
+        if (m_FireFx) {
+            if (s_P.ember) {
+                s_P.vy += 90.0f * s_Ui * s_Dt; // embers arc and fall back
+                s_P.x += (s_P.vx + std::sin(s_P.phase + s_P.life * 9.0f) * 14.0f * s_Ui) * s_Dt;
+            } else {
+                s_P.vy *= std::max(0.0f, 1.0f - 0.9f * s_Dt); // flames slow down as they rise
+                s_P.x += (s_P.vx + std::sin(s_P.phase + s_P.life * 15.0f) * 26.0f * s_Ui) * s_Dt; // flicker sideways
+            }
+            s_P.y += s_P.vy * s_Dt;
+        } else {
+            s_P.x += s_P.vx * s_Dt;
+            s_P.y += s_P.vy * s_Dt;
+            s_P.vy += 40.0f * s_Ui * s_Dt; // slight pull down so the sparks arc
+        }
     }
     m_Particles.erase(std::remove_if(m_Particles.begin(), m_Particles.end(), [](const Particle& p) { return p.life <= 0.0f; }),
                       m_Particles.end());
 
-    for (const auto& s_P : m_Particles) {
-        const float s_K = s_P.life / s_P.maxLife;
-        s_Dl->AddCircleFilled(ImVec2(s_P.x, s_P.y), s_P.size * (0.5f + 0.5f * s_K),
-                              s_Col(s_R + (1.0f - s_R) * 0.55f, s_G + (1.0f - s_G) * 0.55f, s_B + (1.0f - s_B) * 0.55f, s_K * s_A), 6);
+    if (m_FireFx) {
+        // Flame colors follow the meter color: white-hot core -> meter color -> deep red-orange that fades out.
+        const float s_CoreR = s_R + (1.0f - s_R) * 0.75f, s_CoreG = s_G + (1.0f - s_G) * 0.75f, s_CoreB = s_B + (1.0f - s_B) * 0.75f;
+        const float s_EndR = s_R * 0.85f, s_EndG = s_G * 0.30f, s_EndB = s_B * 0.10f;
+        for (const auto& s_P : m_Particles) {
+            const float s_K = std::clamp(s_P.life / s_P.maxLife, 0.0f, 1.0f); // 1 = just born, 0 = gone
+            const float s_T = 1.0f - s_K;
+            float s_Pr, s_Pg, s_Pb;
+            if (s_T < 0.35f) {
+                const float s_F = s_T / 0.35f;
+                s_Pr = s_CoreR + (s_R - s_CoreR) * s_F;
+                s_Pg = s_CoreG + (s_G - s_CoreG) * s_F;
+                s_Pb = s_CoreB + (s_B - s_CoreB) * s_F;
+            } else {
+                const float s_F = (s_T - 0.35f) / 0.65f;
+                s_Pr = s_R + (s_EndR - s_R) * s_F;
+                s_Pg = s_G + (s_EndG - s_G) * s_F;
+                s_Pb = s_B + (s_EndB - s_B) * s_F;
+            }
+            const ImVec2 s_Pos(s_P.x, s_P.y);
+            if (s_P.ember) {
+                const float s_Rad = s_P.size * (0.6f + 0.4f * s_K);
+                s_Dl->AddCircleFilled(s_Pos, s_Rad * 2.2f, s_Col(s_Pr, s_Pg, s_Pb, 0.18f * s_K * s_A), 8);
+                s_Dl->AddCircleFilled(s_Pos, s_Rad, s_Col(s_CoreR, s_CoreG, s_CoreB, 0.95f * s_K * s_A), 6);
+            } else {
+                const float s_Rad = s_P.size * (0.30f + 0.70f * s_K); // flames shrink as they burn out
+                const float s_Fa = std::pow(s_K, 0.8f) * s_A;
+                s_Dl->AddCircleFilled(s_Pos, s_Rad * 1.9f, s_Col(s_Pr, s_Pg, s_Pb, 0.16f * s_Fa), 10); // soft halo
+                s_Dl->AddCircleFilled(s_Pos, s_Rad, s_Col(s_Pr, s_Pg, s_Pb, 0.55f * s_Fa), 10);
+                if (s_T < 0.55f) {
+                    s_Dl->AddCircleFilled(s_Pos, s_Rad * 0.5f, s_Col(s_CoreR, s_CoreG, s_CoreB, 0.75f * s_Fa), 8); // hot core
+                }
+            }
+        }
+    } else {
+        for (const auto& s_P : m_Particles) {
+            const float s_K = s_P.life / s_P.maxLife;
+            s_Dl->AddCircleFilled(ImVec2(s_P.x, s_P.y), s_P.size * (0.5f + 0.5f * s_K),
+                                  s_Col(s_R + (1.0f - s_R) * 0.55f, s_G + (1.0f - s_G) * 0.55f, s_B + (1.0f - s_B) * 0.55f, s_K * s_A), 6);
+        }
     }
 
     // Bright spark at the tip of the fill (stronger while Instinct is in use).
     if (m_Meter > 0.004f) {
         const float s_Pulse = s_Active ? 0.85f + 0.15f * std::sin(s_Time * 14.0f) : 0.5f;
-        const float s_Rad = s_H * (s_Active ? 0.95f : 0.7f);
+        const float s_Rad = s_Girth * (s_Active ? 0.95f : 0.7f);
 
         for (int i = 0; i < 4; ++i) { // soft glow
             const float s_Rr = s_Rad * (2.6f - 0.6f * static_cast<float>(i));
-            s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_MidY), s_Rr, s_Col(s_R, s_G, s_B, (0.06f + 0.05f * static_cast<float>(i)) * s_Pulse * s_A), 20);
+            s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_HeadY), s_Rr, s_Col(s_R, s_G, s_B, (0.06f + 0.05f * static_cast<float>(i)) * s_Pulse * s_A), 20);
         }
-        s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_MidY), s_Rad * 0.5f, s_Col(1.0f, 0.97f, 0.88f, 0.95f * s_Pulse * s_A), 12);
+        s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_HeadY), s_Rad * 0.5f, s_Col(1.0f, 0.97f, 0.88f, 0.95f * s_Pulse * s_A), 12);
 
         const float s_Len = s_Rad * (2.3f + (s_Active ? 0.6f * std::sin(s_Time * 10.0f) : 0.0f));
         const ImU32 s_Star = s_Col(1.0f, 0.97f, 0.88f, 0.8f * s_Pulse * s_A);
-        s_Dl->AddLine(ImVec2(s_HeadX - s_Len, s_MidY), ImVec2(s_HeadX + s_Len, s_MidY), s_Star, s_Thick);
-        s_Dl->AddLine(ImVec2(s_HeadX, s_MidY - s_Len * 0.8f), ImVec2(s_HeadX, s_MidY + s_Len * 0.8f), s_Star, s_Thick);
+        s_Dl->AddLine(ImVec2(s_HeadX - s_Len, s_HeadY), ImVec2(s_HeadX + s_Len, s_HeadY), s_Star, s_Thick);
+        s_Dl->AddLine(ImVec2(s_HeadX, s_HeadY - s_Len * 0.8f), ImVec2(s_HeadX, s_HeadY + s_Len * 0.8f), s_Star, s_Thick);
     }
 
     // Thin outline, a little brighter while Instinct is active.
@@ -3255,10 +3363,31 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::Checkbox("Show Instinct meter", &m_HudEnabled)) s_Changed = true;
         ImGui::BeginDisabled(!m_HudEnabled);
         if (ImGui::Checkbox("Always visible (even when full)", &m_HudAlways)) s_Changed = true;
-        if (ImGui::SliderFloat("Width", &m_HudWidth, 0.05f, 0.5f, "%.2f")) s_Changed = true;
-        if (ImGui::SliderFloat("Height from bottom", &m_HudYOffset, 0.0f, 400.0f, "%.0f px")) s_Changed = true;
+        {
+            static const char* const s_OrientNames[] = {"Horizontal", "Vertical"};
+            int s_OrientIdx = m_HudVertical ? 1 : 0;
+            if (ImGui::Combo("Orientation", &s_OrientIdx, s_OrientNames, 2)) {
+                m_HudVertical = (s_OrientIdx == 1);
+                s_Changed = true;
+            }
+        }
+        if (ImGui::SliderFloat("Length", &m_HudWidth, 0.05f, 0.5f, "%.2f")) s_Changed = true;
+        if (ImGui::SliderFloat("Horizontal position", &m_HudX, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::SliderFloat("Height from bottom", &m_HudYOffset, 0.0f, 1080.0f, "%.0f px")) s_Changed = true;
+        ImGui::TextDisabled("Horizontal position: 0 = left edge, 1 = right edge. A vertical bar fills upward.");
+        if (ImGui::Button("Bottom center")) { m_HudX = 0.5f; m_HudYOffset = 64.0f; s_Changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Top center")) { m_HudX = 0.5f; m_HudYOffset = 1010.0f; s_Changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Left side")) { m_HudX = 0.04f; m_HudYOffset = 380.0f; s_Changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Right side")) { m_HudX = 0.96f; m_HudYOffset = 380.0f; s_Changed = true; }
         if (ImGui::SliderFloat("Size", &m_HudScale, 0.5f, 3.0f, "%.2f")) s_Changed = true;
         if (ImGui::SliderFloat("Opacity", &m_HudOpacity, 0.1f, 1.0f, "%.2f")) s_Changed = true;
+        if (ImGui::Checkbox("Fire effect at the tip (like Absolution)", &m_FireFx)) s_Changed = true;
+        ImGui::BeginDisabled(!m_FireFx);
+        if (ImGui::SliderFloat("Fire amount", &m_FireAmount, 0.2f, 2.5f, "%.2f")) s_Changed = true;
+        ImGui::EndDisabled();
         if (ImGui::ColorEdit3("Meter color", m_FillColor)) s_Changed = true;
         if (ImGui::ColorEdit3("Low-meter color", m_LowColor)) s_Changed = true;
         ImGui::EndDisabled();
