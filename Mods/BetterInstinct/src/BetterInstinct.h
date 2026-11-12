@@ -145,13 +145,18 @@ private:
     };
     // Live camera: float properties with "fov" in their name on the player's main camera entity.
     struct SCamFov {
-        float* Ptr = nullptr;
+        float* Ptr = nullptr;                      // direct memory (null when the property only has a getter/setter)
+        ZEntityRef Ref;                            // owner entity (used for getter/setter properties)
+        uint32_t PropId = 0;
         float Base = 0.0f;                         // the game's own value
         float Last = 0.0f;                         // what we wrote last (0 = we are not overriding)
         std::string Name;
     };
+    bool ReadCamFov(const SCamFov& p_F, float& p_Out);
+    void WriteCamFov(const SCamFov& p_F, float p_Value);
     std::vector<SCamFov> m_CamFovs;                // game thread only
     float m_CamScan = 0.0f;
+    bool m_PrevRightDown = false;
     void ScanCameraFov();
     void ApplyCameraFov(float p_Zoom);
     std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
@@ -264,7 +269,7 @@ private:
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
     bool m_ZoomLiveCam = true;       // also scale the live camera's FOV (the profile values alone had almost no effect)
-    bool m_ZoomAnyItem = false;      // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
+    bool m_ZoomAnyItem = true;       // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
