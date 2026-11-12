@@ -947,8 +947,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("zoom_step", m_ZoomStep);
         s_Flt("zoom_smooth", m_ZoomSmooth);
         s_Bool("zoom_remember", m_ZoomRemember);
-        s_Bool("zoom_any_item", m_ZoomAnyItem);
-        s_Bool("zoom_live_cam", m_ZoomLiveCam);
+        s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1080,8 +1079,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("zoom_step", m_ZoomStep, 1.03f, 1.6f);
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
     s_Bool("zoom_remember", m_ZoomRemember);
-    s_Bool("zoom_any_item", m_ZoomAnyItem);
-    s_Bool("zoom_live_cam", m_ZoomLiveCam);
+    s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1572,14 +1570,129 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
     }
 }
 
-// Is the zoom allowed for what 47 holds right now? Wanted: hands empty, or an item that can't be thrown.
-// Guns (and throwable items) keep the game's own aiming.
-// TODO: wire this to the held item. It needs the item/inventory API of the SDK fork (ZHitman5.h / ZItem.h).
-// Until then the check is the "Zoom with any item" option, so the feature is switched off by default.
+// Is the zoom allowed for what 47 holds right now? Only with empty hands: no gun, no throwable, no tool, nothing.
+// The check looks at reflected properties of the player / character / sub-controllers (see ScanItemProbes).
 bool BetterInstinct::HeldItemAllowsZoom() {
-    // Not needed: only the UnAimed camera profiles are zoomed (see CheckTemplateForZoom), and the game uses those exactly
-    // when you hold right mouse without aiming a weapon.
-    return true;
+    if (m_ZoomAnyItem) return true; // the user switched the check off
+    return !m_ItemHolding;
+}
+
+// Looks for properties that tell whether something is in 47's hands. Names are matched loosely, because the exact
+// property names are not known to the SDK; only entity references (8/16 bytes) and flags (1 byte) are considered.
+void BetterInstinct::ScanItemProbes() {
+    static const char* s_Want[] = {"helditem", "currentitem", "curitem", "activeitem", "equipped", "carried", "inhand",
+                                   "wielded", "selecteditem", "currentweapon", "activeweapon", "heldweapon", "holdeditem",
+                                   "handitem", "holdingitem", "holdingweapon", "hasweapon", "isarmed", "carryingitem"};
+    static const char* s_Skip[] = {"allow", "can", "array", "list", "count", "index", "desc", "config", "anim", "slot",
+                                   "holster", "socket", "bone", "offset", "spawn", "enable", "disable", "block", "lock"};
+
+    std::vector<SItemProbe> s_New;
+    std::string s_Info;
+    auto s_ScanEntity = [&](const std::string& p_Label, ZEntityRef p_Ref) {
+        auto s_Body = [&]() {
+            ZEntityImpl* s_Entity = p_Ref.GetEntity();
+            ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+            if (!s_Type || !s_Type->m_pPropertyData) return;
+            for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+                const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                if (!s_NI || !s_NI->m_pszPropertyName) continue;
+                std::string s_Lower = s_NI->m_pszPropertyName;
+                for (char& ch : s_Lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                bool s_Match = false;
+                for (const char* s_W : s_Want) if (s_Lower.find(s_W) != std::string::npos) s_Match = true;
+                if (!s_Match) continue;
+                for (const char* s_S : s_Skip) if (s_Lower.find(s_S) != std::string::npos) s_Match = false;
+                if (!s_Match) continue;
+
+                const SPropertyInfo& s_PI = s_NI->m_propertyInfo;
+                if (s_PI.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue; // not plain memory
+                const IType* s_T = s_PI.m_Type ? s_PI.m_Type->GetTypeInfo() : nullptr;
+                const uint32_t s_Size = s_T ? s_T->m_nTypeSize : 0;
+                if (s_Size != 1 && s_Size != 8 && s_Size != 16) continue;
+
+                SItemProbe s_Probe;
+                s_Probe.Ref = p_Ref;
+                s_Probe.Size = s_Size;
+                s_Probe.Name = p_Label + "." + s_NI->m_pszPropertyName;
+                s_Probe.Ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(p_Ref.m_pObj) + s_P.m_nPropertyOffset);
+                if (!CanWriteMemory(s_Probe.Ptr, s_Size)) continue;
+                bool s_Dup = false;
+                for (const SItemProbe& s_O : s_New) if (s_O.Ptr == s_Probe.Ptr) s_Dup = true;
+                if (s_Dup) continue;
+                // keep what was learned about this property in earlier scans
+                for (const SItemProbe& s_Old : m_ItemProbes) if (s_Old.Ptr == s_Probe.Ptr) s_Probe.SeenEmpty = s_Old.SeenEmpty;
+                s_Info += s_Probe.Name + " ";
+                s_New.push_back(std::move(s_Probe));
+            }
+        };
+        SafeCall(s_Body);
+    };
+
+    auto s_Walk = [&]() {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) return;
+        s_ScanEntity("player", s_Local.m_entityRef);
+        auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
+        if (s_CharRef.m_pInterfaceRef) {
+            s_ScanEntity("character", s_CharRef.m_entityRef);
+            auto& s_ContRef = s_CharRef.m_pInterfaceRef->m_rSubcontrollerContainer;
+            if (s_ContRef.m_pInterfaceRef) {
+                int s_Idx = 0;
+                for (auto& s_Sub : s_ContRef.m_pInterfaceRef->m_aReferencedControllers) {
+                    if (s_Idx >= 60) break;
+                    s_ScanEntity("sub" + std::to_string(s_Idx++), s_Sub.m_entityRef);
+                }
+            }
+        }
+    };
+    if (!SafeCall(s_Walk)) return; // keep what we had
+
+    m_ItemProbes = std::move(s_New);
+    if (s_Info.empty()) s_Info = "no held-item property found";
+    static std::string s_LastLogged;
+    if (s_Info != s_LastLogged) { // log only when the list changes
+        s_LastLogged = s_Info;
+        GlowLog("Held-item properties: " + s_Info + "\n");
+    }
+    std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+    m_ItemInfo = s_Info;
+}
+
+bool BetterInstinct::ReadItemProbe(const SItemProbe& p_P, bool& p_Out) {
+    bool s_Ok = false;
+    auto s_Body = [&]() {
+        if (!p_P.Ptr || !CanWriteMemory(p_P.Ptr, p_P.Size)) return;
+        if (p_P.Size == 1) {
+            p_Out = *p_P.Ptr != 0;
+        } else {
+            uint64_t s_V = 0;
+            std::memcpy(&s_V, p_P.Ptr, sizeof(s_V));
+            p_Out = s_V != 0; // an entity reference starts with its pointer: null = nothing there
+        }
+        s_Ok = true;
+    };
+    if (!SafeCall(s_Body)) return false;
+    return s_Ok;
+}
+
+void BetterInstinct::UpdateHeldItem(float p_Dt) {
+    m_ItemScan -= p_Dt;
+    if (m_ItemScan <= 0.0f) {
+        m_ItemScan = 2.0f; // pointers are refreshed regularly (entities can be recreated)
+        ScanItemProbes();
+    }
+    bool s_Holding = false;
+    bool s_Indicator = false;
+    for (SItemProbe& s_P : m_ItemProbes) {
+        bool s_Set = false;
+        if (!ReadItemProbe(s_P, s_Set)) continue;
+        if (!s_Set) s_P.SeenEmpty = true;
+        if (!s_P.SeenEmpty) continue; // never seen empty yet: can't tell yet whether it means anything
+        s_Indicator = true;
+        if (s_Set) s_Holding = true;
+    }
+    m_ItemHolding = s_Holding;
+    m_ItemState.store(m_ItemProbes.empty() ? 0 : (!s_Indicator ? 1 : (s_Holding ? 3 : 2)));
 }
 
 void BetterInstinct::WriteZoomFov(float p_Zoom) {
@@ -1858,10 +1971,12 @@ void BetterInstinct::ApplyCameraFov(float p_Zoom) {
 
 void BetterInstinct::UpdateZoom(float p_Dt) {
     if (m_DumpRequest.exchange(false)) DumpHeldItemInfo();
+    UpdateHeldItem(p_Dt);
     const bool s_Focused = GameIsForeground() && !m_Binding;
     const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
-    const bool s_Gate = m_ZoomEnabled && s_RightDown && HeldItemAllowsZoom();
-    g_ZoomWanted.store(s_Gate);
+    const bool s_ItemOk = HeldItemAllowsZoom();                       // empty hands only
+    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk;
+    g_ZoomWanted.store(s_Gate); // only then does the hook take the wheel away from the game
 
     const int s_Delta = g_Wheel.exchange(0);
     m_WheelSeen.fetch_add(s_Delta);
@@ -1871,27 +1986,35 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     }
     m_ZoomTarget = std::clamp(m_ZoomTarget, 1.0f, std::max(1.0f, m_ZoomMax));
     if (!s_RightDown && !m_ZoomRemember) m_ZoomTarget = 1.0f;
+    if (s_RightDown && !s_Gate) { // something is in the hands (or zoom is off): back to the game's own camera at once
+        m_ZoomTarget = 1.0f;
+        m_ZoomCur = 1.0f;
+    }
 
     const float s_Wanted = s_Gate ? m_ZoomTarget : 1.0f; // not allowed right now: the game's own FOV
     m_ZoomCur += (s_Wanted - m_ZoomCur) * std::clamp(m_ZoomSmooth * p_Dt, 0.0f, 1.0f);
     if (std::abs(m_ZoomCur - s_Wanted) < 0.002f) m_ZoomCur = s_Wanted;
 
-    if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
-        WriteZoomFov(m_ZoomCur);
-        m_ZoomWritten = m_ZoomCur;
+    // Live camera: the FOV the game really renders with. Every frame while zoomed, once more to hand the value back.
+    m_CamScan -= p_Dt;
+    if (m_CamFovs.empty() && m_CamScan <= 0.0f) {
+        m_CamScan = 2.0f;
+        ScanCameraFov();
     }
+    bool s_Overriding = false;
+    for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
+    if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
+    if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
 
-    // Live camera (every frame while zoomed, once more to hand the value back).
-    if (m_ZoomLiveCam) {
-        m_CamScan -= p_Dt;
-        if (m_CamFovs.empty() && m_CamScan <= 0.0f) {
-            m_CamScan = 2.0f;
-            ScanCameraFov();
+    // The camera profile values are only the fallback when no live camera FOV could be found (writing both would zoom twice).
+    if (m_CamFovs.empty()) {
+        if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
+            WriteZoomFov(m_ZoomCur);
+            m_ZoomWritten = m_ZoomCur;
         }
-        bool s_Overriding = false;
-        for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
-        if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
-        if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
+    } else if (m_ZoomWritten != 1.0f) {
+        WriteZoomFov(1.0f); // give the profiles back to the game
+        m_ZoomWritten = 1.0f;
     }
 
     m_PrevRightDown = s_RightDown;
@@ -2435,6 +2558,9 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
             }
             m_ZoomFound.store(0);
             m_CamFovs.clear();
+            m_ItemProbes.clear();
+            m_ItemHolding = false;
+            m_ItemState.store(0);
             m_ZoomTarget = m_ZoomCur = m_ZoomWritten = 1.0f;
             g_ZoomWanted.store(false);
             m_Meter = 1.0f;
@@ -3763,12 +3889,20 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         // --- Better Zoom ---
         if (ImGui::CollapsingHeader("Zoom (right mouse + mouse wheel)")) {
             if (ImGui::Checkbox("Enable wheel zoom", &m_ZoomEnabled)) s_Changed = true;
-            ImGui::TextDisabled("Hold right mouse with empty hands (or an item you can't throw), then scroll.");
+            ImGui::TextDisabled("Hold right mouse with EMPTY hands (no weapon, no item), then scroll.");
             if (ImGui::SliderFloat("Max zoom", &m_ZoomMax, 1.5f, 10.0f, "%.1fx")) s_Changed = true;
             if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
             if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
-            if (ImGui::Checkbox("Also zoom the live camera (also zooms weapon aiming)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
+            if (ImGui::Checkbox("Zoom with anything in hand (skip the held-item check)", &m_ZoomAnyItem)) s_Changed = true;
+            {
+                static const char* s_ItemTxt[] = {"no held-item property found (check skipped: zoom is NOT limited to empty hands)",
+                                                  "learning (waiting until the hands have been empty once)",
+                                                  "hands empty", "holding something: zoom off"};
+                ImGui::TextDisabled("Held item: %s", s_ItemTxt[std::clamp(m_ItemState.load(), 0, 3)]);
+                std::lock_guard<std::mutex> s_ItemLock(m_ZoomMutex);
+                ImGui::TextDisabled("Item properties used: %s", m_ItemInfo.empty() ? "-" : m_ItemInfo.c_str());
+            }
             ImGui::TextDisabled("Profile FOV now: %.1f (game's own: %.1f)", m_ZoomReadback.load(), m_ZoomReadbackVan.load());
             {
                 std::lock_guard<std::mutex> s_InfoLock(m_ZoomMutex);
