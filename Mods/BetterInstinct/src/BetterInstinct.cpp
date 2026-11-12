@@ -1391,6 +1391,16 @@ static void ZoomLog(const std::string& p_Text) {
     }
 }
 
+static void TextLog(const wchar_t* p_File, const std::string& p_Text) {
+    try {
+        std::wstring s_Dir = ConfigDir();
+        if (s_Dir.empty()) return;
+        std::ofstream s_File(fs::path(s_Dir) / p_File, std::ios::trunc);
+        s_File << p_Text;
+    } catch (...) {
+    }
+}
+
 static void GlowLog(const std::string& p_Text) {
     try {
         std::wstring s_Dir = ConfigDir();
@@ -1728,7 +1738,7 @@ void BetterInstinct::WriteZoomFov(float p_Zoom) {
 
 // Diagnostic for the held-item check: lists the properties (name, size, offset, first bytes) of the player, its character,
 // the inventory controllers and the items it owns, so the right one can be found. Written to BetterInstinct.log.
-void BetterInstinct::DumpHeldItemInfo() {
+void BetterInstinct::DumpHeldItemInfo(const wchar_t* p_FileName) {
     std::string s_Out = "Held item dump (hold the item you want to check while you press the button)\n";
     auto s_Dump = [&](const std::string& p_Title, ZEntityRef p_Ref) {
         s_Out += "\n== " + p_Title + " ==\n";
@@ -1768,7 +1778,7 @@ void BetterInstinct::DumpHeldItemInfo() {
 
     try {
         auto s_Local = SDK()->GetLocalPlayer();
-        if (!s_Local.m_pInterfaceRef) { s_Out += "No local player.\n"; GlowLog(s_Out); return; }
+        if (!s_Local.m_pInterfaceRef) { s_Out += "No local player.\n"; TextLog(p_FileName, s_Out); return; }
         s_Dump("ZHitman5", s_Local.m_entityRef);
         s_Dump("MainCamera (m_rMainCamera)", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
 
@@ -1788,7 +1798,7 @@ void BetterInstinct::DumpHeldItemInfo() {
     } catch (...) {
         s_Out += "\nException while reading.\n";
     }
-    GlowLog(s_Out);
+    TextLog(p_FileName, s_Out);
 }
 
 bool BetterInstinct::ReadCamFov(const SCamFov& p_F, float& p_Out) {
@@ -1982,7 +1992,11 @@ void BetterInstinct::ApplyCameraFov(float p_Zoom) {
 }
 
 void BetterInstinct::UpdateZoom(float p_Dt) {
-    if (m_DumpRequest.exchange(false)) DumpHeldItemInfo();
+    {
+        const int s_Dump = m_DumpRequest.exchange(0);
+        if (s_Dump == 1) DumpHeldItemInfo(L"BetterInstinct_dump_empty.log");
+        else if (s_Dump == 2) DumpHeldItemInfo(L"BetterInstinct_dump_weapon.log");
+    }
     UpdateHeldItem(p_Dt);
     const bool s_Focused = GameIsForeground() && !m_Binding;
     const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
@@ -3968,9 +3982,11 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 std::lock_guard<std::mutex> s_LiveLock(m_ZoomMutex);
                 ImGui::TextDisabled("Live now: %s", m_CamLive.empty() ? "-" : m_CamLive.c_str());
             }
-            if (ImGui::Button("Dump inventory info to log")) m_DumpRequest = true;
+            if (ImGui::Button("Dump info: EMPTY hands")) m_DumpRequest = 1;
+            ImGui::SameLine();
+            if (ImGui::Button("Dump info: holding a WEAPON")) m_DumpRequest = 2;
             ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
-            if (ImGui::Checkbox("Use the live camera FOV instead of the camera profiles", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
+            if (ImGui::Checkbox("Use the live camera FOV (recommended; unticked = camera profiles, which are not found)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
             ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
         }
 
