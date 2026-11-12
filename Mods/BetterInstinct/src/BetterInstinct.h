@@ -157,6 +157,10 @@ private:
     std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
     std::atomic<float> m_ZoomReadbackVan{0.0f};
     std::string m_CamInfo;                         // guarded by m_ZoomMutex
+    std::string m_CamLive;                         // live values of the camera FOV properties (UI), guarded by m_ZoomMutex
+    float m_CamLiveTimer = 0.0f;
+    std::atomic<bool> m_ZoomGateNow{false};        // zoom is allowed right now (UI)
+    std::atomic<int> m_WheelSeen{0};               // total wheel delta the zoom has received (UI)
     std::vector<SZoomProfile> m_ZoomProfiles;      // guarded by m_ZoomMutex
     std::mutex m_ZoomMutex;
     float m_ZoomTarget = 1.0f;                     // what the wheel asked for
