@@ -189,6 +189,8 @@ private:
     // Sparkle particles shown at the tip of the meter while Instinct is in use.
     struct Particle {
         float x, y, vx, vy, life, maxLife, size;
+        float phase = 0.0f;   // random offset for the flame flicker
+        bool ember = false;   // small fast spark instead of a flame
     };
     std::vector<Particle> m_Particles;
     float m_EmitAcc = 0.0f;
@@ -218,6 +220,10 @@ private:
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
+    bool m_HudVertical = false;      // false = horizontal bar, true = vertical bar (fills upward)
+    float m_HudX = 0.5f;             // horizontal position of the bar's center: 0 = left edge, 1 = right edge
+    bool m_FireFx = true;            // flame-style particles at the tip of the meter (Absolution look)
+    float m_FireAmount = 1.0f;       // how many flame particles
     float m_HudWidth = 0.17f;        // fraction of screen width
     float m_HudYOffset = 64.0f;      // pixels from the bottom (at 1080p)
     float m_HudScale = 1.0f;
