@@ -38,6 +38,8 @@
 #include "Glacier/ZCameraEntity.h"
 #include "Glacier/ZCollision.h"
 #include "Glacier/ZEntity.h"
+#include "Glacier/EntityFactory.h"
+#include "Glacier/ZResource.h"
 #include "Glacier/ZEntityManager.h"
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZHitman5.h"
@@ -576,6 +578,8 @@ void BetterInstinct::Init() {
     Hooks::ZInputAction_Digital->AddDetour(this, &BetterInstinct::ZInputAction_Digital);
     // Catches the Instinct glow config entity when the game activates it.
     Hooks::ZEntityManager_ActivateEntity->AddDetour(this, &BetterInstinct::ZEntityManager_ActivateEntity);
+    // Main way to find the glow config entity: the game builds it from its template, and we look at the result right after.
+    Hooks::ZTemplateEntityFactory_ConfigureEntity->AddDetour(this, &BetterInstinct::ZTemplateEntityFactory_ConfigureEntity);
 }
 
 void BetterInstinct::OnEngineInitialized() {
@@ -1443,6 +1447,45 @@ void BetterInstinct::ApplyGlowOnActivate(const ZEntityRef* p_Ref) {
     };
     SafeCall(s_Apply);
     if (s_Written > 0) m_GlowPreApplied.fetch_add(s_Written);
+}
+
+// The glow config entity is the same one the Killer Instinct data mod patches: entity f55806ff6135965f in the main game's
+// template (0092AAB2AF8AC127) and d796d60af9226450 (plus ...6400) in Sniper Assassin's (0029C0633A11CDE1).
+DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZTemplateEntityFactory_ConfigureEntity, ZTemplateEntityFactory* th, ZEntityType** pEntity, const SExternalReferences& externalRefs, uint8_t* unk0) {
+    p_Hook->CallOriginal(th, pEntity, externalRefs, unk0); // the game builds the entities and sets their properties first
+    ++m_GlowTplCalls;
+    CheckTemplateForGlow(th, pEntity);
+    return HookResult<void>(HookAction::Return());
+}
+
+void BetterInstinct::CheckTemplateForGlow(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity) {
+    if (!p_Factory || !p_Entity) return;
+
+    static constexpr uint64_t s_Ids[] = {0xF55806FF6135965FULL, 0xD796D60AF9226450ULL, 0xD796D60AF9226400ULL};
+    std::vector<ZEntityRef> s_Hits;
+    auto s_Look = [&]() {
+        auto* s_Blueprint = static_cast<IEntityBlueprintFactory*>(p_Factory->m_blueprintResource.GetResourceData());
+        if (!s_Blueprint) return;
+        const int64_t s_Count = s_Blueprint->GetSubEntitiesCount();
+        if (s_Count <= 0 || s_Count > 2000000) return;
+        for (int64_t i = 0; i < s_Count; ++i) {
+            const uint64_t s_Id = s_Blueprint->GetSubEntityId(static_cast<int>(i)); // cheap: no entity is touched unless the id matches
+            bool s_Match = false;
+            for (const uint64_t s_Wanted : s_Ids) {
+                if (s_Id == s_Wanted) s_Match = true;
+            }
+            if (!s_Match) continue;
+            ZEntityType** s_Sub = s_Blueprint->GetSubEntity(p_Entity, static_cast<int>(i));
+            if (s_Sub) s_Hits.push_back(ZEntityRef(s_Sub));
+        }
+    };
+    if (!SafeCall(s_Look)) return;
+
+    for (const ZEntityRef& s_Ref : s_Hits) {
+        ++m_GlowTplHits;
+        CatchGlowEntity(&s_Ref);      // remembers it (the color search and the live updates use this list)
+        ApplyGlowOnActivate(&s_Ref);  // writes the player's colors right now
+    }
 }
 
 // Finds every glow color in the game's entities. Runs on the game thread (it reads the entity manager).
@@ -3156,6 +3199,8 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 ImGui::TextDisabled("Status: %s | written at load: %u | colors found now: %u",
                                     s_GlowSt == 2 ? "colors found" : (s_GlowSt == 1 ? "config not found yet" : "waiting for a mission"),
                                     m_GlowPreApplied.load(), m_GlowFound.load());
+                ImGui::TextDisabled("Template hook: ran %u times | config entity seen %u times",
+                                    m_GlowTplCalls.load(), m_GlowTplHits.load());
             }
             ImGui::TextDisabled("Unticking Silhouette / Outline hides that part. Alpha = how strong it is.");
 
