@@ -948,6 +948,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("zoom_smooth", m_ZoomSmooth);
         s_Bool("zoom_remember", m_ZoomRemember);
         s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
+        s_Bool("zoom_use_live", m_ZoomLiveCam);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1080,6 +1081,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
     s_Bool("zoom_remember", m_ZoomRemember);
     s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
+    s_Bool("zoom_use_live", m_ZoomLiveCam);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1995,26 +1997,32 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     m_ZoomCur += (s_Wanted - m_ZoomCur) * std::clamp(m_ZoomSmooth * p_Dt, 0.0f, 1.0f);
     if (std::abs(m_ZoomCur - s_Wanted) < 0.002f) m_ZoomCur = s_Wanted;
 
-    // Live camera: the FOV the game really renders with. Every frame while zoomed, once more to hand the value back.
-    m_CamScan -= p_Dt;
-    if (m_CamFovs.empty() && m_CamScan <= 0.0f) {
-        m_CamScan = 2.0f;
-        ScanCameraFov();
-    }
-    bool s_Overriding = false;
-    for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
-    if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
-    if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
-
-    // The camera profile values are only the fallback when no live camera FOV could be found (writing both would zoom twice).
-    if (m_CamFovs.empty()) {
-        if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
-            WriteZoomFov(m_ZoomCur);
-            m_ZoomWritten = m_ZoomCur;
+    // Two ways to zoom, only one is used at a time (using both would zoom twice):
+    //  - camera profiles (default): the UnAimed profiles' FOV is what the game uses for right mouse without a weapon. The game
+    //    keeps reading it, so a smaller value there is a real zoom, and aiming a weapon is never touched.
+    //  - live camera: the FOV the game renders with, written every frame (this is what zoomed weapon aiming before).
+    {
+        bool s_Overriding = false;
+        for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
+        if (m_ZoomLiveCam) {
+            m_CamScan -= p_Dt;
+            if (m_CamFovs.empty() && m_CamScan <= 0.0f) {
+                m_CamScan = 2.0f;
+                ScanCameraFov();
+            }
+            if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
+            if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
+            if (m_ZoomWritten != 1.0f) { // switched method: give the profiles back to the game
+                WriteZoomFov(1.0f);
+                m_ZoomWritten = 1.0f;
+            }
+        } else {
+            if (s_Overriding) ApplyCameraFov(1.0f); // switched method: hand the live camera value back
+            if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
+                WriteZoomFov(m_ZoomCur);
+                m_ZoomWritten = m_ZoomCur;
+            }
         }
-    } else if (m_ZoomWritten != 1.0f) {
-        WriteZoomFov(1.0f); // give the profiles back to the game
-        m_ZoomWritten = 1.0f;
     }
 
     m_PrevRightDown = s_RightDown;
@@ -3915,6 +3923,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             }
             if (ImGui::Button("Dump inventory info to log")) m_DumpRequest = true;
             ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
+            if (ImGui::Checkbox("Use the live camera FOV instead of the camera profiles", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
             ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
         }
 
