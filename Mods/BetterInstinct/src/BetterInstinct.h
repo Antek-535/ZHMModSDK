@@ -135,8 +135,8 @@ private:
     void UpdateZoom(float p_Dt);
     bool HeldItemAllowsZoom();
     void WriteZoomFov(float p_Zoom);
-    void DumpHeldItemInfo();                       // diagnostic: writes the player's character/inventory properties to BetterInstinct.log
-    std::atomic<bool> m_DumpRequest{false};
+    void DumpHeldItemInfo(const wchar_t* p_FileName);                       // diagnostic: writes the player's character/inventory properties to BetterInstinct.log
+    std::atomic<int> m_DumpRequest{0};             // 1 = dump with empty hands, 2 = dump while holding a weapon
     void CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity);
     struct SZoomProfile {
         ZEntityRef Ref;
@@ -290,7 +290,7 @@ private:
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
-    bool m_ZoomLiveCam = false;       // false = scale the UnAimed camera profiles (empty hands); true = scale the live camera FOV instead
+    bool m_ZoomLiveCam = true;        // true = scale the live camera FOV (works); false = scale the UnAimed camera profiles (never found them in the logs)
     bool m_ZoomAnyItem = false;      // skip the held-item check (zoom with anything in hand): off, zoom is for empty hands only
 
     bool m_HudEnabled = true;
