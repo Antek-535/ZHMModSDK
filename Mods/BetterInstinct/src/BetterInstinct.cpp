@@ -1381,6 +1381,16 @@ inline uint32_t FloatBits(float p_F) {
 } // namespace
 
 // One short log file (BetterInstinct.log, next to the config) with the result of the last color search.
+static void ZoomLog(const std::string& p_Text) {
+    try {
+        std::wstring s_Dir = ConfigDir();
+        if (s_Dir.empty()) return;
+        std::ofstream s_File(fs::path(s_Dir) / L"BetterInstinct_zoom.log", std::ios::trunc);
+        s_File << p_Text;
+    } catch (...) {
+    }
+}
+
 static void GlowLog(const std::string& p_Text) {
     try {
         std::wstring s_Dir = ConfigDir();
@@ -1983,6 +1993,43 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     const int s_Delta = g_Wheel.exchange(0);
     m_WheelSeen.fetch_add(s_Delta);
     m_ZoomGateNow.store(s_Gate);
+
+    // --- diagnostics: what the zoom sees while right mouse is held (file BetterInstinct_zoom.log, next to the config) ---
+    {
+        auto s_Log = [&](const std::string& p_Line) {
+            m_ZoomLogBuf += p_Line + "\n";
+            if (m_ZoomLogBuf.size() > 14000) m_ZoomLogBuf.erase(0, m_ZoomLogBuf.size() - 10000);
+            m_ZoomLogDirty = true;
+        };
+        char s_B[512];
+        if (s_RightDown != m_PrevRightDown) s_Log(s_RightDown ? "--- right mouse DOWN" : "--- right mouse UP");
+        if (s_Delta != 0) {
+            std::snprintf(s_B, sizeof(s_B), "wheel delta=%d  gate=%d (zoomEnabled=%d itemOk=%d holding=%d)", s_Delta, s_Gate ? 1 : 0,
+                          m_ZoomEnabled ? 1 : 0, s_ItemOk ? 1 : 0, m_ItemHolding ? 1 : 0);
+            s_Log(s_B);
+        }
+        m_ZoomLogTimer -= p_Dt;
+        if (s_RightDown && m_ZoomLogTimer <= 0.0f) {
+            m_ZoomLogTimer = 0.5f;
+            std::string s_Live;
+            {
+                std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+                s_Live = m_CamLive;
+            }
+            std::snprintf(s_B, sizeof(s_B),
+                          "state: gate=%d itemState=%d wheelTotal=%d target=%.2f cur=%.2f written=%.2f method=%s profilesFound=%u "
+                          "profileFov=%.2f (vanilla %.2f) writes=%u camFovs=%zu",
+                          s_Gate ? 1 : 0, m_ItemState.load(), m_WheelSeen.load(), m_ZoomTarget, m_ZoomCur, m_ZoomWritten,
+                          m_ZoomLiveCam ? "live" : "profiles", m_ZoomFound.load(), m_ZoomReadback.load(), m_ZoomReadbackVan.load(),
+                          m_ZoomWrites.load(), m_CamFovs.size());
+            s_Log(s_B);
+            if (!s_Live.empty()) s_Log("live camera: " + s_Live);
+        }
+        if (m_ZoomLogDirty && (!s_RightDown || m_ZoomLogTimer > 0.4f)) { // on release, and about every 2 s while held
+            ZoomLog(m_ZoomLogBuf);
+            m_ZoomLogDirty = false;
+        }
+    }
     if (s_Gate && s_Delta != 0) {
         m_ZoomTarget *= std::pow(m_ZoomStep, static_cast<float>(s_Delta) / 120.0f);
     }
