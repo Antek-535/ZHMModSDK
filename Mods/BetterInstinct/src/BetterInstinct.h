@@ -146,6 +146,12 @@ private:
     // Writes the chosen colors straight into the glow config entity while the game is activating it, i.e. BEFORE the
     // game reads them (the same moment a data patch would change them).
     void ApplyGlowOnActivate(const ZEntityRef* p_Ref);
+    // Template hook: runs right after the game has built an entity template and set all its properties from the data.
+    // The Instinct glow config entity is found here by its entity id, and its colors are written before anything reads them.
+    DECLARE_PLUGIN_DETOUR(BetterInstinct, void, ZTemplateEntityFactory_ConfigureEntity, ZTemplateEntityFactory* th, ZEntityType** pEntity, const SExternalReferences& externalRefs, uint8_t* unk0);
+    void CheckTemplateForGlow(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity);
+    std::atomic<uint32_t> m_GlowTplCalls{0};                // how often the template hook ran (shows the hook is alive)
+    std::atomic<uint32_t> m_GlowTplHits{0};                 // how often it found an entity with the glow config id
     std::mutex m_PreMutex;
     std::map<uintptr_t, std::array<float, 4>> m_PreVanilla; // color address -> the game's own value, remembered before we write
     std::atomic<uint32_t> m_GlowPreApplied{0};              // how many color values were written at activation (shown in the UI)
