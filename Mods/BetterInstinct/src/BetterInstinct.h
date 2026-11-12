@@ -129,6 +129,27 @@ private:
     std::atomic<uint32_t> m_GlowSkipped{0};
     std::atomic<uint32_t> m_GlowScanned{0};
 
+    // Better Zoom: hold right mouse while the hands are empty (or hold something that can't be thrown) and turn the mouse
+    // wheel to zoom in further than the game allows. The game's over-the-shoulder camera profiles have a field of view
+    // (m_fFOV); we remember their vanilla values and write a narrower one while zooming.
+    void UpdateZoom(float p_Dt);
+    bool HeldItemAllowsZoom();
+    void WriteZoomFov(float p_Zoom);
+    void DumpHeldItemInfo();                       // diagnostic: writes the player's character/inventory properties to BetterInstinct.log
+    std::atomic<bool> m_DumpRequest{false};
+    void CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity);
+    struct SZoomProfile {
+        ZEntityRef Ref;
+        float VanillaFov = 30.0f;
+    };
+    std::vector<SZoomProfile> m_ZoomProfiles;      // guarded by m_ZoomMutex
+    std::mutex m_ZoomMutex;
+    float m_ZoomTarget = 1.0f;                     // what the wheel asked for
+    float m_ZoomCur = 1.0f;                        // smoothed value actually applied
+    float m_ZoomWritten = 1.0f;                    // last value written to the profiles
+    std::atomic<uint32_t> m_ZoomFound{0};          // camera profiles found (shown in the UI)
+    std::atomic<uint32_t> m_ZoomWrites{0};
+
     bool InstinctKeyDown() const;
     void ForceReleaseInstinct();
 
@@ -218,6 +239,13 @@ private:
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
 
+    bool m_ZoomEnabled = true;       // wheel zoom while holding right mouse (empty hands / non-throwable item)
+    float m_ZoomMax = 5.0f;          // furthest zoom, 1 = vanilla
+    float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
+    float m_ZoomSmooth = 10.0f;      // higher = snappier
+    bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
+    bool m_ZoomAnyItem = false;      // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
+
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
     bool m_HudVertical = false;      // false = horizontal bar, true = vertical bar (fills upward)
@@ -230,6 +258,9 @@ private:
     float m_HudOpacity = 0.95f;
     float m_FillColor[3] = {1.00f, 0.78f, 0.28f}; // gold
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
+    float m_BarBottom[3] = {1.00f, 0.50f, 0.10f}; // color at the bottom (start) of the bar: orange
+    float m_BarTop[3] = {1.00f, 0.88f, 0.25f};    // color at the top (end) of the bar: yellow
+    bool m_ShowIcon = true;                       // round flame icon at the bottom of the bar
 
     bool m_TintRemove = false;       // no Instinct color at all: the grey grading is replaced by an identity LUT (outlines only)
     bool m_TintEnabled = false;      // off by default, so existing setups look exactly as before
