@@ -948,6 +948,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("zoom_smooth", m_ZoomSmooth);
         s_Bool("zoom_remember", m_ZoomRemember);
         s_Bool("zoom_any_item", m_ZoomAnyItem);
+        s_Bool("zoom_live_cam", m_ZoomLiveCam);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1080,6 +1081,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
     s_Bool("zoom_remember", m_ZoomRemember);
     s_Bool("zoom_any_item", m_ZoomAnyItem);
+    s_Bool("zoom_live_cam", m_ZoomLiveCam);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1539,6 +1541,7 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
     static const uint32_t s_FovId = Hash::Crc32("m_fFOV");
     for (const ZEntityRef& s_Ref : s_Hits) {
         float s_Fov = 0.0f;
+        const float* s_FovPtr = nullptr;
         auto s_Read = [&]() {
             ZEntityImpl* s_Entity = s_Ref.GetEntity();
             ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
@@ -1549,18 +1552,20 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
             const uint8_t* s_Ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Data->m_nPropertyOffset);
             if (!CanWriteMemory(s_Ptr, sizeof(float))) return;
             std::memcpy(&s_Fov, s_Ptr, sizeof(float));
+            s_FovPtr = reinterpret_cast<const float*>(s_Ptr);
         };
         if (!SafeCall(s_Read) || !std::isfinite(s_Fov) || s_Fov < 5.0f || s_Fov > 120.0f) continue; // not a sane FOV: leave it alone
 
         std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
         bool s_Known = false;
         for (SZoomProfile& s_P : m_ZoomProfiles) {
-            if (s_P.Ref.GetEntity() == s_Ref.GetEntity()) { s_P.VanillaFov = s_Fov; s_Known = true; }
+            if (s_P.Ref.GetEntity() == s_Ref.GetEntity()) { s_P.VanillaFov = s_Fov; s_P.Ptr = s_FovPtr; s_Known = true; }
         }
         if (!s_Known) {
             SZoomProfile s_New;
             s_New.Ref = s_Ref;
             s_New.VanillaFov = s_Fov; // read before we ever write, so this is the game's own value
+            s_New.Ptr = s_FovPtr;
             m_ZoomProfiles.push_back(s_New);
         }
         m_ZoomFound.store(static_cast<uint32_t>(m_ZoomProfiles.size()));
@@ -1658,6 +1663,68 @@ void BetterInstinct::DumpHeldItemInfo() {
     GlowLog(s_Out);
 }
 
+void BetterInstinct::ScanCameraFov() {
+    m_CamFovs.clear();
+    std::string s_Info;
+    auto s_Body = [&]() {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) { s_Info = "no player"; return; }
+        ZEntityRef s_Ref = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
+        ZEntityImpl* s_Entity = s_Ref.GetEntity();
+        ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+        if (!s_Type || !s_Type->m_pPropertyData) { s_Info = "main camera has no properties"; return; }
+        for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+            const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+            if (!s_NI || !s_NI->m_pszPropertyName) continue;
+            std::string s_Name = s_NI->m_pszPropertyName;
+            std::string s_Lower = s_Name;
+            for (char& ch : s_Lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (s_Lower.find("fov") == std::string::npos) continue;
+            const SPropertyInfo& s_PI = s_NI->m_propertyInfo;
+            if (s_PI.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
+            const IType* s_T = s_PI.m_Type ? s_PI.m_Type->GetTypeInfo() : nullptr;
+            if (!s_T || s_T->m_nTypeSize != 4) continue;
+            float* s_Ptr = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_P.m_nPropertyOffset);
+            if (!CanWriteMemory(s_Ptr, sizeof(float))) continue;
+            const float s_V = *s_Ptr;
+            if (!std::isfinite(s_V) || s_V < 0.01f || s_V > 150.0f) continue;
+            SCamFov s_F;
+            s_F.Ptr = s_Ptr;
+            s_F.Base = s_V;
+            s_F.Name = s_Name;
+            m_CamFovs.push_back(s_F);
+            s_Info += s_Name + "=" + std::to_string(s_V) + " ";
+        }
+        if (s_Info.empty()) s_Info = "no FOV property on the main camera";
+    };
+    if (!SafeCall(s_Body)) { m_CamFovs.clear(); s_Info = "scan failed"; }
+    std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+    m_CamInfo = s_Info;
+}
+
+// Scales the live camera's FOV every frame while zooming. If the game rewrites the value each frame we see a value that
+// isn't ours and take it as the new base; if it doesn't, the base stays the value we first saw.
+void BetterInstinct::ApplyCameraFov(float p_Zoom) {
+    for (SCamFov& s_F : m_CamFovs) {
+        if (!s_F.Ptr || !CanWriteMemory(s_F.Ptr, sizeof(float))) continue;
+        const float s_Cur = *s_F.Ptr;
+        if (!std::isfinite(s_Cur)) continue;
+        if (s_F.Last == 0.0f || std::abs(s_Cur - s_F.Last) > 0.0005f) s_F.Base = s_Cur; // the game changed it: new base
+        if (p_Zoom > 1.0005f && s_F.Base > 0.01f) {
+            const bool s_Rad = s_F.Base < 3.2f; // looks like radians
+            const float s_Half = (s_Rad ? s_F.Base : s_F.Base * 3.14159265f / 180.0f) * 0.5f;
+            float s_New = 2.0f * std::atan(std::tan(s_Half) / p_Zoom);
+            if (!s_Rad) s_New = s_New * 180.0f / 3.14159265f;
+            s_New = std::max(s_New, s_Rad ? 0.02f : 1.0f);
+            *s_F.Ptr = s_New;
+            s_F.Last = s_New;
+        } else if (s_F.Last != 0.0f) {
+            if (std::abs(s_Cur - s_F.Last) <= 0.0005f) *s_F.Ptr = s_F.Base; // hand it back
+            s_F.Last = 0.0f;
+        }
+    }
+}
+
 void BetterInstinct::UpdateZoom(float p_Dt) {
     if (m_DumpRequest.exchange(false)) DumpHeldItemInfo();
     const bool s_Focused = GameIsForeground() && !m_Binding;
@@ -1679,6 +1746,27 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
         WriteZoomFov(m_ZoomCur);
         m_ZoomWritten = m_ZoomCur;
+    }
+
+    // Live camera (every frame while zoomed, once more to hand the value back).
+    if (m_ZoomLiveCam) {
+        m_CamScan -= p_Dt;
+        if (m_CamFovs.empty() && m_CamScan <= 0.0f) {
+            m_CamScan = 2.0f;
+            ScanCameraFov();
+        }
+        bool s_Overriding = false;
+        for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
+        if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
+    }
+
+    // Read back the first profile's FOV for the UI (shows whether our write sticks).
+    {
+        std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+        if (!m_ZoomProfiles.empty() && m_ZoomProfiles[0].Ptr && CanWriteMemory(m_ZoomProfiles[0].Ptr, sizeof(float))) {
+            m_ZoomReadback.store(*m_ZoomProfiles[0].Ptr);
+            m_ZoomReadbackVan.store(m_ZoomProfiles[0].VanillaFov);
+        }
     }
 }
 
@@ -2199,6 +2287,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
                 m_ZoomProfiles.clear(); // the mission's entities are gone
             }
             m_ZoomFound.store(0);
+            m_CamFovs.clear();
             m_ZoomTarget = m_ZoomCur = m_ZoomWritten = 1.0f;
             g_ZoomWanted.store(false);
             m_Meter = 1.0f;
@@ -3486,6 +3575,12 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
             if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
             if (ImGui::Checkbox("Zoom with any item (temporary, no item check yet)", &m_ZoomAnyItem)) s_Changed = true;
+            if (ImGui::Checkbox("Also zoom the live camera (recommended)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
+            ImGui::TextDisabled("Profile FOV now: %.1f (game's own: %.1f)", m_ZoomReadback.load(), m_ZoomReadbackVan.load());
+            {
+                std::lock_guard<std::mutex> s_InfoLock(m_ZoomMutex);
+                ImGui::TextDisabled("Live camera FOV: %s", m_CamInfo.empty() ? "not scanned yet" : m_CamInfo.c_str());
+            }
             if (ImGui::Button("Dump inventory info to log")) m_DumpRequest = true;
             ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
             ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
