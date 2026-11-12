@@ -1506,18 +1506,18 @@ void BetterInstinct::ApplyGlowOnActivate(const ZEntityRef* p_Ref) {
 // ---------------------------------------------------------------------------
 // Better Zoom
 // ---------------------------------------------------------------------------
-// Camera profile entities (template 00852016D29CC8A3): OTS_Master01, OTSHigh01, OTSLow, CoverHighOTS01, CoverLowOTS01.
+// Camera profile entities (template 00852016D29CC8A3): UnAimed_Master, UnAimedHigh01, UnAimedLow01.
 // Their m_fFOV is the aim camera's field of view. A smaller FOV = more zoom.
 
 void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity) {
     if (!p_Factory || !p_Entity) return;
 
     static constexpr uint64_t s_Ids[] = {
-        0x986AC0B7847DC618ULL, // OTS_Master01
-        0xB0EA3D50DCBB1A7AULL, // OTSHigh01
-        0x6793005D38EFC567ULL, // OTSLow
-        0x0997FA17BEB4FBB1ULL, // CoverHighOTS01
-        0xC21FA7B9826A5E20ULL, // CoverLowOTS01
+        // "UnAimed" = the camera used when you hold right mouse without aiming a weapon (empty hands, or an item you can't
+        // throw). The weapon aim cameras (OTS_*) are deliberately NOT in this list, so aiming a gun stays vanilla.
+        0x3018A88CA650837BULL, // UnAimed_Master (FOV 35)
+        0x1079A3300281DC7AULL, // UnAimedHigh01 (FOV 30)
+        0x7EACB3E21DF563F8ULL, // UnAimedLow01 (FOV 30)
     };
     std::vector<ZEntityRef> s_Hits;
     auto s_Look = [&]() {
@@ -1577,7 +1577,9 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
 // TODO: wire this to the held item. It needs the item/inventory API of the SDK fork (ZHitman5.h / ZItem.h).
 // Until then the check is the "Zoom with any item" option, so the feature is switched off by default.
 bool BetterInstinct::HeldItemAllowsZoom() {
-    return m_ZoomAnyItem;
+    // Not needed: only the UnAimed camera profiles are zoomed (see CheckTemplateForZoom), and the game uses those exactly
+    // when you hold right mouse without aiming a weapon.
+    return true;
 }
 
 void BetterInstinct::WriteZoomFov(float p_Zoom) {
@@ -3104,7 +3106,17 @@ std::vector<uint8_t> LutIdentity(const std::vector<uint8_t>& p_Base, int p_W, in
 
 fs::path LutCachePath() {
     const std::wstring s_Dir = ConfigDir();
-    return s_Dir.empty() ? fs::path() : fs::path(s_Dir) / L"instinct_lut_base.bin";
+    // v2: older cache files could contain an already recolored LUT (so "off" restored a tinted look); they are ignored.
+    return s_Dir.empty() ? fs::path() : fs::path(s_Dir) / L"instinct_lut_base_v2.bin";
+}
+
+// Process-wide marker (an environment variable survives a plugin reload): set while we have written our recolored LUT
+// into the game's texture, cleared when the vanilla LUT is back. A readback taken while it is set is NOT vanilla.
+bool LutTouched() {
+    return GetEnvironmentVariableW(L"BETTERINSTINCT_LUT_TOUCHED", nullptr, 0) > 0;
+}
+void SetLutTouched(bool p_Touched) {
+    SetEnvironmentVariableW(L"BETTERINSTINCT_LUT_TOUCHED", p_Touched ? L"1" : nullptr);
 }
 
 } // namespace
@@ -3178,33 +3190,60 @@ bool BetterInstinct::EnsureLut() {
             return false;
         }
 
-        // Vanilla pixels: from the cache file when there is one (so a plugin reload can never mistake our own
-        // recolored texture for the vanilla one), otherwise read back from the GPU and cache.
+        // Vanilla pixels. While our recolored LUT is NOT in the texture (the normal case, also after "custom color" was
+        // switched off), the live texture IS the vanilla LUT, so it is read from the GPU and the cache file is refreshed
+        // from it. This also repairs a cache file that ever got a recolored LUT (that is what made "off" restore a weak,
+        // tinted look instead of the grey). Only when our recolored LUT may still be in the texture (plugin reload) the
+        // cache file is used instead, because a readback would not be vanilla then.
         const size_t s_Bytes = static_cast<size_t>(s_Gpu->m_Desc.Width) * s_Gpu->m_Desc.Height * 4;
         const fs::path s_Cache = LutCachePath();
-        bool s_Have = false;
+        bool s_Have = false;   // the pixels come from the cache file
+        bool s_Approx = false; // grey approximation (no vanilla pixels available)
+        std::vector<uint8_t> s_Cached;
         if (!s_Cache.empty()) {
             std::ifstream s_In(s_Cache, std::ios::binary);
             if (s_In) {
                 std::vector<uint8_t> s_Data((std::istreambuf_iterator<char>(s_In)), std::istreambuf_iterator<char>());
-                if (s_Data.size() == s_Bytes) {
-                    s_Gpu->m_Base = std::move(s_Data);
-                    s_Have = true;
-                }
+                if (s_Data.size() == s_Bytes) s_Cached = std::move(s_Data);
             }
         }
-        if (!s_Have) {
+        const bool s_Touched = LutTouched();
+        if (s_Touched && !s_Cached.empty()) {
+            s_Gpu->m_Base = std::move(s_Cached);
+            s_Have = true;
+        } else if (!s_Touched && !LutReadback(*s_Gpu, m_LutBarrier, s_Err)) {
+            if (s_Cached.empty()) {
+                delete s_Gpu;
+                SetLutStatus(2, "Instinct LUT: " + s_Err + ".");
+                return false;
+            }
+            s_Gpu->m_Base = std::move(s_Cached); // readback failed: the cache file is the best we have
+            s_Have = true;
+        } else if (s_Touched) {
+            // Our recolored LUT is (or was) in the texture and there is no cache file: a readback is not the vanilla look.
+            // Use a plain grey version of the identity LUT instead (close to the grey Instinct look) and do not cache it.
             if (!LutReadback(*s_Gpu, m_LutBarrier, s_Err)) {
                 delete s_Gpu;
                 SetLutStatus(2, "Instinct LUT: " + s_Err + ".");
                 return false;
             }
-            if (!s_Cache.empty()) {
-                std::error_code s_Ec;
-                fs::create_directories(s_Cache.parent_path(), s_Ec);
-                std::ofstream s_Out(s_Cache, std::ios::binary | std::ios::trunc);
-                if (s_Out) s_Out.write(reinterpret_cast<const char*>(s_Gpu->m_Base.data()), static_cast<std::streamsize>(s_Gpu->m_Base.size()));
+            std::string s_IdErr;
+            std::vector<uint8_t> s_Id = LutIdentity(s_Gpu->m_Base, static_cast<int>(s_Gpu->m_Desc.Width), static_cast<int>(s_Gpu->m_Desc.Height), s_IdErr);
+            if (!s_Id.empty()) {
+                for (size_t k = 0; k + 3 < s_Id.size(); k += 4) {
+                    const float s_L = 0.2126f * s_Id[k] + 0.7152f * s_Id[k + 1] + 0.0722f * s_Id[k + 2];
+                    const uint8_t s_G = static_cast<uint8_t>(std::clamp(std::lround(s_L), 0L, 255L));
+                    s_Id[k] = s_Id[k + 1] = s_Id[k + 2] = s_G;
+                }
+                s_Gpu->m_Base = std::move(s_Id);
+                s_Approx = true;
             }
+        } else if (!s_Cache.empty() && s_Gpu->m_Base != s_Cached) {
+            // Untouched texture = vanilla: (re)write the cache from it.
+            std::error_code s_Ec;
+            fs::create_directories(s_Cache.parent_path(), s_Ec);
+            std::ofstream s_Out(s_Cache, std::ios::binary | std::ios::trunc);
+            if (s_Out) s_Out.write(reinterpret_cast<const char*>(s_Gpu->m_Base.data()), static_cast<std::streamsize>(s_Gpu->m_Base.size()));
         }
 
         m_Lut = s_Gpu;
@@ -3212,7 +3251,7 @@ bool BetterInstinct::EnsureLut() {
         m_LutAppliedSig = 0;
         std::snprintf(s_Buf, sizeof(s_Buf), "Instinct LUT found (resource #%zu, %ux%u, DXGI %d, %s, %s).", i,
                       static_cast<unsigned>(s_Gpu->m_Desc.Width), s_Gpu->m_Desc.Height, static_cast<int>(s_Gpu->m_Desc.Format),
-                      s_How.c_str(), s_Have ? "vanilla pixels from cache" : "vanilla pixels read from the GPU");
+                      s_How.c_str(), s_Have ? "vanilla pixels from cache" : (s_Approx ? "grey approximation, the texture was already recolored" : "vanilla pixels read from the GPU"));
         SetLutStatus(3, s_Buf);
         return true;
     }
@@ -3225,7 +3264,7 @@ bool BetterInstinct::EnsureLut() {
 void BetterInstinct::RestoreTint() {
     if (m_Lut && m_LutApplied && m_HasPlayer.load() && LutStillValid()) {
         std::string s_Err;
-        LutWrite(*m_Lut, m_LutBarrier, m_Lut->m_Base, s_Err);
+        if (LutWrite(*m_Lut, m_LutBarrier, m_Lut->m_Base, s_Err)) SetLutTouched(false);
     }
     ReleaseLut();
 }
@@ -3247,7 +3286,10 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     }
 
     const bool s_Mod = m_TintEnabled || m_TintRemove; // do we want the texture changed at all?
-    if (!s_Mod && !m_Lut) return; // nothing to do and nothing to undo
+    // Our recolored LUT may still be in the texture although no color is wanted any more (we lost track of it, e.g. after
+    // a plugin reload or leaving a mission): it must be put back, otherwise a tinted/weak Instinct look stays.
+    const bool s_Stray = !s_Mod && LutTouched();
+    if (!s_Mod && !s_Stray && !m_Lut) return; // nothing to do and nothing to undo
 
     m_LutPoll -= p_Dt;
     m_LutCooldown -= p_Dt;
@@ -3255,9 +3297,13 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
     if (m_Lut && !LutStillValid()) ReleaseLut();
 
     if (!m_Lut) {
-        if (!s_Mod || m_LutPoll > 0.0f) return;
+        if ((!s_Mod && !s_Stray) || m_LutPoll > 0.0f) return;
         m_LutPoll = 2.0f; // searching walks the whole resource list: only every couple of seconds
         if (!EnsureLut()) return;
+        if (s_Stray) { // unknown content: force the vanilla LUT to be written back below
+            m_LutApplied = true;
+            m_LutAppliedSig = 1;
+        }
     }
 
     // What should the texture contain right now?
@@ -3296,6 +3342,7 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
             SetLutStatus(2, "Could not remove the Instinct color: " + s_Err + ". The vanilla look stays.");
             m_LutFailSig.store(s_Sig);
         } else if (LutWrite(*m_Lut, m_LutBarrier, s_Image, s_Err)) {
+            SetLutTouched(true);
             m_LutApplied = true;
             m_LutAppliedSig = s_Sig;
             ++m_LutWrites;
@@ -3308,9 +3355,13 @@ void BetterInstinct::UpdateTint(float p_Dt, bool /*p_Active*/) {
         }
     } else {
         if (LutWrite(*m_Lut, m_LutBarrier, m_Lut->m_Base, s_Err)) {
+            SetLutTouched(false);
             m_LutApplied = false;
             m_LutAppliedSig = 0;
             SetLutStatus(3, "Instinct color is off (vanilla LUT restored).");
+        } else {
+            SetLutStatus(2, "Could not restore the vanilla Instinct LUT: " + s_Err + ". Retrying...");
+            m_LutCooldown = 1.0f;
         }
     }
 }
@@ -3717,8 +3768,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
             if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
-            if (ImGui::Checkbox("Zoom with any item (temporary, no item check yet)", &m_ZoomAnyItem)) s_Changed = true;
-            if (ImGui::Checkbox("Also zoom the live camera (recommended)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
+            if (ImGui::Checkbox("Also zoom the live camera (also zooms weapon aiming)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
             ImGui::TextDisabled("Profile FOV now: %.1f (game's own: %.1f)", m_ZoomReadback.load(), m_ZoomReadbackVan.load());
             {
                 std::lock_guard<std::mutex> s_InfoLock(m_ZoomMutex);
