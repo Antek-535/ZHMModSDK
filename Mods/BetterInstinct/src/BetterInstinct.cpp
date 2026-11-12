@@ -1744,6 +1744,23 @@ void BetterInstinct::ScanCameraFov() {
     auto s_Walk = [&]() {
         auto s_Local = SDK()->GetLocalPlayer();
         if (!s_Local.m_pInterfaceRef) { s_Info = "no player"; return; }
+        // Direct access to the camera entity's own FOV member (the reflection scan below does not see it).
+        {
+            ZEntityRef s_CamRef = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
+            ZCameraEntity* s_Cam = s_CamRef ? s_CamRef.QueryInterface<ZCameraEntity>() : nullptr;
+            if (s_Cam) {
+                SCamFov s_F;
+                s_F.Ptr = &s_Cam->m_fFovYDeg;
+                s_F.Ref = s_CamRef;
+                s_F.Name = "camera.m_fFovYDeg";
+                float s_V = 0.0f;
+                if (CanWriteMemory(s_F.Ptr, sizeof(float)) && ReadCamFov(s_F, s_V) && s_V > 0.01f && s_V < 150.0f) {
+                    s_F.Base = s_V;
+                    m_CamFovs.push_back(s_F);
+                    s_Info += s_F.Name + "=" + std::to_string(s_V) + " ";
+                }
+            }
+        }
         s_ScanEntity("camera", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
         s_ScanEntity("player", s_Local.m_entityRef);
         auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
@@ -3296,7 +3313,7 @@ void BetterInstinct::DrawHud() {
     const float s_HalfAcross = (s_Vert ? s_Girth : s_BarLen) * 0.5f;
     const float s_Cx = std::clamp(s_Screen.x * std::clamp(m_HudX, 0.0f, 1.0f), s_HalfAcross,
                                   std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
-    const float s_IconR = std::max(7.0f, 12.0f * s_Ui);
+    const float s_IconR = s_Girth * 0.5f; // icon diameter = bar width
     const float s_LabelRoom = 4.0f * s_Ui;
     const float s_BelowRoom = (s_Vert && m_ShowIcon) ? (s_IconR * 2.0f + 6.0f * s_Ui) : 0.0f; // vertical bar: the icon sits under it
     const float s_MinBottom = (s_Vert ? s_BarLen : s_Girth) + s_LabelRoom;
