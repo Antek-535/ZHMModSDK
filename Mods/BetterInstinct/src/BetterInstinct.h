@@ -157,6 +157,25 @@ private:
     std::vector<SCamFov> m_CamFovs;                // game thread only
     float m_CamScan = 0.0f;
     bool m_PrevRightDown = false;
+
+    // Held-item check: the zoom only works with empty hands. The game's character/inventory objects are searched for
+    // reflected properties that say "something is in the hands" (held/current/equipped/carried item, weapon in hand...).
+    // A property only counts after it has been seen empty once, so constant pointers can never block the zoom for good.
+    struct SItemProbe {
+        ZEntityRef Ref;
+        const uint8_t* Ptr = nullptr;              // where the value lives inside the game's entity
+        uint32_t Size = 0;                         // 1 = flag, 8 / 16 = entity reference
+        std::string Name;
+        bool SeenEmpty = false;                    // has been empty at least once (so it is a real indicator)
+    };
+    std::vector<SItemProbe> m_ItemProbes;          // game thread only
+    float m_ItemScan = 0.0f;
+    bool m_ItemHolding = false;                    // something is in 47's hands right now
+    std::atomic<int> m_ItemState{0};               // 0 no property found, 1 learning, 2 hands empty, 3 holding something (UI)
+    std::string m_ItemInfo;                        // names of the properties used (UI), guarded by m_ZoomMutex
+    void ScanItemProbes();
+    bool ReadItemProbe(const SItemProbe& p_P, bool& p_Out);
+    void UpdateHeldItem(float p_Dt);
     void ScanCameraFov();
     void ApplyCameraFov(float p_Zoom);
     std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
@@ -268,8 +287,8 @@ private:
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
-    bool m_ZoomLiveCam = false;       // also scale the live camera's FOV (the profile values alone had almost no effect)
-    bool m_ZoomAnyItem = true;       // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
+    bool m_ZoomLiveCam = true;        // always on now: the live camera's FOV is what really zooms (profile values alone had almost no effect)
+    bool m_ZoomAnyItem = false;      // skip the held-item check (zoom with anything in hand): off, zoom is for empty hands only
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
