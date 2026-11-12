@@ -1664,41 +1664,100 @@ void BetterInstinct::DumpHeldItemInfo() {
     GlowLog(s_Out);
 }
 
+bool BetterInstinct::ReadCamFov(const SCamFov& p_F, float& p_Out) {
+    bool s_Ok = false;
+    auto s_Body = [&]() {
+        if (p_F.Ptr) {
+            if (!CanWriteMemory(p_F.Ptr, sizeof(float))) return;
+            p_Out = *p_F.Ptr;
+        } else {
+            if (!p_F.Ref.GetEntity()) return;
+            p_Out = p_F.Ref.GetProperty<float>(p_F.PropId);
+        }
+        s_Ok = std::isfinite(p_Out);
+    };
+    if (!SafeCall(s_Body)) return false;
+    return s_Ok;
+}
+
+void BetterInstinct::WriteCamFov(const SCamFov& p_F, float p_Value) {
+    auto s_Body = [&]() {
+        if (p_F.Ptr) {
+            if (CanWriteMemory(p_F.Ptr, sizeof(float))) *p_F.Ptr = p_Value;
+        } else if (p_F.Ref.GetEntity()) {
+            p_F.Ref.SetProperty<float>(p_F.PropId, p_Value, true);
+        }
+    };
+    SafeCall(s_Body);
+}
+
+// Looks for float properties with "fov" in the name on the player's camera AND on the player / character / sub-controllers,
+// because the aim FOV is not necessarily stored on the camera entity itself. Properties that only have a getter/setter
+// are handled too (they are read and written through the property system).
 void BetterInstinct::ScanCameraFov() {
     m_CamFovs.clear();
     std::string s_Info;
-    auto s_Body = [&]() {
+    uint32_t s_Checked = 0;
+
+    auto s_ScanEntity = [&](const std::string& p_Label, ZEntityRef p_Ref) {
+        ++s_Checked;
+        auto s_Body = [&]() {
+            ZEntityImpl* s_Entity = p_Ref.GetEntity();
+            ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+            if (!s_Type || !s_Type->m_pPropertyData) return;
+            for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+                const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                if (!s_NI || !s_NI->m_pszPropertyName) continue;
+                std::string s_Name = s_NI->m_pszPropertyName;
+                std::string s_Lower = s_Name;
+                for (char& ch : s_Lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (s_Lower.find("fov") == std::string::npos) continue;
+                const SPropertyInfo& s_PI = s_NI->m_propertyInfo;
+                const IType* s_T = s_PI.m_Type ? s_PI.m_Type->GetTypeInfo() : nullptr;
+                if (!s_T || s_T->m_nTypeSize != 4) continue;
+
+                SCamFov s_F;
+                s_F.Ref = p_Ref;
+                s_F.PropId = Hash::Crc32(s_Name.c_str());
+                s_F.Name = p_Label + "." + s_Name;
+                if (!(s_PI.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER)) {
+                    s_F.Ptr = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(p_Ref.m_pObj) + s_P.m_nPropertyOffset);
+                    if (!CanWriteMemory(s_F.Ptr, sizeof(float))) continue;
+                    bool s_Dup = false;
+                    for (const SCamFov& s_Old : m_CamFovs) if (s_Old.Ptr == s_F.Ptr) s_Dup = true;
+                    if (s_Dup) continue;
+                }
+                float s_V = 0.0f;
+                if (!ReadCamFov(s_F, s_V)) continue;
+                if (s_V < 0.01f || s_V > 150.0f) continue; // not a sane FOV (degrees or radians)
+                s_F.Base = s_V;
+                m_CamFovs.push_back(s_F);
+                s_Info += s_F.Name + "=" + std::to_string(s_V) + (s_F.Ptr ? " " : "(setter) ");
+            }
+        };
+        SafeCall(s_Body);
+    };
+
+    auto s_Walk = [&]() {
         auto s_Local = SDK()->GetLocalPlayer();
         if (!s_Local.m_pInterfaceRef) { s_Info = "no player"; return; }
-        ZEntityRef s_Ref = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
-        ZEntityImpl* s_Entity = s_Ref.GetEntity();
-        ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
-        if (!s_Type || !s_Type->m_pPropertyData) { s_Info = "main camera has no properties"; return; }
-        for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
-            const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
-            if (!s_NI || !s_NI->m_pszPropertyName) continue;
-            std::string s_Name = s_NI->m_pszPropertyName;
-            std::string s_Lower = s_Name;
-            for (char& ch : s_Lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (s_Lower.find("fov") == std::string::npos) continue;
-            const SPropertyInfo& s_PI = s_NI->m_propertyInfo;
-            if (s_PI.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) continue;
-            const IType* s_T = s_PI.m_Type ? s_PI.m_Type->GetTypeInfo() : nullptr;
-            if (!s_T || s_T->m_nTypeSize != 4) continue;
-            float* s_Ptr = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_P.m_nPropertyOffset);
-            if (!CanWriteMemory(s_Ptr, sizeof(float))) continue;
-            const float s_V = *s_Ptr;
-            if (!std::isfinite(s_V) || s_V < 0.01f || s_V > 150.0f) continue;
-            SCamFov s_F;
-            s_F.Ptr = s_Ptr;
-            s_F.Base = s_V;
-            s_F.Name = s_Name;
-            m_CamFovs.push_back(s_F);
-            s_Info += s_Name + "=" + std::to_string(s_V) + " ";
+        s_ScanEntity("camera", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
+        s_ScanEntity("player", s_Local.m_entityRef);
+        auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
+        if (s_CharRef.m_pInterfaceRef) {
+            s_ScanEntity("character", s_CharRef.m_entityRef);
+            auto& s_ContRef = s_CharRef.m_pInterfaceRef->m_rSubcontrollerContainer;
+            if (s_ContRef.m_pInterfaceRef) {
+                int s_Idx = 0;
+                for (auto& s_Sub : s_ContRef.m_pInterfaceRef->m_aReferencedControllers) {
+                    if (s_Idx >= 60) break;
+                    s_ScanEntity("sub" + std::to_string(s_Idx++), s_Sub.m_entityRef);
+                }
+            }
         }
-        if (s_Info.empty()) s_Info = "no FOV property on the main camera";
     };
-    if (!SafeCall(s_Body)) { m_CamFovs.clear(); s_Info = "scan failed"; }
+    if (!SafeCall(s_Walk)) { m_CamFovs.clear(); s_Info = "scan failed"; }
+    if (s_Info.empty()) s_Info = "no FOV property found (" + std::to_string(s_Checked) + " entities checked)";
     std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
     m_CamInfo = s_Info;
 }
@@ -1707,9 +1766,8 @@ void BetterInstinct::ScanCameraFov() {
 // isn't ours and take it as the new base; if it doesn't, the base stays the value we first saw.
 void BetterInstinct::ApplyCameraFov(float p_Zoom) {
     for (SCamFov& s_F : m_CamFovs) {
-        if (!s_F.Ptr || !CanWriteMemory(s_F.Ptr, sizeof(float))) continue;
-        const float s_Cur = *s_F.Ptr;
-        if (!std::isfinite(s_Cur)) continue;
+        float s_Cur = 0.0f;
+        if (!ReadCamFov(s_F, s_Cur)) continue;
         if (s_F.Last == 0.0f || std::abs(s_Cur - s_F.Last) > 0.0005f) s_F.Base = s_Cur; // the game changed it: new base
         if (p_Zoom > 1.0005f && s_F.Base > 0.01f) {
             const bool s_Rad = s_F.Base < 3.2f; // looks like radians
@@ -1717,10 +1775,10 @@ void BetterInstinct::ApplyCameraFov(float p_Zoom) {
             float s_New = 2.0f * std::atan(std::tan(s_Half) / p_Zoom);
             if (!s_Rad) s_New = s_New * 180.0f / 3.14159265f;
             s_New = std::max(s_New, s_Rad ? 0.02f : 1.0f);
-            *s_F.Ptr = s_New;
+            WriteCamFov(s_F, s_New);
             s_F.Last = s_New;
         } else if (s_F.Last != 0.0f) {
-            if (std::abs(s_Cur - s_F.Last) <= 0.0005f) *s_F.Ptr = s_F.Base; // hand it back
+            if (std::abs(s_Cur - s_F.Last) <= 0.0005f) WriteCamFov(s_F, s_F.Base); // hand it back
             s_F.Last = 0.0f;
         }
     }
@@ -1760,15 +1818,18 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         }
         bool s_Overriding = false;
         for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
+        if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
         if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
     }
 
+    m_PrevRightDown = s_RightDown;
     m_CamLiveTimer -= p_Dt;
     if (m_CamLiveTimer <= 0.0f) {
         m_CamLiveTimer = 0.2f;
         std::string s_Live;
         for (const SCamFov& s_F : m_CamFovs) {
-            if (s_F.Ptr && CanWriteMemory(s_F.Ptr, sizeof(float))) s_Live += s_F.Name + "=" + std::to_string(*s_F.Ptr) + " ";
+            float s_V = 0.0f;
+            if (ReadCamFov(s_F, s_V)) s_Live += s_F.Name + "=" + std::to_string(s_V) + " ";
         }
         std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
         m_CamLive = s_Live;
@@ -3375,7 +3436,6 @@ void BetterInstinct::DrawHud() {
         const ImVec2 s_Ic = s_Vert ? ImVec2(s_Cx, s_Bottom + 4.0f * s_Ui + s_IconR)
                                    : ImVec2(s_Left - 4.0f * s_Ui - s_IconR, (s_Top + s_Bottom) * 0.5f);
         s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(190 * s_A)), 32);
-        s_Dl->AddCircle(s_Ic, s_IconR, s_Col(s_ColBot[0], s_ColBot[1], s_ColBot[2], 0.9f * s_A), 32, s_Thick * 1.5f);
         auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
             const float s_F = s_IconR * 0.5f * p_Scale;
             auto P = [&](float x, float y) { return ImVec2(s_Ic.x + x * s_F, s_Ic.y + p_Dy * s_IconR + y * s_F); };
