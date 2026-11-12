@@ -43,6 +43,7 @@
 #include "Glacier/ZEntityManager.h"
 #include "Glacier/ZGameLoopManager.h"
 #include "Glacier/ZHitman5.h"
+#include "Glacier/ZInventory.h"
 #include "Glacier/ZObject.h"
 #include "Glacier/ZModule.h"
 #include "Glacier/ZScene.h"
@@ -163,6 +164,8 @@ DWORD g_Pid = 0;
 std::atomic<uint32_t> g_KbEvents{0};
 std::atomic<uint32_t> g_MouseEvents{0};
 std::atomic<int> g_LastVk{0};
+std::atomic<int> g_Wheel{0};          // mouse wheel delta collected by the hook (120 = one notch)
+std::atomic<bool> g_ZoomWanted{false}; // zoom is active: the wheel is ours, the game doesn't get it
 constexpr ULONG_PTR kOurMarker = 0x464F4341; // tags the key events we inject ourselves, so the hook can ignore them
 
 void SendKey(int p_Vk, bool p_Up);
@@ -212,6 +215,13 @@ LRESULT CALLBACK KeyboardProc(int p_Code, WPARAM p_W, LPARAM p_L) {
 }
 
 LRESULT CALLBACK MouseProc(int p_Code, WPARAM p_W, LPARAM p_L) {
+    if (p_Code == HC_ACTION && p_W == WM_MOUSEWHEEL) {
+        const auto* s_Wh = reinterpret_cast<const MSLLHOOKSTRUCT*>(p_L);
+        if (s_Wh->dwExtraInfo != kOurMarker && g_ZoomWanted.load() && GameIsForeground()) {
+            g_Wheel += static_cast<short>(HIWORD(s_Wh->mouseData));
+            return 1; // zoom is active: the wheel belongs to the zoom
+        }
+    }
     if (p_Code == HC_ACTION && p_W != WM_MOUSEMOVE) {
         const auto* s_Ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(p_L);
         if (s_Ms->dwExtraInfo != kOurMarker) {
@@ -925,6 +935,19 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("fire_amount", m_FireAmount);
         s_Flt("hud_scale", m_HudScale);
         s_Flt("hud_opacity", m_HudOpacity);
+        s_Flt("bar_bottom_r", m_BarBottom[0]);
+        s_Flt("bar_bottom_g", m_BarBottom[1]);
+        s_Flt("bar_bottom_b", m_BarBottom[2]);
+        s_Flt("bar_top_r", m_BarTop[0]);
+        s_Flt("bar_top_g", m_BarTop[1]);
+        s_Flt("bar_top_b", m_BarTop[2]);
+        s_Bool("show_icon", m_ShowIcon);
+        s_Bool("zoom_enabled", m_ZoomEnabled);
+        s_Flt("zoom_max", m_ZoomMax);
+        s_Flt("zoom_step", m_ZoomStep);
+        s_Flt("zoom_smooth", m_ZoomSmooth);
+        s_Bool("zoom_remember", m_ZoomRemember);
+        s_Bool("zoom_any_item", m_ZoomAnyItem);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1044,6 +1067,19 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("fire_amount", m_FireAmount, 0.2f, 2.5f);
     s_Flt("hud_scale", m_HudScale, 0.5f, 3.0f);
     s_Flt("hud_opacity", m_HudOpacity, 0.1f, 1.0f);
+    s_Flt("bar_bottom_r", m_BarBottom[0], 0.0f, 1.0f);
+    s_Flt("bar_bottom_g", m_BarBottom[1], 0.0f, 1.0f);
+    s_Flt("bar_bottom_b", m_BarBottom[2], 0.0f, 1.0f);
+    s_Flt("bar_top_r", m_BarTop[0], 0.0f, 1.0f);
+    s_Flt("bar_top_g", m_BarTop[1], 0.0f, 1.0f);
+    s_Flt("bar_top_b", m_BarTop[2], 0.0f, 1.0f);
+    s_Bool("show_icon", m_ShowIcon);
+    s_Bool("zoom_enabled", m_ZoomEnabled);
+    s_Flt("zoom_max", m_ZoomMax, 1.5f, 10.0f);
+    s_Flt("zoom_step", m_ZoomStep, 1.03f, 1.6f);
+    s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
+    s_Bool("zoom_remember", m_ZoomRemember);
+    s_Bool("zoom_any_item", m_ZoomAnyItem);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1465,12 +1501,194 @@ void BetterInstinct::ApplyGlowOnActivate(const ZEntityRef* p_Ref) {
     if (s_Written > 0) m_GlowPreApplied.fetch_add(s_Written);
 }
 
+// ---------------------------------------------------------------------------
+// Better Zoom
+// ---------------------------------------------------------------------------
+// Camera profile entities (template 00852016D29CC8A3): OTS_Master01, OTSHigh01, OTSLow, CoverHighOTS01, CoverLowOTS01.
+// Their m_fFOV is the aim camera's field of view. A smaller FOV = more zoom.
+
+void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEntityType** p_Entity) {
+    if (!p_Factory || !p_Entity) return;
+
+    static constexpr uint64_t s_Ids[] = {
+        0x986AC0B7847DC618ULL, // OTS_Master01
+        0xB0EA3D50DCBB1A7AULL, // OTSHigh01
+        0x6793005D38EFC567ULL, // OTSLow
+        0x0997FA17BEB4FBB1ULL, // CoverHighOTS01
+        0xC21FA7B9826A5E20ULL, // CoverLowOTS01
+    };
+    std::vector<ZEntityRef> s_Hits;
+    auto s_Look = [&]() {
+        auto* s_Blueprint = static_cast<IEntityBlueprintFactory*>(p_Factory->m_blueprintResource.GetResourceData());
+        if (!s_Blueprint) return;
+        const int64_t s_Count = s_Blueprint->GetSubEntitiesCount();
+        if (s_Count <= 0 || s_Count > 2000000) return;
+        for (int64_t i = 0; i < s_Count; ++i) {
+            const uint64_t s_Id = s_Blueprint->GetSubEntityId(static_cast<int>(i));
+            bool s_Match = false;
+            for (const uint64_t s_Wanted : s_Ids) {
+                if (s_Id == s_Wanted) s_Match = true;
+            }
+            if (!s_Match) continue;
+            ZEntityType** s_Sub = s_Blueprint->GetSubEntity(p_Entity, static_cast<int>(i));
+            if (s_Sub) s_Hits.push_back(ZEntityRef(s_Sub));
+        }
+    };
+    if (!SafeCall(s_Look) || s_Hits.empty()) return;
+
+    static const uint32_t s_FovId = Hash::Crc32("m_fFOV");
+    for (const ZEntityRef& s_Ref : s_Hits) {
+        float s_Fov = 0.0f;
+        auto s_Read = [&]() {
+            ZEntityImpl* s_Entity = s_Ref.GetEntity();
+            ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+            if (!s_Type || !s_Type->m_pPropertyData) return;
+            SPropertyData* s_Data = s_Type->FindProperty(s_FovId);
+            if (!s_Data) return;
+            if (s_Data->GetPropertyInfo()->m_propertyInfo.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) return;
+            const uint8_t* s_Ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(s_Ref.m_pObj) + s_Data->m_nPropertyOffset);
+            if (!CanWriteMemory(s_Ptr, sizeof(float))) return;
+            std::memcpy(&s_Fov, s_Ptr, sizeof(float));
+        };
+        if (!SafeCall(s_Read) || !std::isfinite(s_Fov) || s_Fov < 5.0f || s_Fov > 120.0f) continue; // not a sane FOV: leave it alone
+
+        std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+        bool s_Known = false;
+        for (SZoomProfile& s_P : m_ZoomProfiles) {
+            if (s_P.Ref.GetEntity() == s_Ref.GetEntity()) { s_P.VanillaFov = s_Fov; s_Known = true; }
+        }
+        if (!s_Known) {
+            SZoomProfile s_New;
+            s_New.Ref = s_Ref;
+            s_New.VanillaFov = s_Fov; // read before we ever write, so this is the game's own value
+            m_ZoomProfiles.push_back(s_New);
+        }
+        m_ZoomFound.store(static_cast<uint32_t>(m_ZoomProfiles.size()));
+    }
+}
+
+// Is the zoom allowed for what 47 holds right now? Wanted: hands empty, or an item that can't be thrown.
+// Guns (and throwable items) keep the game's own aiming.
+// TODO: wire this to the held item. It needs the item/inventory API of the SDK fork (ZHitman5.h / ZItem.h).
+// Until then the check is the "Zoom with any item" option, so the feature is switched off by default.
+bool BetterInstinct::HeldItemAllowsZoom() {
+    return m_ZoomAnyItem;
+}
+
+void BetterInstinct::WriteZoomFov(float p_Zoom) {
+    static const uint32_t s_FovId = Hash::Crc32("m_fFOV");
+    std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+    for (SZoomProfile& s_P : m_ZoomProfiles) {
+        float s_Fov = s_P.VanillaFov;
+        if (p_Zoom > 1.0005f) {
+            const float s_Half = s_P.VanillaFov * 0.5f * 3.14159265f / 180.0f;
+            s_Fov = 2.0f * std::atan(std::tan(s_Half) / p_Zoom) * 180.0f / 3.14159265f; // real magnification, not just FOV / zoom
+            s_Fov = std::max(s_Fov, 1.0f);
+        }
+        try {
+            if (!s_P.Ref.GetEntity()) continue;
+            s_P.Ref.SetProperty<float>(s_FovId, s_Fov, true);
+            ++m_ZoomWrites;
+        } catch (...) {
+        }
+    }
+}
+
+// Diagnostic for the held-item check: lists the properties (name, size, offset, first bytes) of the player, its character,
+// the inventory controllers and the items it owns, so the right one can be found. Written to BetterInstinct.log.
+void BetterInstinct::DumpHeldItemInfo() {
+    std::string s_Out = "Held item dump (hold the item you want to check while you press the button)\n";
+    auto s_Dump = [&](const std::string& p_Title, ZEntityRef p_Ref) {
+        s_Out += "\n== " + p_Title + " ==\n";
+        auto s_Body = [&]() {
+            ZEntityImpl* s_Entity = p_Ref.GetEntity();
+            ZEntityType* s_Type = s_Entity ? s_Entity->GetType() : nullptr;
+            if (!s_Type || !s_Type->m_pPropertyData) { s_Out += "(no properties)\n"; return; }
+            int s_N = 0;
+            for (const SPropertyData& s_P : *s_Type->m_pPropertyData) {
+                if (++s_N > 300) break;
+                const SNamedPropertyInfo* s_NI = s_P.GetPropertyInfo();
+                if (!s_NI || !s_NI->m_pszPropertyName) continue;
+                const SPropertyInfo& s_Info = s_NI->m_propertyInfo;
+                const IType* s_T = s_Info.m_Type ? s_Info.m_Type->GetTypeInfo() : nullptr;
+                const uint32_t s_Size = s_T ? s_T->m_nTypeSize : 0;
+                const bool s_Setter = (s_Info.m_Flags & EPropertyInfoFlags::E_HAS_GETTER_SETTER) != 0;
+                char s_Line[256];
+                std::snprintf(s_Line, sizeof(s_Line), "%s  size=%u offset=0x%X%s", s_NI->m_pszPropertyName, s_Size,
+                              static_cast<unsigned>(s_P.m_nPropertyOffset), s_Setter ? " getter/setter" : "");
+                s_Out += s_Line;
+                if (!s_Setter && s_Size > 0 && s_Size <= 16) {
+                    const uint8_t* s_Ptr = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(p_Ref.m_pObj) + s_P.m_nPropertyOffset);
+                    if (CanWriteMemory(s_Ptr, s_Size)) {
+                        s_Out += "  value=";
+                        for (uint32_t k = 0; k < s_Size; ++k) {
+                            char s_Hex[4];
+                            std::snprintf(s_Hex, sizeof(s_Hex), "%02X", s_Ptr[k]);
+                            s_Out += s_Hex;
+                        }
+                    }
+                }
+                s_Out += "\n";
+            }
+        };
+        if (!SafeCall(s_Body)) s_Out += "(read failed)\n";
+    };
+
+    try {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) { s_Out += "No local player.\n"; GlowLog(s_Out); return; }
+        s_Dump("ZHitman5", s_Local.m_entityRef);
+
+        auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
+        if (s_CharRef.m_pInterfaceRef) {
+            s_Dump("ZCharacter", s_CharRef.m_entityRef);
+            auto& s_ContRef = s_CharRef.m_pInterfaceRef->m_rSubcontrollerContainer;
+            if (s_ContRef.m_pInterfaceRef) {
+                s_Dump("SubcontrollerContainer", s_ContRef.m_entityRef);
+                int s_Idx = 0;
+                for (auto& s_Sub : s_ContRef.m_pInterfaceRef->m_aReferencedControllers) {
+                    if (s_Idx >= 40) break;
+                    s_Dump("Subcontroller " + std::to_string(s_Idx++), s_Sub.m_entityRef);
+                }
+            }
+        }
+    } catch (...) {
+        s_Out += "\nException while reading.\n";
+    }
+    GlowLog(s_Out);
+}
+
+void BetterInstinct::UpdateZoom(float p_Dt) {
+    if (m_DumpRequest.exchange(false)) DumpHeldItemInfo();
+    const bool s_Focused = GameIsForeground() && !m_Binding;
+    const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
+    const bool s_Gate = m_ZoomEnabled && s_RightDown && HeldItemAllowsZoom();
+    g_ZoomWanted.store(s_Gate);
+
+    const int s_Delta = g_Wheel.exchange(0);
+    if (s_Gate && s_Delta != 0) {
+        m_ZoomTarget *= std::pow(m_ZoomStep, static_cast<float>(s_Delta) / 120.0f);
+    }
+    m_ZoomTarget = std::clamp(m_ZoomTarget, 1.0f, std::max(1.0f, m_ZoomMax));
+    if (!s_RightDown && !m_ZoomRemember) m_ZoomTarget = 1.0f;
+
+    const float s_Wanted = s_Gate ? m_ZoomTarget : 1.0f; // not allowed right now: the game's own FOV
+    m_ZoomCur += (s_Wanted - m_ZoomCur) * std::clamp(m_ZoomSmooth * p_Dt, 0.0f, 1.0f);
+    if (std::abs(m_ZoomCur - s_Wanted) < 0.002f) m_ZoomCur = s_Wanted;
+
+    if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
+        WriteZoomFov(m_ZoomCur);
+        m_ZoomWritten = m_ZoomCur;
+    }
+}
+
 // The glow config entity is the same one the Killer Instinct data mod patches: entity f55806ff6135965f in the main game's
 // template (0092AAB2AF8AC127) and d796d60af9226450 (plus ...6400) in Sniper Assassin's (0029C0633A11CDE1).
 DEFINE_PLUGIN_DETOUR(BetterInstinct, void, ZTemplateEntityFactory_ConfigureEntity, ZTemplateEntityFactory* th, ZEntityType** pEntity, const SExternalReferences& externalRefs, uint8_t* unk0) {
     p_Hook->CallOriginal(th, pEntity, externalRefs, unk0); // the game builds the entities and sets their properties first
     ++m_GlowTplCalls;
     CheckTemplateForGlow(th, pEntity);
+    CheckTemplateForZoom(th, pEntity);
     return HookResult<void>(HookAction::Return());
 }
 
@@ -1976,6 +2194,13 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
             m_GlowKeepSnap = false;
             m_GlowWait = 3.0f;
             m_GlowState = 0;
+            {
+                std::lock_guard<std::mutex> s_ZoomLock(m_ZoomMutex);
+                m_ZoomProfiles.clear(); // the mission's entities are gone
+            }
+            m_ZoomFound.store(0);
+            m_ZoomTarget = m_ZoomCur = m_ZoomWritten = 1.0f;
+            g_ZoomWanted.store(false);
             m_Meter = 1.0f;
             m_Locked = false;
             m_Blocked = false;
@@ -1995,6 +2220,7 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     m_NoPlayerTime = 0.0f;
 
     UpdateGlowColors(s_Dt);
+    UpdateZoom(s_Dt);
 
     // Only react to keys when the game window is the active window.
     DWORD s_ForegroundPid = 0;
@@ -2904,9 +3130,11 @@ void BetterInstinct::DrawHud() {
     const float s_HalfAcross = (s_Vert ? s_Girth : s_BarLen) * 0.5f;
     const float s_Cx = std::clamp(s_Screen.x * std::clamp(m_HudX, 0.0f, 1.0f), s_HalfAcross,
                                   std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
-    const float s_LabelRoom = 34.0f * s_Ui;
+    const float s_IconR = std::max(7.0f, 12.0f * s_Ui);
+    const float s_LabelRoom = 4.0f * s_Ui;
+    const float s_BelowRoom = (s_Vert && m_ShowIcon) ? (s_IconR * 2.0f + 6.0f * s_Ui) : 0.0f; // vertical bar: the icon sits under it
     const float s_MinBottom = (s_Vert ? s_BarLen : s_Girth) + s_LabelRoom;
-    const float s_Bottom = std::clamp(s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f), std::min(s_MinBottom, s_Screen.y), s_Screen.y);
+    const float s_Bottom = std::clamp(s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f), std::min(s_MinBottom, s_Screen.y - s_BelowRoom), s_Screen.y - s_BelowRoom);
     const float s_Top = s_Bottom - (s_Vert ? s_BarLen : s_Girth);
     const float s_Left = s_Cx - (s_Vert ? s_Girth : s_BarLen) * 0.5f;
     const float s_Right = s_Cx + (s_Vert ? s_Girth : s_BarLen) * 0.5f;
@@ -2921,26 +3149,20 @@ void BetterInstinct::DrawHud() {
 
     // Fill color: gold normally, blends to the "low" color when nearly empty, pulses while recharging.
     const float s_Low = 1.0f - std::clamp(m_Meter / kLowLevel, 0.0f, 1.0f);
-    float s_R = m_FillColor[0] + (m_LowColor[0] - m_FillColor[0]) * s_Low;
-    float s_G = m_FillColor[1] + (m_LowColor[1] - m_FillColor[1]) * s_Low;
-    float s_B = m_FillColor[2] + (m_LowColor[2] - m_FillColor[2]) * s_Low;
-    float s_FillA = s_A;
-    if (m_Blocked) {
-        s_R = m_LowColor[0];
-        s_G = m_LowColor[1];
-        s_B = m_LowColor[2];
-        s_FillA = s_A * (0.55f + 0.35f * std::sin(s_Time * 8.0f));
+    // Bar colors: the bottom color at the start of the bar, the top color at the end. The fill shows the part of that
+    // gradient up to the current level. Both blend to the "low" color when nearly empty; recharging uses the low color.
+    float s_Bot[3], s_Top[3];
+    for (int k = 0; k < 3; ++k) {
+        s_Bot[k] = m_BarBottom[k] + (m_LowColor[k] - m_BarBottom[k]) * s_Low;
+        s_Top[k] = m_BarTop[k] + (m_LowColor[k] - m_BarTop[k]) * s_Low;
+        if (m_Blocked) { s_Bot[k] = m_LowColor[k]; s_Top[k] = m_LowColor[k]; }
     }
-
-    // Label above the bar.
-    const char* s_Label = m_Blocked ? "RECHARGING" : "INSTINCT";
-    ImFont* s_Font = ImGui::GetFont();
-    const float s_FontSize = std::max(10.0f, ImGui::GetFontSize() * 0.8f * s_Ui);
-    const ImVec2 s_TextSize = s_Font->CalcTextSizeA(s_FontSize, FLT_MAX, 0.0f, s_Label);
-    const float s_TextX = std::clamp(s_Cx - s_TextSize.x * 0.5f, 4.0f, std::max(4.0f, s_Screen.x - s_TextSize.x - 4.0f));
-    const ImVec2 s_TextPos(s_TextX, s_Top - s_TextSize.y - 6.0f * s_Ui);
-    s_Dl->AddText(s_Font, s_FontSize, ImVec2(s_TextPos.x + 1.0f, s_TextPos.y + 1.0f), IM_COL32(0, 0, 0, static_cast<int>(160 * s_A)), s_Label);
-    s_Dl->AddText(s_Font, s_FontSize, s_TextPos, s_Col(1.0f, 0.93f, 0.75f, 0.85f * s_A), s_Label);
+    float s_FillA = s_A;
+    if (m_Blocked) s_FillA = s_A * (0.55f + 0.35f * std::sin(s_Time * 8.0f));
+    const float s_Fill = std::clamp(m_Meter, 0.0f, 1.0f);
+    const float s_R = s_Bot[0] + (s_Top[0] - s_Bot[0]) * s_Fill; // color at the tip of the fill
+    const float s_G = s_Bot[1] + (s_Top[1] - s_Bot[1]) * s_Fill;
+    const float s_B = s_Bot[2] + (s_Top[2] - s_Bot[2]) * s_Fill;
 
     // Dark backing, then the grey "empty" track.
     const float s_Inset = s_Thick * 2.0f;
@@ -2961,8 +3183,8 @@ void BetterInstinct::DrawHud() {
     // Fill: darker at the start, brighter toward the tip.
     const bool s_HasFill = s_Vert ? (s_InnerB - s_HeadY > 0.5f) : (s_HeadX - s_InnerL > 0.5f);
     if (s_HasFill) {
-        const ImU32 s_Dim = s_Col(s_R * 0.50f, s_G * 0.50f, s_B * 0.50f, s_FillA);
-        const ImU32 s_Bright = s_Col(s_R + (1.0f - s_R) * 0.35f, s_G + (1.0f - s_G) * 0.35f, s_B + (1.0f - s_B) * 0.35f, s_FillA);
+        const ImU32 s_Dim = s_Col(s_Bot[0], s_Bot[1], s_Bot[2], s_FillA);
+        const ImU32 s_Bright = s_Col(s_R, s_G, s_B, s_FillA);
         const ImU32 s_Shine = IM_COL32(255, 255, 255, static_cast<int>(70 * s_A));
         if (s_Vert) {
             s_Dl->AddRectFilledMultiColor(ImVec2(s_InnerL, s_HeadY), ImVec2(s_InnerR, s_InnerB), s_Bright, s_Bright, s_Dim, s_Dim);
@@ -2973,49 +3195,32 @@ void BetterInstinct::DrawHud() {
         }
     }
 
-    // Particles at the tip. While the settings window is open they also run, so the effect can be tuned.
-    const bool s_Emit = (s_Active || s_Preview) && m_Meter > 0.004f;
+    // Sparkles at the tip: only while Instinct is in use. Tiny firework-like sparks burst out of the tip in every
+    // direction, slow down fast and die quickly, so the effect stays small and concentrated (no rising flames).
+    const bool s_Emit = s_Active && m_Meter > 0.004f;
     const float s_PxMin = std::max(1.0f, s_Ui);
+    if (!s_Active) {
+        m_Particles.clear(); // not using Instinct: plain bar, no effects
+        m_EmitAcc = 0.0f;
+    }
     if (s_Emit) {
-        // Fire: more particles per second; classic sparkles keep the old rate.
-        m_EmitAcc += s_Dt * (m_FireFx ? 95.0f * m_FireAmount : 60.0f);
-        const size_t s_MaxParticles = m_FireFx ? 320 : 160;
+        m_EmitAcc += s_Dt * (m_FireFx ? 70.0f * m_FireAmount : 60.0f);
+        const size_t s_MaxParticles = 220;
         while (m_EmitAcc >= 1.0f) {
             m_EmitAcc -= 1.0f;
             if (m_Particles.size() >= s_MaxParticles) break;
 
             Particle s_P;
-            if (m_FireFx) {
-                // Flames and embers leave the tip and rise up the screen (whichever way the bar points).
-                const float s_Across = (Rand01() - 0.5f) * s_Girth * 0.6f;
-                s_P.ember = Rand01() < 0.15f;
-                s_P.phase = Rand01() * 6.2831853f;
-                if (s_Vert) {
-                    s_P.x = s_HeadX + s_Across;
-                    s_P.y = s_HeadY + (Rand01() - 0.5f) * 2.0f * s_Ui;
-                } else {
-                    s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
-                    s_P.y = s_HeadY + s_Across;
-                }
-                if (s_P.ember) {
-                    s_P.vx = (Rand01() - 0.5f) * 120.0f * s_Ui;
-                    s_P.vy = -(60.0f + 120.0f * Rand01()) * s_Ui;
-                    s_P.maxLife = 0.6f + 0.9f * Rand01();
-                    s_P.size = (0.7f + 1.0f * Rand01()) * s_PxMin;
-                } else {
-                    s_P.vx = (Rand01() - 0.5f) * 18.0f * s_Ui;
-                    s_P.vy = -(40.0f + 60.0f * Rand01()) * s_Ui;
-                    s_P.maxLife = 0.45f + 0.55f * Rand01();
-                    s_P.size = (2.2f + 3.2f * Rand01()) * s_PxMin;
-                }
-            } else {
-                s_P.x = s_HeadX + (Rand01() - 0.5f) * 2.0f * s_Ui;
-                s_P.y = s_InnerT + Rand01() * (s_InnerB - s_InnerT);
-                s_P.vx = (Rand01() - 0.5f) * 70.0f * s_Ui;
-                s_P.vy = -(12.0f + 55.0f * Rand01()) * s_Ui;
-                s_P.maxLife = 0.35f + 0.65f * Rand01();
-                s_P.size = (0.8f + 1.8f * Rand01()) * s_PxMin;
-            }
+            const float s_Ang = Rand01() * 6.2831853f;
+            const float s_Speed = (18.0f + 62.0f * Rand01() * Rand01()) * s_Ui; // most sparks are slow, a few shoot out further
+            s_P.x = s_HeadX + std::cos(s_Ang) * 1.0f * s_Ui;
+            s_P.y = s_HeadY + std::sin(s_Ang) * 1.0f * s_Ui;
+            s_P.vx = std::cos(s_Ang) * s_Speed;
+            s_P.vy = std::sin(s_Ang) * s_Speed;
+            s_P.phase = Rand01() * 6.2831853f;
+            s_P.ember = Rand01() < 0.25f; // "ember" = a brighter spark with a short trail
+            s_P.maxLife = 0.22f + 0.38f * Rand01();
+            s_P.size = (0.7f + 0.9f * Rand01()) * s_PxMin;
             s_P.life = s_P.maxLife;
             m_Particles.push_back(s_P);
         }
@@ -3025,86 +3230,64 @@ void BetterInstinct::DrawHud() {
 
     for (auto& s_P : m_Particles) {
         s_P.life -= s_Dt;
-        if (m_FireFx) {
-            if (s_P.ember) {
-                s_P.vy += 90.0f * s_Ui * s_Dt; // embers arc and fall back
-                s_P.x += (s_P.vx + std::sin(s_P.phase + s_P.life * 9.0f) * 14.0f * s_Ui) * s_Dt;
-            } else {
-                s_P.vy *= std::max(0.0f, 1.0f - 0.9f * s_Dt); // flames slow down as they rise
-                s_P.x += (s_P.vx + std::sin(s_P.phase + s_P.life * 15.0f) * 26.0f * s_Ui) * s_Dt; // flicker sideways
-            }
-            s_P.y += s_P.vy * s_Dt;
-        } else {
-            s_P.x += s_P.vx * s_Dt;
-            s_P.y += s_P.vy * s_Dt;
-            s_P.vy += 40.0f * s_Ui * s_Dt; // slight pull down so the sparks arc
-        }
+        const float s_Drag = std::max(0.0f, 1.0f - 5.5f * s_Dt); // strong drag: the burst stays near the tip
+        s_P.vx *= s_Drag;
+        s_P.vy = s_P.vy * s_Drag + 14.0f * s_Ui * s_Dt;          // tiny sag, like a firework spark
+        s_P.x += s_P.vx * s_Dt;
+        s_P.y += s_P.vy * s_Dt;
     }
     m_Particles.erase(std::remove_if(m_Particles.begin(), m_Particles.end(), [](const Particle& p) { return p.life <= 0.0f; }),
                       m_Particles.end());
 
-    if (m_FireFx) {
-        // Flame colors follow the meter color: white-hot core -> meter color -> deep red-orange that fades out.
-        const float s_CoreR = s_R + (1.0f - s_R) * 0.75f, s_CoreG = s_G + (1.0f - s_G) * 0.75f, s_CoreB = s_B + (1.0f - s_B) * 0.75f;
-        const float s_EndR = s_R * 0.85f, s_EndG = s_G * 0.30f, s_EndB = s_B * 0.10f;
+    {
+        // White-hot at birth, then the meter color, fading out. Each spark twinkles a little.
+        const float s_CoreR = s_R + (1.0f - s_R) * 0.8f, s_CoreG = s_G + (1.0f - s_G) * 0.8f, s_CoreB = s_B + (1.0f - s_B) * 0.8f;
         for (const auto& s_P : m_Particles) {
             const float s_K = std::clamp(s_P.life / s_P.maxLife, 0.0f, 1.0f); // 1 = just born, 0 = gone
-            const float s_T = 1.0f - s_K;
-            float s_Pr, s_Pg, s_Pb;
-            if (s_T < 0.35f) {
-                const float s_F = s_T / 0.35f;
-                s_Pr = s_CoreR + (s_R - s_CoreR) * s_F;
-                s_Pg = s_CoreG + (s_G - s_CoreG) * s_F;
-                s_Pb = s_CoreB + (s_B - s_CoreB) * s_F;
-            } else {
-                const float s_F = (s_T - 0.35f) / 0.65f;
-                s_Pr = s_R + (s_EndR - s_R) * s_F;
-                s_Pg = s_G + (s_EndG - s_G) * s_F;
-                s_Pb = s_B + (s_EndB - s_B) * s_F;
-            }
+            const float s_Mix = std::clamp((1.0f - s_K) * 1.8f, 0.0f, 1.0f);
+            const float s_Pr = s_CoreR + (s_R - s_CoreR) * s_Mix;
+            const float s_Pg = s_CoreG + (s_G - s_CoreG) * s_Mix;
+            const float s_Pb = s_CoreB + (s_B - s_CoreB) * s_Mix;
+            const float s_Twinkle = 0.65f + 0.35f * std::sin(s_P.phase + s_P.life * 60.0f);
+            const float s_Fa = s_K * s_Twinkle * s_A;
             const ImVec2 s_Pos(s_P.x, s_P.y);
-            if (s_P.ember) {
-                const float s_Rad = s_P.size * (0.6f + 0.4f * s_K);
-                s_Dl->AddCircleFilled(s_Pos, s_Rad * 2.2f, s_Col(s_Pr, s_Pg, s_Pb, 0.18f * s_K * s_A), 8);
-                s_Dl->AddCircleFilled(s_Pos, s_Rad, s_Col(s_CoreR, s_CoreG, s_CoreB, 0.95f * s_K * s_A), 6);
-            } else {
-                const float s_Rad = s_P.size * (0.30f + 0.70f * s_K); // flames shrink as they burn out
-                const float s_Fa = std::pow(s_K, 0.8f) * s_A;
-                s_Dl->AddCircleFilled(s_Pos, s_Rad * 1.9f, s_Col(s_Pr, s_Pg, s_Pb, 0.16f * s_Fa), 10); // soft halo
-                s_Dl->AddCircleFilled(s_Pos, s_Rad, s_Col(s_Pr, s_Pg, s_Pb, 0.55f * s_Fa), 10);
-                if (s_T < 0.55f) {
-                    s_Dl->AddCircleFilled(s_Pos, s_Rad * 0.5f, s_Col(s_CoreR, s_CoreG, s_CoreB, 0.75f * s_Fa), 8); // hot core
+            if (s_P.ember) { // short streak along the direction it is flying
+                const float s_Sp = std::sqrt(s_P.vx * s_P.vx + s_P.vy * s_P.vy);
+                if (s_Sp > 0.5f) {
+                    const float s_Tail = std::min(s_Sp * 0.045f, 4.0f * s_Ui);
+                    s_Dl->AddLine(ImVec2(s_P.x - s_P.vx / s_Sp * s_Tail, s_P.y - s_P.vy / s_Sp * s_Tail), s_Pos,
+                                  s_Col(s_Pr, s_Pg, s_Pb, 0.75f * s_Fa), std::max(1.0f, s_P.size * 0.8f));
                 }
             }
+            s_Dl->AddCircleFilled(s_Pos, s_P.size * 1.8f, s_Col(s_Pr, s_Pg, s_Pb, 0.14f * s_Fa), 8); // tiny halo
+            s_Dl->AddCircleFilled(s_Pos, s_P.size * (0.5f + 0.5f * s_K), s_Col(s_CoreR, s_CoreG, s_CoreB, 0.95f * s_Fa), 6);
         }
-    } else {
-        for (const auto& s_P : m_Particles) {
-            const float s_K = s_P.life / s_P.maxLife;
-            s_Dl->AddCircleFilled(ImVec2(s_P.x, s_P.y), s_P.size * (0.5f + 0.5f * s_K),
-                                  s_Col(s_R + (1.0f - s_R) * 0.55f, s_G + (1.0f - s_G) * 0.55f, s_B + (1.0f - s_B) * 0.55f, s_K * s_A), 6);
-        }
-    }
-
-    // Bright spark at the tip of the fill (stronger while Instinct is in use).
-    if (m_Meter > 0.004f) {
-        const float s_Pulse = s_Active ? 0.85f + 0.15f * std::sin(s_Time * 14.0f) : 0.5f;
-        const float s_Rad = s_Girth * (s_Active ? 0.95f : 0.7f);
-
-        for (int i = 0; i < 4; ++i) { // soft glow
-            const float s_Rr = s_Rad * (2.6f - 0.6f * static_cast<float>(i));
-            s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_HeadY), s_Rr, s_Col(s_R, s_G, s_B, (0.06f + 0.05f * static_cast<float>(i)) * s_Pulse * s_A), 20);
-        }
-        s_Dl->AddCircleFilled(ImVec2(s_HeadX, s_HeadY), s_Rad * 0.5f, s_Col(1.0f, 0.97f, 0.88f, 0.95f * s_Pulse * s_A), 12);
-
-        const float s_Len = s_Rad * (2.3f + (s_Active ? 0.6f * std::sin(s_Time * 10.0f) : 0.0f));
-        const ImU32 s_Star = s_Col(1.0f, 0.97f, 0.88f, 0.8f * s_Pulse * s_A);
-        s_Dl->AddLine(ImVec2(s_HeadX - s_Len, s_HeadY), ImVec2(s_HeadX + s_Len, s_HeadY), s_Star, s_Thick);
-        s_Dl->AddLine(ImVec2(s_HeadX, s_HeadY - s_Len * 0.8f), ImVec2(s_HeadX, s_HeadY + s_Len * 0.8f), s_Star, s_Thick);
     }
 
     // Thin outline, a little brighter while Instinct is active.
     const float s_Border = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
     s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
+
+    // Round flame icon at the bottom (start) of the bar, like the Absolution Instinct meter.
+    if (m_ShowIcon) {
+        const ImVec2 s_Ic = s_Vert ? ImVec2(s_Cx, s_Bottom + 4.0f * s_Ui + s_IconR)
+                                   : ImVec2(s_Left - 4.0f * s_Ui - s_IconR, (s_Top + s_Bottom) * 0.5f);
+        s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(190 * s_A)), 32);
+        s_Dl->AddCircle(s_Ic, s_IconR, s_Col(s_Bot[0], s_Bot[1], s_Bot[2], 0.9f * s_A), 32, s_Thick * 1.5f);
+        auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
+            const float s_F = s_IconR * 0.5f * p_Scale;
+            auto P = [&](float x, float y) { return ImVec2(s_Ic.x + x * s_F, s_Ic.y + p_Dy * s_IconR + y * s_F); };
+            s_Dl->PathClear();
+            s_Dl->PathLineTo(P(0.05f, -1.15f));
+            s_Dl->PathBezierCubicCurveTo(P(0.15f, -0.55f), P(0.85f, -0.35f), P(0.70f, 0.30f));
+            s_Dl->PathBezierCubicCurveTo(P(0.60f, 0.85f), P(0.25f, 1.05f), P(0.00f, 1.05f));
+            s_Dl->PathBezierCubicCurveTo(P(-0.30f, 1.05f), P(-0.75f, 0.80f), P(-0.70f, 0.20f));
+            s_Dl->PathBezierCubicCurveTo(P(-0.65f, -0.20f), P(-0.20f, -0.45f), P(0.05f, -1.15f));
+            s_Dl->PathFillConvex(p_Color);
+        };
+        s_Flame(1.0f, -0.02f, s_Col(s_Bot[0], s_Bot[1], s_Bot[2], s_A));
+        s_Flame(0.5f, 0.24f, s_Col(s_Top[0], s_Top[1], s_Top[2], s_A));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3294,6 +3477,22 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
 
         ImGui::Separator();
 
+        // --- Better Zoom ---
+        if (ImGui::CollapsingHeader("Zoom (right mouse + mouse wheel)")) {
+            if (ImGui::Checkbox("Enable wheel zoom", &m_ZoomEnabled)) s_Changed = true;
+            ImGui::TextDisabled("Hold right mouse with empty hands (or an item you can't throw), then scroll.");
+            if (ImGui::SliderFloat("Max zoom", &m_ZoomMax, 1.5f, 10.0f, "%.1fx")) s_Changed = true;
+            if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
+            if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
+            if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
+            if (ImGui::Checkbox("Zoom with any item (temporary, no item check yet)", &m_ZoomAnyItem)) s_Changed = true;
+            if (ImGui::Button("Dump inventory info to log")) m_DumpRequest = true;
+            ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
+            ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
+        }
+
+        ImGui::Separator();
+
         // --- Instinct glow colors (people and items) ---
         if (ImGui::CollapsingHeader("Instinct colors (people and items)")) {
             if (ImGui::Button("All to game default")) {
@@ -3388,7 +3587,9 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::BeginDisabled(!m_FireFx);
         if (ImGui::SliderFloat("Fire amount", &m_FireAmount, 0.2f, 2.5f, "%.2f")) s_Changed = true;
         ImGui::EndDisabled();
-        if (ImGui::ColorEdit3("Meter color", m_FillColor)) s_Changed = true;
+        if (ImGui::ColorEdit3("Bar color: bottom", m_BarBottom)) s_Changed = true;
+        if (ImGui::ColorEdit3("Bar color: top", m_BarTop)) s_Changed = true;
+        if (ImGui::Checkbox("Flame icon at the bottom of the bar", &m_ShowIcon)) s_Changed = true;
         if (ImGui::ColorEdit3("Low-meter color", m_LowColor)) s_Changed = true;
         ImGui::EndDisabled();
 
