@@ -268,7 +268,7 @@ private:
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
-    bool m_ZoomLiveCam = true;       // also scale the live camera's FOV (the profile values alone had almost no effect)
+    bool m_ZoomLiveCam = false;       // also scale the live camera's FOV (the profile values alone had almost no effect)
     bool m_ZoomAnyItem = true;       // TEMPORARY: skip the held-item check (see HeldItemAllowsZoom)
 
     bool m_HudEnabled = true;
