@@ -1753,6 +1753,35 @@ void BetterInstinct::ScanCameraFov() {
                 float s_Getter = 0.0f;
                 auto s_ReadGetter = [&]() { s_Getter = s_Cam->GetFovYDeg(); };
                 if (SafeCall(s_ReadGetter)) s_Info += "GetFovYDeg()=" + std::to_string(s_Getter) + " ";
+
+                // The FOV is not a reflected property, so find the camera's own float by probing: look for floats in the
+                // object equal to GetFovYDeg(), nudge each one and see whether the getter follows. Restored right away.
+                if (s_Getter > 1.0f && s_Getter < 170.0f) {
+                    auto s_Probe = [&]() {
+                        uint8_t* s_Base = reinterpret_cast<uint8_t*>(s_Cam);
+                        for (size_t s_Off = 0x20; s_Off < 0x800; s_Off += 4) {
+                            float* s_Ptr = reinterpret_cast<float*>(s_Base + s_Off);
+                            if (!CanWriteMemory(s_Ptr, sizeof(float))) continue;
+                            const float s_Orig = *s_Ptr;
+                            if (!std::isfinite(s_Orig) || std::abs(s_Orig - s_Getter) > 0.0001f) continue;
+                            *s_Ptr = s_Orig + 0.5f;
+                            const float s_After = s_Cam->GetFovYDeg();
+                            *s_Ptr = s_Orig;
+                            if (std::abs(s_After - (s_Getter + 0.5f)) > 0.01f) continue; // getter did not follow: not the one
+                            SCamFov s_F;
+                            s_F.Ptr = s_Ptr;
+                            s_F.Ref = s_CamRef;
+                            char s_Buf[48];
+                            std::snprintf(s_Buf, sizeof(s_Buf), "camera+0x%zX", s_Off);
+                            s_F.Name = s_Buf;
+                            s_F.Base = s_Orig;
+                            m_CamFovs.push_back(s_F);
+                            s_Info += s_F.Name + "=" + std::to_string(s_Orig) + " ";
+                            break;
+                        }
+                    };
+                    SafeCall(s_Probe);
+                }
             }
             static const char* s_Names[] = {"m_fFovYDeg", "m_fFOV", "m_fFov"};
             for (const char* s_Name : s_Names) {
