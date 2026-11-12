@@ -1643,6 +1643,7 @@ void BetterInstinct::DumpHeldItemInfo() {
         auto s_Local = SDK()->GetLocalPlayer();
         if (!s_Local.m_pInterfaceRef) { s_Out += "No local player.\n"; GlowLog(s_Out); return; }
         s_Dump("ZHitman5", s_Local.m_entityRef);
+        s_Dump("MainCamera (m_rMainCamera)", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
 
         auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
         if (s_CharRef.m_pInterfaceRef) {
@@ -1733,6 +1734,8 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     g_ZoomWanted.store(s_Gate);
 
     const int s_Delta = g_Wheel.exchange(0);
+    m_WheelSeen.fetch_add(s_Delta);
+    m_ZoomGateNow.store(s_Gate);
     if (s_Gate && s_Delta != 0) {
         m_ZoomTarget *= std::pow(m_ZoomStep, static_cast<float>(s_Delta) / 120.0f);
     }
@@ -1758,6 +1761,17 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         bool s_Overriding = false;
         for (const SCamFov& s_F : m_CamFovs) if (s_F.Last != 0.0f) s_Overriding = true;
         if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
+    }
+
+    m_CamLiveTimer -= p_Dt;
+    if (m_CamLiveTimer <= 0.0f) {
+        m_CamLiveTimer = 0.2f;
+        std::string s_Live;
+        for (const SCamFov& s_F : m_CamFovs) {
+            if (s_F.Ptr && CanWriteMemory(s_F.Ptr, sizeof(float))) s_Live += s_F.Name + "=" + std::to_string(*s_F.Ptr) + " ";
+        }
+        std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+        m_CamLive = s_Live;
     }
 
     // Read back the first profile's FOV for the UI (shows whether our write sticks).
@@ -2334,11 +2348,10 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     //  - Hold mode: release every frame while the key is held (also beats key auto-repeat).
     //  - Toggle mode: tap once on the press, which flips the game's Instinct straight back off.
     if (m_BlockEnabled && m_Blocked && s_KeyDown) {
-        if (m_ToggleMode) {
-            if (s_PressEdge) ForceReleaseInstinct();
-        } else {
-            ForceReleaseInstinct();
-        }
+        // Only once per press. Doing it every frame while the key is held made the game see the key go up and down all
+        // the time, so Instinct (and the item glow) flashed on and off. The key hook and the game-level block already
+        // keep the held key away from the game.
+        if (s_PressEdge) ForceReleaseInstinct();
     }
 
     // A key press that happened while blocked (or that we force-released) must be released before Instinct can start again.
@@ -3580,6 +3593,11 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             {
                 std::lock_guard<std::mutex> s_InfoLock(m_ZoomMutex);
                 ImGui::TextDisabled("Live camera FOV: %s", m_CamInfo.empty() ? "not scanned yet" : m_CamInfo.c_str());
+            }
+            ImGui::TextDisabled("Zoom allowed now: %s   wheel received: %d   target: %.2fx", m_ZoomGateNow.load() ? "yes" : "no", m_WheelSeen.load(), m_ZoomTarget);
+            {
+                std::lock_guard<std::mutex> s_LiveLock(m_ZoomMutex);
+                ImGui::TextDisabled("Live now: %s", m_CamLive.empty() ? "-" : m_CamLive.c_str());
             }
             if (ImGui::Button("Dump inventory info to log")) m_DumpRequest = true;
             ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
