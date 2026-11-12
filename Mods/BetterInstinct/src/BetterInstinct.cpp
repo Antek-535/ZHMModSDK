@@ -3151,18 +3151,18 @@ void BetterInstinct::DrawHud() {
     const float s_Low = 1.0f - std::clamp(m_Meter / kLowLevel, 0.0f, 1.0f);
     // Bar colors: the bottom color at the start of the bar, the top color at the end. The fill shows the part of that
     // gradient up to the current level. Both blend to the "low" color when nearly empty; recharging uses the low color.
-    float s_Bot[3], s_Top[3];
+    float s_ColBot[3], s_ColTop[3];
     for (int k = 0; k < 3; ++k) {
-        s_Bot[k] = m_BarBottom[k] + (m_LowColor[k] - m_BarBottom[k]) * s_Low;
-        s_Top[k] = m_BarTop[k] + (m_LowColor[k] - m_BarTop[k]) * s_Low;
-        if (m_Blocked) { s_Bot[k] = m_LowColor[k]; s_Top[k] = m_LowColor[k]; }
+        s_ColBot[k] = m_BarBottom[k] + (m_LowColor[k] - m_BarBottom[k]) * s_Low;
+        s_ColTop[k] = m_BarTop[k] + (m_LowColor[k] - m_BarTop[k]) * s_Low;
+        if (m_Blocked) { s_ColBot[k] = m_LowColor[k]; s_ColTop[k] = m_LowColor[k]; }
     }
     float s_FillA = s_A;
     if (m_Blocked) s_FillA = s_A * (0.55f + 0.35f * std::sin(s_Time * 8.0f));
     const float s_Fill = std::clamp(m_Meter, 0.0f, 1.0f);
-    const float s_R = s_Bot[0] + (s_Top[0] - s_Bot[0]) * s_Fill; // color at the tip of the fill
-    const float s_G = s_Bot[1] + (s_Top[1] - s_Bot[1]) * s_Fill;
-    const float s_B = s_Bot[2] + (s_Top[2] - s_Bot[2]) * s_Fill;
+    const float s_R = s_ColBot[0] + (s_ColTop[0] - s_ColBot[0]) * s_Fill; // color at the tip of the fill
+    const float s_G = s_ColBot[1] + (s_ColTop[1] - s_ColBot[1]) * s_Fill;
+    const float s_B = s_ColBot[2] + (s_ColTop[2] - s_ColBot[2]) * s_Fill;
 
     // Dark backing, then the grey "empty" track.
     const float s_Inset = s_Thick * 2.0f;
@@ -3183,7 +3183,7 @@ void BetterInstinct::DrawHud() {
     // Fill: darker at the start, brighter toward the tip.
     const bool s_HasFill = s_Vert ? (s_InnerB - s_HeadY > 0.5f) : (s_HeadX - s_InnerL > 0.5f);
     if (s_HasFill) {
-        const ImU32 s_Dim = s_Col(s_Bot[0], s_Bot[1], s_Bot[2], s_FillA);
+        const ImU32 s_Dim = s_Col(s_ColBot[0], s_ColBot[1], s_ColBot[2], s_FillA);
         const ImU32 s_Bright = s_Col(s_R, s_G, s_B, s_FillA);
         const ImU32 s_Shine = IM_COL32(255, 255, 255, static_cast<int>(70 * s_A));
         if (s_Vert) {
@@ -3273,7 +3273,7 @@ void BetterInstinct::DrawHud() {
         const ImVec2 s_Ic = s_Vert ? ImVec2(s_Cx, s_Bottom + 4.0f * s_Ui + s_IconR)
                                    : ImVec2(s_Left - 4.0f * s_Ui - s_IconR, (s_Top + s_Bottom) * 0.5f);
         s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(190 * s_A)), 32);
-        s_Dl->AddCircle(s_Ic, s_IconR, s_Col(s_Bot[0], s_Bot[1], s_Bot[2], 0.9f * s_A), 32, s_Thick * 1.5f);
+        s_Dl->AddCircle(s_Ic, s_IconR, s_Col(s_ColBot[0], s_ColBot[1], s_ColBot[2], 0.9f * s_A), 32, s_Thick * 1.5f);
         auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
             const float s_F = s_IconR * 0.5f * p_Scale;
             auto P = [&](float x, float y) { return ImVec2(s_Ic.x + x * s_F, s_Ic.y + p_Dy * s_IconR + y * s_F); };
@@ -3285,8 +3285,8 @@ void BetterInstinct::DrawHud() {
             s_Dl->PathBezierCubicCurveTo(P(-0.65f, -0.20f), P(-0.20f, -0.45f), P(0.05f, -1.15f));
             s_Dl->PathFillConvex(p_Color);
         };
-        s_Flame(1.0f, -0.02f, s_Col(s_Bot[0], s_Bot[1], s_Bot[2], s_A));
-        s_Flame(0.5f, 0.24f, s_Col(s_Top[0], s_Top[1], s_Top[2], s_A));
+        s_Flame(1.0f, -0.02f, s_Col(s_ColBot[0], s_ColBot[1], s_ColBot[2], s_A));
+        s_Flame(0.5f, 0.24f, s_Col(s_ColTop[0], s_ColTop[1], s_ColTop[2], s_A));
     }
 }
 
