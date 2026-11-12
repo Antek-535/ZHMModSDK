@@ -1671,8 +1671,9 @@ bool BetterInstinct::ReadCamFov(const SCamFov& p_F, float& p_Out) {
             if (!CanWriteMemory(p_F.Ptr, sizeof(float))) return;
             p_Out = *p_F.Ptr;
         } else {
-            if (!p_F.Ref.GetEntity()) return;
-            p_Out = p_F.Ref.GetProperty<float>(p_F.PropId);
+            ZEntityRef s_Ref = p_F.Ref; // non-const copy: GetProperty/SetProperty are not const members
+            if (!s_Ref.GetEntity()) return;
+            p_Out = s_Ref.GetProperty<float>(p_F.PropId).Get();
         }
         s_Ok = std::isfinite(p_Out);
     };
@@ -1684,8 +1685,10 @@ void BetterInstinct::WriteCamFov(const SCamFov& p_F, float p_Value) {
     auto s_Body = [&]() {
         if (p_F.Ptr) {
             if (CanWriteMemory(p_F.Ptr, sizeof(float))) *p_F.Ptr = p_Value;
-        } else if (p_F.Ref.GetEntity()) {
-            p_F.Ref.SetProperty<float>(p_F.PropId, p_Value, true);
+        } else {
+            ZEntityRef s_Ref = p_F.Ref; // non-const copy: SetProperty is not a const member
+            float s_Val = p_Value;
+            if (s_Ref.GetEntity()) s_Ref.SetProperty<float>(p_F.PropId, s_Val, true);
         }
     };
     SafeCall(s_Body);
