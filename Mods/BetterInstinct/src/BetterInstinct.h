@@ -187,6 +187,8 @@ private:
     void UpdateHeldItem(float p_Dt);
     void ScanCameraFov();
     void ApplyCameraFov(float p_Zoom);
+    bool CameraPtrChanged();
+    uintptr_t m_CamBase = 0;                       // camera object the cached FOV pointers belong to
     void WriteCamExtras(const SCamFov& p_F, float p_FovDeg);
     std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
     std::atomic<float> m_ZoomReadbackVan{0.0f};
