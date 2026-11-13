@@ -925,6 +925,7 @@ bool BetterInstinct::SaveConfigFile() {
         auto s_Str = [&](const char* k, const std::string& v) { s_File << k << "=" << OneLine(v) << "\n"; };
 
         s_Int("instinct_key", m_InstinctKey);
+        s_Int("zoom_key", m_ZoomKey);
         s_Bool("toggle_mode", m_ToggleMode);
         s_Bool("block_enabled", m_BlockEnabled);
         s_Flt("focus_scale", m_FocusScale);
@@ -1058,6 +1059,7 @@ bool BetterInstinct::LoadConfigFile() {
     };
 
     s_Int("instinct_key", m_InstinctKey, 1, 254);
+    s_Int("zoom_key", m_ZoomKey, 0, 254);
     s_Bool("toggle_mode", m_ToggleMode);
     s_Bool("block_enabled", m_BlockEnabled);
     s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
@@ -2100,7 +2102,8 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     const bool s_Focused = GameIsForeground() && !m_Binding;
     const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
     const bool s_ItemOk = HeldItemAllowsZoom();                       // empty hands only
-    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk;
+    const bool s_KeyOk = m_ZoomKey == 0 || g_Phys[m_ZoomKey & 0xFF].load(); // optional extra key that must be held
+    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk && s_KeyOk;
     g_ZoomWanted.store(s_Gate); // only then does the hook take the wheel away from the game
 
     const int s_Delta = g_Wheel.exchange(0);
@@ -4023,7 +4026,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                     if (!IsKeyDown(vk)) continue;
 
                     if (vk != VK_ESCAPE) {
-                        m_InstinctKey = vk;
+                        if (m_BindTarget == 1) m_ZoomKey = vk; else m_InstinctKey = vk;
                         s_Changed = true;
                     }
                     m_Binding = false;
@@ -4035,6 +4038,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             if (ImGui::Button(s_Text.c_str(), ImVec2(-1, 0))) {
                 m_Binding = true;
                 m_BindArmed = false;
+                m_BindTarget = 0;
             }
         }
 
@@ -4129,6 +4133,17 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         // --- Better Zoom ---
         if (ImGui::CollapsingHeader("Zoom (right mouse + mouse wheel)")) {
             if (ImGui::Checkbox("Enable wheel zoom", &m_ZoomEnabled)) s_Changed = true;
+            {
+                const std::string s_ZoomKeyText = (m_ZoomKey == 0 ? std::string("none (right mouse + wheel only)") : KeyName(m_ZoomKey)) + "  (click to change)";
+                ImGui::TextUnformatted("Extra key to hold while zooming (so it does not zoom while aiming a gun)");
+                if (ImGui::Button(s_ZoomKeyText.c_str(), ImVec2(-1, 0))) {
+                    m_Binding = true;
+                    m_BindArmed = false;
+                    m_BindTarget = 1;
+                }
+                if (m_Binding && m_BindTarget == 1) ImGui::TextDisabled("Press the key now (Esc cancels); the prompt is at the top of this window.");
+                if (m_ZoomKey != 0 && ImGui::Button("No extra key")) { m_ZoomKey = 0; s_Changed = true; }
+            }
             ImGui::TextDisabled("Hold right mouse with EMPTY hands (no weapon, no item), then scroll.");
             if (ImGui::SliderFloat("Max zoom", &m_ZoomMax, 1.5f, 10.0f, "%.1fx")) s_Changed = true;
             if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
