@@ -948,7 +948,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("zoom_smooth", m_ZoomSmooth);
         s_Bool("zoom_remember", m_ZoomRemember);
         s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
-        s_Bool("zoom_use_live", m_ZoomLiveCam);
+        s_Bool("zoom_use_live2", m_ZoomLiveCam);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1081,7 +1081,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
     s_Bool("zoom_remember", m_ZoomRemember);
     s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
-    s_Bool("zoom_use_live", m_ZoomLiveCam);
+    s_Bool("zoom_use_live2", m_ZoomLiveCam);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1559,6 +1559,7 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
     if (!SafeCall(s_Look) || s_Hits.empty()) return;
 
     static const uint32_t s_FovId = Hash::Crc32("m_fFOV");
+    bool s_Cleared = false;
     for (const ZEntityRef& s_Ref : s_Hits) {
         float s_Fov = 0.0f;
         const float* s_FovPtr = nullptr;
@@ -1577,6 +1578,12 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
         if (!SafeCall(s_Read) || !std::isfinite(s_Fov) || s_Fov < 5.0f || s_Fov > 120.0f) continue; // not a sane FOV: leave it alone
 
         std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+        if (!s_Cleared) { // a fresh group from this template: forget the entities of the previous mission
+            bool s_Same = false;
+            for (const SZoomProfile& s_P : m_ZoomProfiles) if (s_P.Ref.GetEntity() == s_Ref.GetEntity()) s_Same = true;
+            if (!s_Same) m_ZoomProfiles.clear();
+            s_Cleared = true;
+        }
         bool s_Known = false;
         for (SZoomProfile& s_P : m_ZoomProfiles) {
             if (s_P.Ref.GetEntity() == s_Ref.GetEntity()) { s_P.VanillaFov = s_Fov; s_P.Ptr = s_FovPtr; s_Known = true; }
@@ -2756,11 +2763,8 @@ void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
             m_GlowKeepSnap = false;
             m_GlowWait = 3.0f;
             m_GlowState = 0;
-            {
-                std::lock_guard<std::mutex> s_ZoomLock(m_ZoomMutex);
-                m_ZoomProfiles.clear(); // the mission's entities are gone
-            }
-            m_ZoomFound.store(0);
+            // (the camera profiles are NOT cleared here: they are found while the mission loads, before the player exists,
+            //  and clearing them made them vanish. A new set replaces the old one when the game builds the camera again.)
             m_CamFovs.clear();
             m_ItemProbes.clear();
             m_ItemHolding = false;
@@ -4121,7 +4125,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::SameLine();
             if (ImGui::Button("Dump info: holding a WEAPON")) m_DumpRequest = 2;
             ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
-            if (ImGui::Checkbox("Use the live camera FOV (recommended; unticked = camera profiles, which are not found)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
+            if (ImGui::Checkbox("Use the live camera FOV instead of the camera profiles (does not change the picture)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
             ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
         }
 
