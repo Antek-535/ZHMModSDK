@@ -184,6 +184,17 @@ private:
     std::string m_CamLive;                         // live values of the camera FOV properties (UI), guarded by m_ZoomMutex
     float m_CamLiveTimer = 0.0f;
     std::atomic<bool> m_ZoomGateNow{false};        // zoom is allowed right now (UI)
+    // Focus diagnostics: memory of the camera / player objects before and shortly after right mouse goes down; the values
+    // that changed show where the game keeps the "focus" zoom (logged to BetterInstinct_zoom.log).
+    struct SMemSnap {
+        std::string Label;
+        uintptr_t Base = 0;
+        std::vector<uint8_t> Data;
+    };
+    std::vector<SMemSnap> TakeSnaps();
+    std::vector<SMemSnap> m_SnapA;
+    float m_DiagTimer = -1.0f;
+    int m_DiagCount = 0;
     std::string m_ZoomLogBuf;                      // zoom diagnostics, written to BetterInstinct_zoom.log
     float m_ZoomLogTimer = 0.0f;
     bool m_ZoomLogDirty = false;
