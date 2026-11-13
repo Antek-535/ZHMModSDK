@@ -2186,6 +2186,8 @@ void BetterInstinct::ComputeWeaponRules() {
             s_R.Slot = s_Slot;
             s_R.Index = k;
             s_R.Value = s_W;
+            s_R.Empty = s_E;
+            s_R.HasEmpty = true;
             if (s_E < 0x10000u && s_W < 0x10000u) {
                 s_R.Mode = 0;
                 s_Small.push_back(s_R);
@@ -2195,8 +2197,16 @@ void BetterInstinct::ComputeWeaponRules() {
             }
         }
     }
-    const std::vector<SWeaponRule>& s_Src = !s_Small.empty() ? s_Small : s_Ptr;
-    for (size_t i = 0; i < s_Src.size() && i < 8; ++i) m_WeaponRules.push_back(s_Src[i]);
+    // Keep many values (not just 8) from BOTH kinds, spread evenly over everything found. The check votes over all of them,
+    // so a few useless values can no longer switch the weapon detection off.
+    auto s_Pick = [&](const std::vector<SWeaponRule>& p_List, size_t p_Max) {
+        if (p_List.empty()) return;
+        const size_t s_Stride = (p_List.size() + p_Max - 1) / p_Max;
+        size_t s_Taken = 0;
+        for (size_t i = 0; i < p_List.size() && s_Taken < p_Max; i += s_Stride, ++s_Taken) m_WeaponRules.push_back(p_List[i]);
+    };
+    s_Pick(s_Small, 32);
+    s_Pick(s_Ptr, 32);
 }
 
 void BetterInstinct::SaveWeaponRules() {
@@ -2207,7 +2217,9 @@ void BetterInstinct::SaveWeaponRules() {
         fs::create_directories(fs::path(s_Dir), s_Ec);
         std::ofstream s_File(fs::path(s_Dir) / L"BetterInstinct_weapon.cfg", std::ios::trunc);
         for (const SWeaponRule& s_R : m_WeaponRules) {
-            s_File << s_R.Slot << " " << s_R.Index << " " << s_R.Mode << " " << s_R.Value << "\n";
+            s_File << s_R.Slot << " " << s_R.Index << " " << s_R.Mode << " " << s_R.Value;
+            if (s_R.HasEmpty) s_File << " " << s_R.Empty;
+            s_File << "\n";
         }
     } catch (...) {
     }
@@ -2219,8 +2231,11 @@ void BetterInstinct::LoadWeaponRules() {
         std::wstring s_Dir = ConfigDir();
         if (s_Dir.empty()) return;
         std::ifstream s_File(fs::path(s_Dir) / L"BetterInstinct_weapon.cfg");
-        long long s_Slot = 0, s_Index = 0, s_Mode = 0, s_Value = 0;
-        while (s_File >> s_Slot >> s_Index >> s_Mode >> s_Value) {
+        std::string s_Line;
+        while (std::getline(s_File, s_Line)) {
+            long long s_Slot = 0, s_Index = 0, s_Mode = 0, s_Value = 0, s_Empty = 0;
+            const int s_N = std::sscanf(s_Line.c_str(), "%lld %lld %lld %lld %lld", &s_Slot, &s_Index, &s_Mode, &s_Value, &s_Empty);
+            if (s_N < 4) continue;
             if (s_Slot < 0 || s_Slot >= kLearnSlots || s_Index < 0 || s_Index >= LearnSlotDwords(static_cast<int>(s_Slot))) continue;
             if (s_Mode < 0 || s_Mode > 2) continue;
             SWeaponRule s_R;
@@ -2228,8 +2243,10 @@ void BetterInstinct::LoadWeaponRules() {
             s_R.Index = static_cast<int>(s_Index);
             s_R.Mode = static_cast<int>(s_Mode);
             s_R.Value = static_cast<uint32_t>(s_Value);
+            s_R.HasEmpty = s_N >= 5;
+            s_R.Empty = s_R.HasEmpty ? static_cast<uint32_t>(s_Empty) : 0u;
             m_WeaponRules.push_back(s_R);
-            if (m_WeaponRules.size() >= 8) break;
+            if (m_WeaponRules.size() >= 64) break;
         }
     } catch (...) {
     }
@@ -2255,6 +2272,7 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
         m_WeaponRules.clear();
         m_LearnMode = 0;
         m_WeaponHeld = false;
+        m_WeaponLatch = false;
         m_WeaponRuleCount.store(0);
         m_LearnRoundsE.store(0);
         m_LearnRoundsW.store(0);
@@ -2280,7 +2298,9 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
             m_LearnRoundsW.store(m_LearnW.Rounds);
             m_LearnMode = 0;
             if (m_LearnE.Rounds > 0 && m_LearnW.Rounds > 0) {
+                const std::vector<SWeaponRule> s_OldRules = m_WeaponRules;
                 ComputeWeaponRules();
+                if (m_WeaponRules.empty() && !s_OldRules.empty()) m_WeaponRules = s_OldRules; // a worse round must not throw away what worked
                 SaveWeaponRules();
                 m_WeaponRuleCount.store(static_cast<int>(m_WeaponRules.size()));
             }
@@ -2292,11 +2312,15 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
     m_LearnUiTaken.store(m_LearnTaken);
 
     // Is a weapon in the hands? Only matters (and is only read) while right mouse is held.
+    // Every learned value votes: it votes WEAPON when it looks like it did while a weapon was held, and EMPTY when it looks like it
+    // did with empty hands. Values that look like neither don't vote. More WEAPON than EMPTY votes = weapon. (Before, ALL values
+    // had to match exactly, so one useless value or a different weapon than the learned one silently allowed the zoom.)
+    if (!p_RightDown) m_WeaponLatch = false;
     bool s_Weapon = false;
     if (!m_WeaponRules.empty() && p_RightDown && m_LearnMode == 0) {
-        s_Weapon = true;
         const uint8_t* s_Bases[kLearnSlots] = {};
         bool s_Have[kLearnSlots] = {};
+        int s_WVotes = 0, s_EVotes = 0;
         for (const SWeaponRule& s_R : m_WeaponRules) {
             if (!s_Have[s_R.Slot]) { s_Have[s_R.Slot] = true; GetSlotBase(s_R.Slot, s_Bases[s_R.Slot]); }
             uint32_t s_V = 0;
@@ -2308,15 +2332,25 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
                 s_Ok = true;
             };
             if (!SafeCall(s_Read)) s_Ok = false;
-            bool s_Match = false;
-            if (s_Ok) {
-                if (s_R.Mode == 0) s_Match = s_V == s_R.Value;
-                else if (s_R.Mode == 1) s_Match = s_V != 0;
-                else s_Match = s_V == 0;
+            if (!s_Ok) continue;
+            bool s_IsW = false, s_IsE = false;
+            if (s_R.Mode == 0) {
+                s_IsW = s_V == s_R.Value;
+                s_IsE = s_R.HasEmpty ? (s_V == s_R.Empty) : !s_IsW;
+            } else if (s_R.Mode == 1) { // weapon: not zero, empty: zero
+                s_IsW = s_V != 0;
+                s_IsE = s_V == 0;
+            } else {                    // weapon: zero, empty: not zero
+                s_IsW = s_V == 0;
+                s_IsE = s_V != 0;
             }
-            if (!s_Match) { s_Weapon = false; break; } // all rules have to agree
+            if (s_IsW) ++s_WVotes;
+            else if (s_IsE) ++s_EVotes;
         }
+        s_Weapon = s_WVotes > s_EVotes;
+        if (s_Weapon) m_WeaponLatch = true;
     }
+    if (p_RightDown && m_LearnMode == 0 && m_WeaponLatch) s_Weapon = true; // once a weapon is seen, it stays blocked until right mouse is released
     m_WeaponHeld = s_Weapon;
     m_ItemHolding = s_Weapon; // (shown in the zoom log)
     m_WeaponState.store(m_WeaponRules.empty() ? (m_LearnE.Rounds > 0 && m_LearnW.Rounds > 0 ? 1 : 0) : (s_Weapon ? 3 : 2));
@@ -2333,7 +2367,7 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     UpdateWeapon(p_Dt, s_RightDown);
     const bool s_ItemOk = HeldItemAllowsZoom();                       // not with a weapon in the hands
     const bool s_InstinctOk = m_Active.load();                        // only while Instinct is in use
-    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk && s_InstinctOk;
+    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk && s_InstinctOk && m_LearnMode == 0; // (no zoom while the weapon check is being learned)
     g_ZoomWanted.store(s_Gate); // only then does the hook take the wheel away from the game
 
     const int s_Delta = g_Wheel.exchange(0);
@@ -4372,6 +4406,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             {
                 ImGui::TextDisabled("Weapon check: press a button, close the menu, then hold right mouse STEADY for about 2 seconds.");
                 ImGui::TextDisabled("Do it with empty hands and with a weapon in hand (twice each is best; once with a pistol, once with a rifle).");
+                ImGui::TextDisabled("Keep everything else the same in both (Instinct on or off, standing, same place). Press Forget first if you learned before.");
                 if (ImGui::Button("Learn: EMPTY hands")) m_LearnRequest = 1;
                 ImGui::SameLine();
                 if (ImGui::Button("Learn: holding a WEAPON")) m_LearnRequest = 2;
