@@ -1991,6 +1991,34 @@ void BetterInstinct::ApplyCameraFov(float p_Zoom) {
     }
 }
 
+std::vector<BetterInstinct::SMemSnap> BetterInstinct::TakeSnaps() {
+    std::vector<SMemSnap> s_Out;
+    auto s_Add = [&](const std::string& p_Label, const void* p_Base, size_t p_Size) {
+        if (!p_Base) return;
+        for (const SMemSnap& s_O : s_Out) if (s_O.Base == reinterpret_cast<uintptr_t>(p_Base)) return;
+        SMemSnap s_S;
+        s_S.Label = p_Label;
+        s_S.Base = reinterpret_cast<uintptr_t>(p_Base);
+        s_S.Data.assign(p_Size, 0);
+        for (size_t s_Off = 0; s_Off < p_Size; s_Off += 256) { // unreadable parts stay zero
+            const size_t s_N = std::min<size_t>(256, p_Size - s_Off);
+            const uint8_t* s_P = reinterpret_cast<const uint8_t*>(p_Base) + s_Off;
+            if (CanWriteMemory(s_P, s_N)) std::memcpy(s_S.Data.data() + s_Off, s_P, s_N);
+        }
+        s_Out.push_back(std::move(s_S));
+    };
+    auto s_Body = [&]() {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) return;
+        ZEntityRef s_Cam = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
+        s_Add("cameraObj", s_Cam.m_pObj, 0x800);
+        if (ZCameraEntity* s_CamI = s_Cam ? s_Cam.QueryInterface<ZCameraEntity>() : nullptr) s_Add("cameraIface", s_CamI, 0x800);
+        s_Add("player", s_Local.m_entityRef.m_pObj, 0x1800);
+    };
+    SafeCall(s_Body);
+    return s_Out;
+}
+
 void BetterInstinct::UpdateZoom(float p_Dt) {
     {
         const int s_Dump = m_DumpRequest.exchange(0);
@@ -2012,10 +2040,11 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
     {
         auto s_Log = [&](const std::string& p_Line) {
             m_ZoomLogBuf += p_Line + "\n";
-            if (m_ZoomLogBuf.size() > 14000) m_ZoomLogBuf.erase(0, m_ZoomLogBuf.size() - 10000);
+            if (m_ZoomLogBuf.size() > 60000) m_ZoomLogBuf.erase(0, m_ZoomLogBuf.size() - 45000);
             m_ZoomLogDirty = true;
         };
         char s_B[512];
+        char s_B2[256];
         if (s_RightDown != m_PrevRightDown) s_Log(s_RightDown ? "--- right mouse DOWN" : "--- right mouse UP");
         if (s_Delta != 0) {
             std::snprintf(s_B, sizeof(s_B), "wheel delta=%d  gate=%d (zoomEnabled=%d itemOk=%d holding=%d)", s_Delta, s_Gate ? 1 : 0,
@@ -2038,6 +2067,37 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
                           m_ZoomWrites.load(), m_CamFovs.size());
             s_Log(s_B);
             if (!s_Live.empty()) s_Log("live camera: " + s_Live);
+        }
+        // Focus diagnostics for the first few presses: hold right mouse for ~1.5 s WITHOUT scrolling or moving the mouse.
+        if (s_RightDown && !m_PrevRightDown && m_DiagCount < 4) {
+            m_SnapA = TakeSnaps();
+            m_DiagTimer = 1.5f;
+        }
+        if (!s_RightDown) m_DiagTimer = -1.0f;
+        if (m_DiagTimer > 0.0f) {
+            m_DiagTimer -= p_Dt;
+            if (m_DiagTimer <= 0.0f) {
+                ++m_DiagCount;
+                std::vector<SMemSnap> s_B = TakeSnaps();
+                s_Log("=== focus diff #" + std::to_string(m_DiagCount) + " (right mouse down -> 1.5 s later) ===");
+                int s_Lines = 0;
+                for (const SMemSnap& s_SB : s_B) {
+                    for (const SMemSnap& s_SA : m_SnapA) {
+                        if (s_SA.Base != s_SB.Base || s_SA.Data.size() != s_SB.Data.size()) continue;
+                        for (size_t s_Off = 0; s_Off + 4 <= s_SB.Data.size() && s_Lines < 250; s_Off += 4) {
+                            if (std::memcmp(&s_SA.Data[s_Off], &s_SB.Data[s_Off], 4) == 0) continue;
+                            float s_Fa, s_Fb;
+                            int32_t s_Ia, s_Ib;
+                            std::memcpy(&s_Fa, &s_SA.Data[s_Off], 4); std::memcpy(&s_Fb, &s_SB.Data[s_Off], 4);
+                            std::memcpy(&s_Ia, &s_SA.Data[s_Off], 4); std::memcpy(&s_Ib, &s_SB.Data[s_Off], 4);
+                            std::snprintf(s_B2, sizeof(s_B2), "%s+0x%zX  float %g -> %g   int %d -> %d", s_SB.Label.c_str(), s_Off, s_Fa, s_Fb, s_Ia, s_Ib);
+                            s_Log(s_B2);
+                            ++s_Lines;
+                        }
+                    }
+                }
+                s_Log("=== end of diff (" + std::to_string(s_Lines) + " changed values) ===");
+            }
         }
         if (m_ZoomLogDirty && (!s_RightDown || m_ZoomLogTimer > 0.4f)) { // on release, and about every 2 s while held
             ZoomLog(m_ZoomLogBuf);
