@@ -198,8 +198,10 @@ private:
     struct SWeaponRule {
         int Slot = 0;                              // 0 player interface, 1 player object, 2 character, 3.. sub-controllers
         int Index = 0;                             // 4-byte slot inside that object
-        int Mode = 0;                              // 0 = equals Value, 1 = not zero, 2 = zero
-        uint32_t Value = 0;
+        int Mode = 0;                              // 0 = equals Value, 1 = not zero, 2 = zero (the WEAPON state)
+        uint32_t Value = 0;                        // value seen while a weapon is held
+        uint32_t Empty = 0;                        // value seen with empty hands (mode 0 only)
+        bool HasEmpty = false;                     // Empty is known (rules from an old config file don't have it)
     };
     SLearnSet m_LearnE, m_LearnW;                  // game thread only
     std::vector<SWeaponRule> m_WeaponRules;        // game thread only
@@ -211,6 +213,7 @@ private:
     int m_LearnTaken = 0;
     bool m_WeaponLoaded = false;
     bool m_WeaponHeld = false;                     // a weapon is in 47's hands right now
+    bool m_WeaponLatch = false;                    // a weapon was seen during this right-mouse press: stays blocked until release
     std::atomic<int> m_LearnUiMode{0};
     std::atomic<int> m_LearnUiTaken{0};
     std::atomic<int> m_LearnRoundsE{0};
