@@ -572,6 +572,9 @@ BetterInstinct::~BetterInstinct() {
 
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->UnregisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+    const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_LateDelegate(this, &BetterInstinct::OnLateFrameUpdate);
+    Globals::GameLoopManager->UnregisterFrameUpdate(s_LateDelegate, 1000000, EUpdateMode::eUpdatePlayMode);
+    Globals::GameLoopManager->UnregisterFrameUpdate(s_LateDelegate, -1000000, EUpdateMode::eUpdatePlayMode);
 
     if (m_HasPlayer.load()) RestoreGlowColors(); // put the game's own colors back
     RestoreTint();
@@ -600,6 +603,11 @@ void BetterInstinct::OnEngineInitialized() {
     // Register the game-loop update first, so nothing below can stop the core feature from running.
     const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_Delegate(this, &BetterInstinct::OnFrameUpdate);
     Globals::GameLoopManager->RegisterFrameUpdate(s_Delegate, 1, EUpdateMode::eUpdatePlayMode);
+    // The game rewrites the camera FOV every frame, so a single write early in the frame is lost. Run the zoom again at both
+    // ends of the update order (whichever one comes after the game's camera update wins).
+    const ZMemberDelegate<BetterInstinct, void(const SGameUpdateEvent&)> s_LateDelegate(this, &BetterInstinct::OnLateFrameUpdate);
+    Globals::GameLoopManager->RegisterFrameUpdate(s_LateDelegate, 1000000, EUpdateMode::eUpdatePlayMode);
+    Globals::GameLoopManager->RegisterFrameUpdate(s_LateDelegate, -1000000, EUpdateMode::eUpdatePlayMode);
 
     try {
         m_ModDir = FindModuleDir();
@@ -2220,6 +2228,10 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
                 m_ZoomWritten = 1.0f;
             }
         } else {
+            // Profile mode: still look at the live camera (read only) so the log shows how the game's own FOV reacts.
+            m_CamScan -= p_Dt;
+            if (m_CamFovs.empty() && m_CamScan <= 0.0f) { m_CamScan = 2.0f; ScanCameraFov(); }
+            if (s_RightDown && !m_PrevRightDown && !s_Overriding && CameraPtrChanged()) { m_CamScan = 2.0f; ScanCameraFov(); }
             if (s_Overriding) ApplyCameraFov(1.0f); // switched method: hand the live camera value back
             if (std::abs(m_ZoomCur - m_ZoomWritten) > 0.002f) {
                 WriteZoomFov(m_ZoomCur);
@@ -2720,6 +2732,10 @@ void BetterInstinct::UpdateGlowColors(float p_Dt) {
 // ---------------------------------------------------------------------------
 // Game loop
 // ---------------------------------------------------------------------------
+
+void BetterInstinct::OnLateFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
+    if (m_ZoomLiveCam && m_ZoomCur > 1.0005f && g_ZoomWanted.load()) ApplyCameraFov(m_ZoomCur);
+}
 
 void BetterInstinct::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     if (!Globals::GameTimeManager) {
