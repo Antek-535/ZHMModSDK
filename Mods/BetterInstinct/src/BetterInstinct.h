@@ -109,6 +109,7 @@ private:
         float Vanilla[4] = {};
     };
     void InitGlowDefaults();
+    void ResetAllSettings();
     void ScanGlowSlots(bool p_KeepSnapshots);
     void UpdateGlowColors(float p_Dt);
     void WriteGlowSlots(bool p_NotifyGame);
@@ -354,12 +355,9 @@ private:
     int m_BindTarget = 0;            // which key is being bound: 0 = Instinct key, 1 = zoom key
     bool m_ZoomOnlyInstinct = true;  // the wheel zoom only works while Instinct is active
     bool m_ZoomEnabled = true;       // wheel zoom while holding right mouse (empty hands / non-throwable item)
-    float m_ZoomMax = 5.0f;          // furthest zoom, 1 = vanilla
-    float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
+    float m_ZoomMax = 3.0f;          // furthest zoom (2 to 5), 1 = vanilla; each wheel notch is one whole level
     float m_ZoomSmooth = 10.0f;      // higher = snappier
-    bool m_ZoomRemember = false;     // keep the zoom level for the next time you aim (default: back to 1x on release)
-    bool m_ZoomLiveCam = false;        // true = scale the live camera FOV (works); false = scale the UnAimed camera profiles (never found them in the logs)
-    bool m_ZoomAnyItem = false;      // skip the held-item check (zoom with anything in hand): off, zoom is for empty hands only
+    bool m_ZoomLiveCam = true;         // true = scale the live camera FOV (works); false = scale the UnAimed camera profiles (never found them in the logs)
 
     bool m_HudEnabled = true;
     bool m_HudAlways = false;        // keep the meter visible even when full
