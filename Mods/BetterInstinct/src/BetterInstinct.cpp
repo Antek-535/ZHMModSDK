@@ -1836,6 +1836,7 @@ void BetterInstinct::WriteCamFov(const SCamFov& p_F, float p_Value) {
 // are handled too (they are read and written through the property system).
 void BetterInstinct::ScanCameraFov() {
     m_CamFovs.clear();
+    m_CamBase = 0;
     std::string s_Info;
     uint32_t s_Checked = 0;
 
@@ -1896,6 +1897,7 @@ void BetterInstinct::ScanCameraFov() {
                 if (s_Getter > 1.0f && s_Getter < 170.0f) {
                     auto s_Probe = [&]() {
                         uint8_t* s_Base = reinterpret_cast<uint8_t*>(s_Cam);
+                        m_CamBase = reinterpret_cast<uintptr_t>(s_Cam);
                         for (size_t s_Off = 0x20; s_Off < 0x800; s_Off += 4) {
                             float* s_Ptr = reinterpret_cast<float*>(s_Base + s_Off);
                             if (!CanWriteMemory(s_Ptr, sizeof(float))) continue;
@@ -1982,20 +1984,7 @@ void BetterInstinct::ScanCameraFov() {
                 s_Info += s_F.Name + "=" + std::to_string(s_V) + (s_F.Ptr ? " " : "(setter) ");
             }
         }
-        s_ScanEntity("camera", s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef);
-        s_ScanEntity("player", s_Local.m_entityRef);
-        auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
-        if (s_CharRef.m_pInterfaceRef) {
-            s_ScanEntity("character", s_CharRef.m_entityRef);
-            auto& s_ContRef = s_CharRef.m_pInterfaceRef->m_rSubcontrollerContainer;
-            if (s_ContRef.m_pInterfaceRef) {
-                int s_Idx = 0;
-                for (auto& s_Sub : s_ContRef.m_pInterfaceRef->m_aReferencedControllers) {
-                    if (s_Idx >= 60) break;
-                    s_ScanEntity("sub" + std::to_string(s_Idx++), s_Sub.m_entityRef);
-                }
-            }
-        }
+        (void)s_ScanEntity; // the slow scan of every entity for 'fov' properties is not needed: the camera object itself is probed above
     };
     if (!SafeCall(s_Walk)) { m_CamFovs.clear(); s_Info = "scan failed"; }
     if (s_Info.empty()) s_Info = "no FOV property found (" + std::to_string(s_Checked) + " entities checked)";
@@ -2021,6 +2010,20 @@ void BetterInstinct::WriteCamExtras(const SCamFov& p_F, float p_FovDeg) {
         }
     };
     SafeCall(s_Body);
+}
+
+// Cheap check (one interface lookup): is the camera object still the one the cached FOV pointers belong to?
+bool BetterInstinct::CameraPtrChanged() {
+    uintptr_t s_Cur = 0;
+    auto s_Body = [&]() {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) return;
+        ZEntityRef s_Ref = s_Local.m_pInterfaceRef->m_rMainCamera.m_entityRef;
+        ZCameraEntity* s_Cam = s_Ref ? s_Ref.QueryInterface<ZCameraEntity>() : nullptr;
+        s_Cur = reinterpret_cast<uintptr_t>(s_Cam);
+    };
+    SafeCall(s_Body);
+    return s_Cur != 0 && s_Cur != m_CamBase;
 }
 
 void BetterInstinct::ApplyCameraFov(float p_Zoom) {
@@ -2078,7 +2081,7 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         if (s_Dump == 1) DumpHeldItemInfo(L"BetterInstinct_dump_empty.log");
         else if (s_Dump == 2) DumpHeldItemInfo(L"BetterInstinct_dump_weapon.log");
     }
-    UpdateHeldItem(p_Dt);
+    // (held-item scanning removed: the game data has no such property, and the scan caused hitches)
     const bool s_Focused = GameIsForeground() && !m_Binding;
     const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
     const bool s_ItemOk = HeldItemAllowsZoom();                       // empty hands only
@@ -2098,7 +2101,13 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         };
         char s_B[512];
         char s_B2[256];
-        if (s_RightDown != m_PrevRightDown) s_Log(s_RightDown ? "--- right mouse DOWN" : "--- right mouse UP");
+        if (s_RightDown != m_PrevRightDown) {
+            s_Log(s_RightDown ? "--- right mouse DOWN" : "--- right mouse UP");
+            if (s_RightDown) {
+                std::lock_guard<std::mutex> s_Lock(m_ZoomMutex);
+                s_Log("camera scan: " + m_CamInfo);
+            }
+        }
         if (s_Delta != 0) {
             std::snprintf(s_B, sizeof(s_B), "wheel delta=%d  gate=%d (zoomEnabled=%d itemOk=%d holding=%d)", s_Delta, s_Gate ? 1 : 0,
                           m_ZoomEnabled ? 1 : 0, s_ItemOk ? 1 : 0, m_ItemHolding ? 1 : 0);
@@ -2120,9 +2129,22 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
                           m_ZoomWrites.load(), m_CamFovs.size());
             s_Log(s_B);
             if (!s_Live.empty()) s_Log("live camera: " + s_Live);
+            if (!m_CamFovs.empty()) { // current values of the linked copies (do they follow our zoom?)
+                std::string s_Ex = "linked:";
+                int s_N = 0;
+                for (const SCamExtra& s_E : m_CamFovs[0].Extras) {
+                    if (++s_N > 12) break;
+                    if (s_E.Ptr && CanWriteMemory(s_E.Ptr, sizeof(float))) {
+                        char s_T[48];
+                        std::snprintf(s_T, sizeof(s_T), " k%d=%g", s_E.Kind, *s_E.Ptr);
+                        s_Ex += s_T;
+                    }
+                }
+                s_Log(s_Ex);
+            }
         }
         // Focus diagnostics for the first few presses: hold right mouse for ~1.5 s WITHOUT scrolling or moving the mouse.
-        if (s_RightDown && !m_PrevRightDown && m_DiagCount < 4) {
+        if (s_RightDown && !m_PrevRightDown && m_DiagCount < 0) { // focus memory diff: done, switched off
             m_SnapA = TakeSnaps();
             m_DiagTimer = 1.5f;
         }
@@ -2184,7 +2206,7 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
                 m_CamScan = 2.0f;
                 ScanCameraFov();
             }
-            if (s_RightDown && !m_PrevRightDown && !s_Overriding) { m_CamScan = 2.0f; ScanCameraFov(); } // fresh pointers for this aim
+            if (s_RightDown && !m_PrevRightDown && !s_Overriding && CameraPtrChanged()) { m_CamScan = 2.0f; ScanCameraFov(); } // scan again only when the camera object changed (a full scan makes the game hitch)
             if (m_ZoomCur > 1.0005f || s_Overriding) ApplyCameraFov(m_ZoomCur);
             if (m_ZoomWritten != 1.0f) { // switched method: give the profiles back to the game
                 WriteZoomFov(1.0f);
