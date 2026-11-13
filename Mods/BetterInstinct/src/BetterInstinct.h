@@ -144,7 +144,16 @@ private:
         const float* Ptr = nullptr;                // where the profile's m_fFOV lives (read back for the UI)
     };
     // Live camera: float properties with "fov" in their name on the player's main camera entity.
+    // The camera keeps copies of the FOV: more degrees, radians, and projection scale values (1/tan(fov/2) and that divided
+    // by the aspect ratio). The picture only changes when all of them agree, so they are found next to the main FOV and
+    // written together.
+    struct SCamExtra {
+        float* Ptr = nullptr;
+        int Kind = 0;                              // 0 = degrees copy, 1 = radians, 2 = 1/tan(fov/2), 3 = (1/tan(fov/2)) * Ratio
+        float Ratio = 1.0f;
+    };
     struct SCamFov {
+        std::vector<SCamExtra> Extras;
         float* Ptr = nullptr;                      // direct memory (null when the property only has a getter/setter)
         ZEntityRef Ref;                            // owner entity (used for getter/setter properties)
         uint32_t PropId = 0;
@@ -178,6 +187,7 @@ private:
     void UpdateHeldItem(float p_Dt);
     void ScanCameraFov();
     void ApplyCameraFov(float p_Zoom);
+    void WriteCamExtras(const SCamFov& p_F, float p_FovDeg);
     std::atomic<float> m_ZoomReadback{0.0f};       // profile FOV as read back from memory
     std::atomic<float> m_ZoomReadbackVan{0.0f};
     std::string m_CamInfo;                         // guarded by m_ZoomMutex
