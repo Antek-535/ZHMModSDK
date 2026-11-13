@@ -309,6 +309,8 @@ private:
     float m_RechargeDelay = 1.0f;    // pause before recharging after use
     bool m_BlockEnabled = true;      // block the Instinct key while Instinct is unusable
 
+    int m_ZoomKey = 0;               // 0 = zoom with right mouse + wheel only; otherwise this key must also be held (virtual-key code)
+    int m_BindTarget = 0;            // which key is being bound: 0 = Instinct key, 1 = zoom key
     bool m_ZoomEnabled = true;       // wheel zoom while holding right mouse (empty hands / non-throwable item)
     float m_ZoomMax = 5.0f;          // furthest zoom, 1 = vanilla
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
