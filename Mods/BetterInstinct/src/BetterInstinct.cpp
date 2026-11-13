@@ -2144,6 +2144,22 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
                           m_ZoomWrites.load(), m_CamFovs.size());
             s_Log(s_B);
             if (!s_Live.empty()) s_Log("live camera: " + s_Live);
+            {
+                // State flags of the player: do they differ between empty hands, a weapon, a coin, a syringe...?
+                uint64_t s_Mv = 0, s_Cu = 0;
+                uint32_t s_Lo = 0;
+                auto s_ReadFlags = [&]() {
+                    auto s_Local = SDK()->GetLocalPlayer();
+                    if (!s_Local.m_pInterfaceRef) return;
+                    s_Mv = s_Local.m_pInterfaceRef->m_nMovementFlags;
+                    s_Lo = s_Local.m_pInterfaceRef->m_nLocomotionFlag;
+                    s_Cu = s_Local.m_pInterfaceRef->m_nCustomFlags;
+                };
+                SafeCall(s_ReadFlags);
+                std::snprintf(s_B2, sizeof(s_B2), "flags: movement=0x%016llX locomotion=0x%08X custom=0x%016llX",
+                              static_cast<unsigned long long>(s_Mv), s_Lo, static_cast<unsigned long long>(s_Cu));
+                s_Log(s_B2);
+            }
             if (!m_CamFovs.empty()) { // current values of the linked copies (do they follow our zoom?)
                 std::string s_Ex = "linked:";
                 int s_N = 0;
