@@ -213,6 +213,7 @@ private:
     int m_LearnTaken = 0;
     bool m_WeaponLoaded = false;
     bool m_WeaponHeld = false;                     // a weapon is in 47's hands right now
+    float m_WeaponEvalWait = 0.0f;                 // the weapon vote runs ~10 times a second, not every frame
     bool m_WeaponLatch = false;                    // a weapon was seen during this right-mouse press: stays blocked until release
     std::atomic<int> m_LearnUiMode{0};
     std::atomic<int> m_LearnUiTaken{0};
