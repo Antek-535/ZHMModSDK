@@ -4048,7 +4048,9 @@ void BetterInstinct::DrawHud() {
                                   std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
     // The status icon is a round "bulb" attached to the start of the bar (below a vertical bar, left of a horizontal one).
     const float s_IconR = s_Girth * 1.5f;
-    const float s_IconOff = s_IconR * 0.55f; // how far the bulb's center is beyond the bar's end: it merges into the bar
+    // Center of the bulb beyond the bar's end: exactly where the circle is as wide as the bar, so the bar's two edges run
+    // straight into the circle's outline (a full circle, not a cut-off one).
+    const float s_IconOff = std::sqrt(std::max(0.0f, s_IconR * s_IconR - (s_Girth * 0.5f) * (s_Girth * 0.5f)));
     const float s_LabelRoom = 4.0f * s_Ui;
     const float s_BelowRoom = !m_ShowIcon ? 0.0f
         : (s_Vert ? (s_IconOff + s_IconR + 2.0f * s_Ui) : (s_IconR - s_Girth * 0.5f + 2.0f * s_Ui)); // keep the bulb on screen
@@ -4099,11 +4101,11 @@ void BetterInstinct::DrawHud() {
         ImVec2 s_Ic;
         if (s_Vert) {
             s_Ic = ImVec2(s_Cx, s_Bottom + s_IconOff);
-            s_Glyph = ImVec2(s_Cx, s_Bottom + (s_IconOff + s_IconR) * 0.5f);
+            s_Glyph = s_Ic;
             s_Dl->PushClipRect(ImVec2(0.0f, s_Bottom), ImVec2(s_Screen.x, s_Screen.y), true);
         } else {
             s_Ic = ImVec2(s_Left - s_IconOff, (s_Top + s_Bottom) * 0.5f);
-            s_Glyph = ImVec2(s_Left - (s_IconOff + s_IconR) * 0.5f, (s_Top + s_Bottom) * 0.5f);
+            s_Glyph = s_Ic;
             s_Dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(s_Left, s_Screen.y), true);
         }
         s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(170 * s_A)), 48);
@@ -4204,15 +4206,29 @@ void BetterInstinct::DrawHud() {
 
     // Thin outline, a little brighter while Instinct is active.
     const float s_Border = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
-    s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
+    if (!m_ShowIcon) {
+        s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
+    } else {
+        // Open on the side where the bulb is attached, so the inside of the bar flows into the bulb.
+        const ImU32 s_BorderCol = s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A);
+        ImVec2 s_Pts[4];
+        if (s_Vert) {
+            s_Pts[0] = ImVec2(s_Left, s_Bottom); s_Pts[1] = ImVec2(s_Left, s_Top);
+            s_Pts[2] = ImVec2(s_Right, s_Top);   s_Pts[3] = ImVec2(s_Right, s_Bottom);
+        } else {
+            s_Pts[0] = ImVec2(s_Left, s_Top);    s_Pts[1] = ImVec2(s_Right, s_Top);
+            s_Pts[2] = ImVec2(s_Right, s_Bottom); s_Pts[3] = ImVec2(s_Left, s_Bottom);
+        }
+        s_Dl->AddPolyline(s_Pts, 4, s_BorderCol, 0, s_Thick);
+    }
 
     // Status symbol in the bulb: red down arrow while Instinct is in use, golden up arrow while it can't be used
     // (empty / recharging), and the orange flame (black inside) once it can be used again.
     if (m_ShowIcon) {
         auto s_Chevron = [&](bool p_Down, float p_R, float p_G, float p_B) {
-            const float s_Hw = s_IconR * 0.62f;
+            const float s_Hw = s_IconR * 0.36f;
             const float s_Hh = s_Hw * 0.49f;       // same proportions as the reference arrow
-            const float s_Stroke = std::max(2.0f, s_Hw * 2.0f * 0.12f);
+            const float s_Stroke = std::max(1.5f, s_Hw * 2.0f * 0.13f);
             const float s_Dy = p_Down ? s_Hh : -s_Hh; // the tip
             const ImVec2 s_P1(s_Glyph.x - s_Hw, s_Glyph.y - s_Dy);
             const ImVec2 s_P2(s_Glyph.x, s_Glyph.y + s_Dy);
@@ -4228,8 +4244,9 @@ void BetterInstinct::DrawHud() {
             s_Chevron(false, 1.00f, 0.78f, 0.28f);  // gold, pointing up
         } else {
             auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
-                const float s_F = s_IconR * 0.55f * p_Scale;
-                auto P = [&](float x, float y) { return ImVec2(s_Glyph.x + x * s_F, s_Glyph.y + p_Dy * s_IconR * 0.55f + y * s_F); };
+                const float s_F0 = s_IconR * 0.38f;
+                const float s_F = s_F0 * p_Scale;
+                auto P = [&](float x, float y) { return ImVec2(s_Glyph.x + x * s_F, s_Glyph.y + (p_Dy + 0.05f) * s_F0 + y * s_F); };
                 s_Dl->PathClear();
                 s_Dl->PathLineTo(P(0.05f, -1.15f));
                 s_Dl->PathBezierCubicCurveTo(P(0.15f, -0.55f), P(0.85f, -0.35f), P(0.70f, 0.30f));
@@ -4699,6 +4716,8 @@ void BetterInstinct::ResetAllSettings() {
     m_LutFailSig.store(0);
 
     InitGlowDefaults(); // the game's own people / item colors
+    m_GlowRescanRequest = true; // the reset also forgot the game's colors we had remembered: read them again right away
+    m_GlowForce = true;
 
     m_SoundEnabled = true;
     m_SoundSource = 0;
