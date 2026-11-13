@@ -186,6 +186,43 @@ private:
     void ScanItemProbes();
     bool ReadItemProbe(const SItemProbe& p_P, bool& p_Out);
     void UpdateHeldItem(float p_Dt);
+
+    // Weapon check (the zoom must never work with a weapon in the hands). The game has no readable "held weapon" property, so the
+    // mod learns it from the player's own memory: you press "Learn EMPTY" / "Learn WEAPON" and hold right mouse for ~2 s each.
+    // Values that stay the same inside each state but differ between the two states become the weapon rule (saved to a file).
+    struct SLearnSet {
+        std::vector<uint32_t> First;               // first value seen for every 4-byte slot of the sampled objects
+        std::vector<uint8_t> State;                // 0 = not seen, 1 = constant so far, 2 = changes / unreadable
+        int Rounds = 0;                            // how many times this state was learned
+    };
+    struct SWeaponRule {
+        int Slot = 0;                              // 0 player interface, 1 player object, 2 character, 3.. sub-controllers
+        int Index = 0;                             // 4-byte slot inside that object
+        int Mode = 0;                              // 0 = equals Value, 1 = not zero, 2 = zero
+        uint32_t Value = 0;
+    };
+    SLearnSet m_LearnE, m_LearnW;                  // game thread only
+    std::vector<SWeaponRule> m_WeaponRules;        // game thread only
+    std::atomic<int> m_LearnRequest{0};            // 1 = learn empty hands, 2 = learn weapon, 3 = forget everything (UI)
+    int m_LearnMode = 0;                           // 0 off, 1 collecting EMPTY, 2 collecting WEAPON
+    float m_LearnTimeout = 0.0f;
+    float m_LearnGap = 0.0f;
+    float m_RmbTime = 0.0f;                        // how long right mouse has been held (samples start after it settles)
+    int m_LearnTaken = 0;
+    bool m_WeaponLoaded = false;
+    bool m_WeaponHeld = false;                     // a weapon is in 47's hands right now
+    std::atomic<int> m_LearnUiMode{0};
+    std::atomic<int> m_LearnUiTaken{0};
+    std::atomic<int> m_LearnRoundsE{0};
+    std::atomic<int> m_LearnRoundsW{0};
+    std::atomic<int> m_WeaponRuleCount{0};
+    std::atomic<int> m_WeaponState{0};             // 0 not learned, 1 learned but nothing differs, 2 hands free, 3 weapon detected (UI)
+    void UpdateWeapon(float p_Dt, bool p_RightDown);
+    void LearnSample(SLearnSet& p_Set);
+    void ComputeWeaponRules();
+    bool GetSlotBase(int p_Slot, const uint8_t*& p_Base);
+    void SaveWeaponRules();
+    void LoadWeaponRules();
     void ScanCameraFov();
     void ApplyCameraFov(float p_Zoom);
     bool CameraPtrChanged();
@@ -311,6 +348,7 @@ private:
 
     int m_ZoomKey = 0;               // 0 = zoom with right mouse + wheel only; otherwise this key must also be held (virtual-key code)
     int m_BindTarget = 0;            // which key is being bound: 0 = Instinct key, 1 = zoom key
+    bool m_ZoomOnlyInstinct = true;  // the wheel zoom only works while Instinct is active
     bool m_ZoomEnabled = true;       // wheel zoom while holding right mouse (empty hands / non-throwable item)
     float m_ZoomMax = 5.0f;          // furthest zoom, 1 = vanilla
     float m_ZoomStep = 1.15f;        // zoom multiplier per wheel notch
