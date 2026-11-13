@@ -926,6 +926,7 @@ bool BetterInstinct::SaveConfigFile() {
 
         s_Int("instinct_key", m_InstinctKey);
         s_Int("zoom_key", m_ZoomKey);
+        s_Bool("zoom_only_instinct", m_ZoomOnlyInstinct);
         s_Bool("toggle_mode", m_ToggleMode);
         s_Bool("block_enabled", m_BlockEnabled);
         s_Flt("focus_scale", m_FocusScale);
@@ -1060,6 +1061,7 @@ bool BetterInstinct::LoadConfigFile() {
 
     s_Int("instinct_key", m_InstinctKey, 1, 254);
     s_Int("zoom_key", m_ZoomKey, 0, 254);
+    s_Bool("zoom_only_instinct", m_ZoomOnlyInstinct);
     s_Bool("toggle_mode", m_ToggleMode);
     s_Bool("block_enabled", m_BlockEnabled);
     s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
@@ -1609,11 +1611,10 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
     }
 }
 
-// Is the zoom allowed for what 47 holds right now? Only with empty hands: no gun, no throwable, no tool, nothing.
-// The check looks at reflected properties of the player / character / sub-controllers (see ScanItemProbes).
+// Is the zoom allowed for what 47 holds right now? Everything except weapons (see UpdateWeapon / the learned weapon rule).
 bool BetterInstinct::HeldItemAllowsZoom() {
     if (m_ZoomAnyItem) return true; // the user switched the check off
-    return !m_ItemHolding;
+    return !m_WeaponHeld;           // only weapons block the zoom (empty hands and other items are fine)
 }
 
 // Looks for properties that tell whether something is in 47's hands. Names are matched loosely, because the exact
@@ -2092,18 +2093,247 @@ std::vector<BetterInstinct::SMemSnap> BetterInstinct::TakeSnaps() {
     return s_Out;
 }
 
+// ---------------------------------------------------------------------------
+// Weapon check
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kLearnSubs = 40;                                   // sub-controllers sampled
+constexpr int kLearnSlots = 3 + kLearnSubs;
+int LearnSlotDwords(int p_Slot) { return p_Slot <= 1 ? 2048 : (p_Slot == 2 ? 1024 : 512); }
+int LearnSlotStart(int p_Slot) {
+    int s_Sum = 0;
+    for (int i = 0; i < p_Slot; ++i) s_Sum += LearnSlotDwords(i);
+    return s_Sum;
+}
+int LearnTotalDwords() { return LearnSlotStart(kLearnSlots); }
+} // namespace
+
+// Memory of the player's objects that is searched for the weapon state: the player (interface and object), its character and the
+// character's sub-controllers (inventory, hands...).
+bool BetterInstinct::GetSlotBase(int p_Slot, const uint8_t*& p_Base) {
+    p_Base = nullptr;
+    auto s_Body = [&]() {
+        auto s_Local = SDK()->GetLocalPlayer();
+        if (!s_Local.m_pInterfaceRef) return;
+        if (p_Slot == 0) { p_Base = reinterpret_cast<const uint8_t*>(s_Local.m_pInterfaceRef); return; }
+        if (p_Slot == 1) { p_Base = reinterpret_cast<const uint8_t*>(s_Local.m_entityRef.m_pObj); return; }
+        auto& s_CharRef = s_Local.m_pInterfaceRef->m_pCharacter;
+        if (!s_CharRef.m_pInterfaceRef) return;
+        if (p_Slot == 2) { p_Base = reinterpret_cast<const uint8_t*>(s_CharRef.m_entityRef.m_pObj); return; }
+        auto& s_ContRef = s_CharRef.m_pInterfaceRef->m_rSubcontrollerContainer;
+        if (!s_ContRef.m_pInterfaceRef) return;
+        int s_Idx = 0;
+        for (auto& s_Sub : s_ContRef.m_pInterfaceRef->m_aReferencedControllers) {
+            if (s_Idx >= kLearnSubs) break;
+            if (s_Idx == p_Slot - 3) { p_Base = reinterpret_cast<const uint8_t*>(s_Sub.m_entityRef.m_pObj); return; }
+            ++s_Idx;
+        }
+    };
+    if (!SafeCall(s_Body)) { p_Base = nullptr; return false; }
+    return p_Base != nullptr;
+}
+
+// One sample: every 4-byte value of those objects. A value that is always the same stays "constant"; anything else is dropped.
+void BetterInstinct::LearnSample(SLearnSet& p_Set) {
+    const int s_Total = LearnTotalDwords();
+    if (static_cast<int>(p_Set.First.size()) != s_Total) {
+        p_Set.First.assign(static_cast<size_t>(s_Total), 0);
+        p_Set.State.assign(static_cast<size_t>(s_Total), 0);
+    }
+    for (int s_Slot = 0; s_Slot < kLearnSlots; ++s_Slot) {
+        const uint8_t* s_Base = nullptr;
+        if (!GetSlotBase(s_Slot, s_Base)) continue;
+        const int s_Start = LearnSlotStart(s_Slot);
+        const int s_Count = LearnSlotDwords(s_Slot);
+        for (int s_Chunk = 0; s_Chunk < s_Count; s_Chunk += 64) { // 256 bytes at a time
+            const int s_N = std::min(64, s_Count - s_Chunk);
+            uint32_t s_Buf[64] = {};
+            bool s_Ok = false;
+            auto s_Read = [&]() {
+                const uint8_t* s_P = s_Base + static_cast<size_t>(s_Chunk) * 4;
+                if (!CanWriteMemory(s_P, static_cast<size_t>(s_N) * 4)) return;
+                std::memcpy(s_Buf, s_P, static_cast<size_t>(s_N) * 4);
+                s_Ok = true;
+            };
+            if (!SafeCall(s_Read)) s_Ok = false;
+            for (int k = 0; k < s_N; ++k) {
+                const size_t s_I = static_cast<size_t>(s_Start + s_Chunk + k);
+                if (!s_Ok) { p_Set.State[s_I] = 2; continue; }
+                if (p_Set.State[s_I] == 0) { p_Set.First[s_I] = s_Buf[k]; p_Set.State[s_I] = 1; }
+                else if (p_Set.State[s_I] == 1 && p_Set.First[s_I] != s_Buf[k]) p_Set.State[s_I] = 2;
+            }
+        }
+    }
+}
+
+// Rule = values that are constant while the hands are empty, constant while a weapon is held, and different between the two.
+// Small values (flags / states) are preferred; if there are none, pointer-like values (a "something is held" pointer) are used.
+void BetterInstinct::ComputeWeaponRules() {
+    m_WeaponRules.clear();
+    const int s_Total = LearnTotalDwords();
+    if (static_cast<int>(m_LearnE.State.size()) != s_Total || static_cast<int>(m_LearnW.State.size()) != s_Total) return;
+
+    std::vector<SWeaponRule> s_Small, s_Ptr;
+    for (int s_Slot = 0; s_Slot < kLearnSlots; ++s_Slot) {
+        const int s_Start = LearnSlotStart(s_Slot);
+        for (int k = 0; k < LearnSlotDwords(s_Slot); ++k) {
+            const size_t s_I = static_cast<size_t>(s_Start + k);
+            if (m_LearnE.State[s_I] != 1 || m_LearnW.State[s_I] != 1) continue;
+            const uint32_t s_E = m_LearnE.First[s_I];
+            const uint32_t s_W = m_LearnW.First[s_I];
+            if (s_E == s_W) continue;
+            SWeaponRule s_R;
+            s_R.Slot = s_Slot;
+            s_R.Index = k;
+            s_R.Value = s_W;
+            if (s_E < 0x10000u && s_W < 0x10000u) {
+                s_R.Mode = 0;
+                s_Small.push_back(s_R);
+            } else if (s_E == 0 || s_W == 0) {
+                s_R.Mode = (s_W == 0) ? 2 : 1;
+                s_Ptr.push_back(s_R);
+            }
+        }
+    }
+    const std::vector<SWeaponRule>& s_Src = !s_Small.empty() ? s_Small : s_Ptr;
+    for (size_t i = 0; i < s_Src.size() && i < 8; ++i) m_WeaponRules.push_back(s_Src[i]);
+}
+
+void BetterInstinct::SaveWeaponRules() {
+    try {
+        std::wstring s_Dir = ConfigDir();
+        if (s_Dir.empty()) return;
+        std::error_code s_Ec;
+        fs::create_directories(fs::path(s_Dir), s_Ec);
+        std::ofstream s_File(fs::path(s_Dir) / L"BetterInstinct_weapon.cfg", std::ios::trunc);
+        for (const SWeaponRule& s_R : m_WeaponRules) {
+            s_File << s_R.Slot << " " << s_R.Index << " " << s_R.Mode << " " << s_R.Value << "\n";
+        }
+    } catch (...) {
+    }
+}
+
+void BetterInstinct::LoadWeaponRules() {
+    m_WeaponRules.clear();
+    try {
+        std::wstring s_Dir = ConfigDir();
+        if (s_Dir.empty()) return;
+        std::ifstream s_File(fs::path(s_Dir) / L"BetterInstinct_weapon.cfg");
+        long long s_Slot = 0, s_Index = 0, s_Mode = 0, s_Value = 0;
+        while (s_File >> s_Slot >> s_Index >> s_Mode >> s_Value) {
+            if (s_Slot < 0 || s_Slot >= kLearnSlots || s_Index < 0 || s_Index >= LearnSlotDwords(static_cast<int>(s_Slot))) continue;
+            if (s_Mode < 0 || s_Mode > 2) continue;
+            SWeaponRule s_R;
+            s_R.Slot = static_cast<int>(s_Slot);
+            s_R.Index = static_cast<int>(s_Index);
+            s_R.Mode = static_cast<int>(s_Mode);
+            s_R.Value = static_cast<uint32_t>(s_Value);
+            m_WeaponRules.push_back(s_R);
+            if (m_WeaponRules.size() >= 8) break;
+        }
+    } catch (...) {
+    }
+    m_WeaponRuleCount.store(static_cast<int>(m_WeaponRules.size()));
+}
+
+// Learning (started from the UI) and the per-frame weapon check.
+void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
+    if (!m_WeaponLoaded) {
+        m_WeaponLoaded = true;
+        LoadWeaponRules();
+    }
+
+    const int s_Req = m_LearnRequest.exchange(0);
+    if (s_Req == 1 || s_Req == 2) {
+        m_LearnMode = s_Req;
+        m_LearnTimeout = 20.0f; // time to close the menu, take the item and hold right mouse
+        m_LearnTaken = 0;
+        m_LearnGap = 0.0f;
+    } else if (s_Req == 3) {
+        m_LearnE = SLearnSet();
+        m_LearnW = SLearnSet();
+        m_WeaponRules.clear();
+        m_LearnMode = 0;
+        m_WeaponHeld = false;
+        m_WeaponRuleCount.store(0);
+        m_LearnRoundsE.store(0);
+        m_LearnRoundsW.store(0);
+        SaveWeaponRules();
+    }
+
+    m_RmbTime = p_RightDown ? m_RmbTime + p_Dt : 0.0f;
+
+    if (m_LearnMode != 0) {
+        m_LearnTimeout -= p_Dt;
+        if (p_RightDown && m_RmbTime > 0.6f) { // let the camera / pose settle first
+            m_LearnGap -= p_Dt;
+            if (m_LearnGap <= 0.0f) {
+                m_LearnGap = 0.05f;
+                LearnSample(m_LearnMode == 1 ? m_LearnE : m_LearnW);
+                ++m_LearnTaken;
+            }
+        }
+        if (m_LearnTaken >= 30 || (m_LearnTimeout <= 0.0f && m_LearnTaken >= 10)) {
+            SLearnSet& s_Set = m_LearnMode == 1 ? m_LearnE : m_LearnW;
+            ++s_Set.Rounds;
+            m_LearnRoundsE.store(m_LearnE.Rounds);
+            m_LearnRoundsW.store(m_LearnW.Rounds);
+            m_LearnMode = 0;
+            if (m_LearnE.Rounds > 0 && m_LearnW.Rounds > 0) {
+                ComputeWeaponRules();
+                SaveWeaponRules();
+                m_WeaponRuleCount.store(static_cast<int>(m_WeaponRules.size()));
+            }
+        } else if (m_LearnTimeout <= 0.0f) {
+            m_LearnMode = 0; // not enough samples (right mouse was not held long enough)
+        }
+    }
+    m_LearnUiMode.store(m_LearnMode);
+    m_LearnUiTaken.store(m_LearnTaken);
+
+    // Is a weapon in the hands? Only matters (and is only read) while right mouse is held.
+    bool s_Weapon = false;
+    if (!m_WeaponRules.empty() && p_RightDown && m_LearnMode == 0) {
+        s_Weapon = true;
+        const uint8_t* s_Bases[kLearnSlots] = {};
+        bool s_Have[kLearnSlots] = {};
+        for (const SWeaponRule& s_R : m_WeaponRules) {
+            if (!s_Have[s_R.Slot]) { s_Have[s_R.Slot] = true; GetSlotBase(s_R.Slot, s_Bases[s_R.Slot]); }
+            uint32_t s_V = 0;
+            bool s_Ok = false;
+            const uint8_t* s_P = s_Bases[s_R.Slot] ? s_Bases[s_R.Slot] + static_cast<size_t>(s_R.Index) * 4 : nullptr;
+            auto s_Read = [&]() {
+                if (!s_P || !CanWriteMemory(s_P, 4)) return;
+                std::memcpy(&s_V, s_P, 4);
+                s_Ok = true;
+            };
+            if (!SafeCall(s_Read)) s_Ok = false;
+            bool s_Match = false;
+            if (s_Ok) {
+                if (s_R.Mode == 0) s_Match = s_V == s_R.Value;
+                else if (s_R.Mode == 1) s_Match = s_V != 0;
+                else s_Match = s_V == 0;
+            }
+            if (!s_Match) { s_Weapon = false; break; } // all rules have to agree
+        }
+    }
+    m_WeaponHeld = s_Weapon;
+    m_ItemHolding = s_Weapon; // (shown in the zoom log)
+    m_WeaponState.store(m_WeaponRules.empty() ? (m_LearnE.Rounds > 0 && m_LearnW.Rounds > 0 ? 1 : 0) : (s_Weapon ? 3 : 2));
+}
+
 void BetterInstinct::UpdateZoom(float p_Dt) {
     {
         const int s_Dump = m_DumpRequest.exchange(0);
         if (s_Dump == 1) DumpHeldItemInfo(L"BetterInstinct_dump_empty.log");
         else if (s_Dump == 2) DumpHeldItemInfo(L"BetterInstinct_dump_weapon.log");
     }
-    // (held-item scanning removed: the game data has no such property, and the scan caused hitches)
     const bool s_Focused = GameIsForeground() && !m_Binding;
     const bool s_RightDown = s_Focused && g_Phys[VK_RBUTTON].load();
-    const bool s_ItemOk = HeldItemAllowsZoom();                       // empty hands only
-    const bool s_KeyOk = m_ZoomKey == 0 || g_Phys[m_ZoomKey & 0xFF].load(); // optional extra key that must be held
-    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk && s_KeyOk;
+    UpdateWeapon(p_Dt, s_RightDown);
+    const bool s_ItemOk = HeldItemAllowsZoom();                       // not with a weapon in the hands
+    const bool s_InstinctOk = m_Active.load();                        // only while Instinct is in use
+    const bool s_Gate = m_ZoomEnabled && s_RightDown && s_ItemOk && s_InstinctOk;
     g_ZoomWanted.store(s_Gate); // only then does the hook take the wheel away from the game
 
     const int s_Delta = g_Wheel.exchange(0);
@@ -4133,30 +4363,30 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         // --- Better Zoom ---
         if (ImGui::CollapsingHeader("Zoom (right mouse + mouse wheel)")) {
             if (ImGui::Checkbox("Enable wheel zoom", &m_ZoomEnabled)) s_Changed = true;
-            {
-                const std::string s_ZoomKeyText = (m_ZoomKey == 0 ? std::string("none (right mouse + wheel only)") : KeyName(m_ZoomKey)) + "  (click to change)";
-                ImGui::TextUnformatted("Extra key to hold while zooming (so it does not zoom while aiming a gun)");
-                if (ImGui::Button(s_ZoomKeyText.c_str(), ImVec2(-1, 0))) {
-                    m_Binding = true;
-                    m_BindArmed = false;
-                    m_BindTarget = 1;
-                }
-                if (m_Binding && m_BindTarget == 1) ImGui::TextDisabled("Press the key now (Esc cancels); the prompt is at the top of this window.");
-                if (m_ZoomKey != 0 && ImGui::Button("No extra key")) { m_ZoomKey = 0; s_Changed = true; }
-            }
-            ImGui::TextDisabled("Hold right mouse with EMPTY hands (no weapon, no item), then scroll.");
+            ImGui::TextDisabled("Hold right mouse, then scroll. Only works while Instinct is active, and never with a weapon in hand.");
             if (ImGui::SliderFloat("Max zoom", &m_ZoomMax, 1.5f, 10.0f, "%.1fx")) s_Changed = true;
             if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
             if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
-            if (ImGui::Checkbox("Zoom with anything in hand (skip the held-item check)", &m_ZoomAnyItem)) s_Changed = true;
+            if (ImGui::Checkbox("Zoom with weapons too (skip the weapon check)", &m_ZoomAnyItem)) s_Changed = true;
             {
-                static const char* s_ItemTxt[] = {"no held-item property found (check skipped: zoom is NOT limited to empty hands)",
-                                                  "learning (waiting until the hands have been empty once)",
-                                                  "hands empty", "holding something: zoom off"};
-                ImGui::TextDisabled("Held item: %s", s_ItemTxt[std::clamp(m_ItemState.load(), 0, 3)]);
-                std::lock_guard<std::mutex> s_ItemLock(m_ZoomMutex);
-                ImGui::TextDisabled("Item properties used: %s", m_ItemInfo.empty() ? "-" : m_ItemInfo.c_str());
+                ImGui::TextDisabled("Weapon check: press a button, close the menu, then hold right mouse STEADY for about 2 seconds.");
+                ImGui::TextDisabled("Do it with empty hands and with a weapon in hand (twice each is best; once with a pistol, once with a rifle).");
+                if (ImGui::Button("Learn: EMPTY hands")) m_LearnRequest = 1;
+                ImGui::SameLine();
+                if (ImGui::Button("Learn: holding a WEAPON")) m_LearnRequest = 2;
+                ImGui::SameLine();
+                if (ImGui::Button("Forget")) m_LearnRequest = 3;
+                const int s_LM = m_LearnUiMode.load();
+                if (s_LM != 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "LEARNING %s: hold right mouse steady... (%d/30)",
+                                       s_LM == 1 ? "EMPTY hands" : "WEAPON", m_LearnUiTaken.load());
+                }
+                static const char* s_WTxt[] = {"not learned yet (zoom is NOT blocked with weapons until you learn it)",
+                                               "learned, but nothing differed between the two states: repeat with right mouse held steady",
+                                               "ready: no weapon in hand", "ready: WEAPON detected, zoom off"};
+                ImGui::TextDisabled("Weapon check: %s", s_WTxt[std::clamp(m_WeaponState.load(), 0, 3)]);
+                ImGui::TextDisabled("Learned: empty x%d, weapon x%d   values used: %d", m_LearnRoundsE.load(), m_LearnRoundsW.load(), m_WeaponRuleCount.load());
             }
             ImGui::TextDisabled("Profile FOV now: %.1f (game's own: %.1f)", m_ZoomReadback.load(), m_ZoomReadbackVan.load());
             {
