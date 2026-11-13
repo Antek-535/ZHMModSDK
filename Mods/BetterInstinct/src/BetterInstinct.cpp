@@ -1912,6 +1912,40 @@ void BetterInstinct::ScanCameraFov() {
                             std::snprintf(s_Buf, sizeof(s_Buf), "camera+0x%zX", s_Off);
                             s_F.Name = s_Buf;
                             s_F.Base = s_Orig;
+                            {
+                                // Copies of this FOV elsewhere in the camera object (see SCamExtra).
+                                const float s_Pi = 3.14159265f;
+                                const float s_RadV = s_Orig * s_Pi / 180.0f;
+                                const float s_Y = 1.0f / std::tan(s_RadV * 0.5f);
+                                for (size_t s_O2 = 0x20; s_O2 < 0x800 && s_F.Extras.size() < 24; s_O2 += 4) {
+                                    if (s_O2 == s_Off) continue;
+                                    float* s_P2 = reinterpret_cast<float*>(s_Base + s_O2);
+                                    if (!CanWriteMemory(s_P2, sizeof(float))) continue;
+                                    const float s_V = *s_P2;
+                                    if (!std::isfinite(s_V)) continue;
+                                    SCamExtra s_E;
+                                    s_E.Ptr = s_P2;
+                                    if (std::abs(s_V - s_Orig) < 1e-4f) s_E.Kind = 0;
+                                    else if (std::abs(s_V - s_RadV) < 1e-5f) s_E.Kind = 1;
+                                    else if (std::abs(s_V - s_Y) < 1e-4f * s_Y) s_E.Kind = 2;
+                                    else continue;
+                                    s_F.Extras.push_back(s_E);
+                                    if (s_E.Kind == 2 && s_O2 >= 0x34) { // the matching x scale sits 0x14 bytes before the y scale
+                                        float* s_Px = reinterpret_cast<float*>(s_Base + s_O2 - 0x14);
+                                        if (CanWriteMemory(s_Px, sizeof(float)) && std::isfinite(*s_Px) && *s_Px > 0.1f) {
+                                            const float s_Aspect = s_V / *s_Px;
+                                            if (s_Aspect > 1.2f && s_Aspect < 2.7f) {
+                                                SCamExtra s_X;
+                                                s_X.Ptr = s_Px;
+                                                s_X.Kind = 3;
+                                                s_X.Ratio = *s_Px / s_V;
+                                                s_F.Extras.push_back(s_X);
+                                            }
+                                        }
+                                    }
+                                }
+                                s_Info += "(" + std::to_string(s_F.Extras.size()) + " linked values) ";
+                            }
                             m_CamFovs.push_back(s_F);
                             s_Info += s_F.Name + "=" + std::to_string(s_Orig) + " ";
                             break;
@@ -1971,6 +2005,24 @@ void BetterInstinct::ScanCameraFov() {
 
 // Scales the live camera's FOV every frame while zooming. If the game rewrites the value each frame we see a value that
 // isn't ours and take it as the new base; if it doesn't, the base stays the value we first saw.
+void BetterInstinct::WriteCamExtras(const SCamFov& p_F, float p_FovDeg) {
+    auto s_Body = [&]() {
+        const float s_Rad = p_FovDeg * 3.14159265f / 180.0f;
+        const float s_Y = 1.0f / std::tan(s_Rad * 0.5f);
+        for (const SCamExtra& s_E : p_F.Extras) {
+            if (!s_E.Ptr || !CanWriteMemory(s_E.Ptr, sizeof(float))) continue;
+            switch (s_E.Kind) {
+            case 0: *s_E.Ptr = p_FovDeg; break;
+            case 1: *s_E.Ptr = s_Rad; break;
+            case 2: *s_E.Ptr = s_Y; break;
+            case 3: *s_E.Ptr = s_Y * s_E.Ratio; break;
+            default: break;
+            }
+        }
+    };
+    SafeCall(s_Body);
+}
+
 void BetterInstinct::ApplyCameraFov(float p_Zoom) {
     for (SCamFov& s_F : m_CamFovs) {
         float s_Cur = 0.0f;
@@ -1983,9 +2035,10 @@ void BetterInstinct::ApplyCameraFov(float p_Zoom) {
             if (!s_Rad) s_New = s_New * 180.0f / 3.14159265f;
             s_New = std::max(s_New, s_Rad ? 0.02f : 1.0f);
             WriteCamFov(s_F, s_New);
+            WriteCamExtras(s_F, s_New);
             s_F.Last = s_New;
         } else if (s_F.Last != 0.0f) {
-            if (std::abs(s_Cur - s_F.Last) <= 0.0005f) WriteCamFov(s_F, s_F.Base); // hand it back
+            if (std::abs(s_Cur - s_F.Last) <= 0.0005f) { WriteCamFov(s_F, s_F.Base); WriteCamExtras(s_F, s_F.Base); } // hand it back
             s_F.Last = 0.0f;
         }
     }
