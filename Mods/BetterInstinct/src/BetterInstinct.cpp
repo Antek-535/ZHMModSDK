@@ -778,7 +778,6 @@ DEFINE_PLUGIN_DETOUR(BetterInstinct, bool, ZInputAction_Digital, ZInputAction* t
 void BetterInstinct::LoadSettings() {
     m_InstinctKey = static_cast<int>(GetSettingInt(kSection, "instinct_key", m_InstinctKey));
     m_ToggleMode = GetSettingBool(kSection, "toggle_mode", m_ToggleMode);
-    m_BlockEnabled = GetSettingBool(kSection, "block_enabled", m_BlockEnabled);
     m_FocusScale = std::clamp(static_cast<float>(GetSettingDouble(kSection, "focus_scale", m_FocusScale)), 0.05f, 0.95f);
     m_BlendSpeed = std::clamp(static_cast<float>(GetSettingDouble(kSection, "blend_speed", m_BlendSpeed)), 1.0f, 30.0f);
     m_DrainSeconds = std::clamp(static_cast<float>(GetSettingDouble(kSection, "drain_seconds", m_DrainSeconds)), 2.0f, 120.0f);
@@ -831,7 +830,6 @@ void BetterInstinct::SaveSettings() {
     SetSettingInt(kSection, "instinct_key", m_InstinctKey);
     SetSettingInt(kSection, "hud_style", 2);
     SetSettingBool(kSection, "toggle_mode", m_ToggleMode);
-    SetSettingBool(kSection, "block_enabled", m_BlockEnabled);
     SetSettingDouble(kSection, "focus_scale", m_FocusScale);
     SetSettingDouble(kSection, "blend_speed", m_BlendSpeed);
     SetSettingDouble(kSection, "drain_seconds", m_DrainSeconds);
@@ -928,7 +926,6 @@ bool BetterInstinct::SaveConfigFile() {
         s_Int("zoom_key", m_ZoomKey);
         s_Bool("zoom_only_instinct", m_ZoomOnlyInstinct);
         s_Bool("toggle_mode", m_ToggleMode);
-        s_Bool("block_enabled", m_BlockEnabled);
         s_Flt("focus_scale", m_FocusScale);
         s_Flt("blend_speed", m_BlendSpeed);
         s_Flt("drain_seconds", m_DrainSeconds);
@@ -954,11 +951,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Bool("show_icon", m_ShowIcon);
         s_Bool("zoom_enabled", m_ZoomEnabled);
         s_Flt("zoom_max", m_ZoomMax);
-        s_Flt("zoom_step", m_ZoomStep);
         s_Flt("zoom_smooth", m_ZoomSmooth);
-        s_Bool("zoom_remember", m_ZoomRemember);
-        s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
-        s_Bool("zoom_use_live2", m_ZoomLiveCam);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1063,7 +1056,6 @@ bool BetterInstinct::LoadConfigFile() {
     s_Int("zoom_key", m_ZoomKey, 0, 254);
     s_Bool("zoom_only_instinct", m_ZoomOnlyInstinct);
     s_Bool("toggle_mode", m_ToggleMode);
-    s_Bool("block_enabled", m_BlockEnabled);
     s_Flt("focus_scale", m_FocusScale, 0.05f, 0.95f);
     s_Flt("blend_speed", m_BlendSpeed, 1.0f, 30.0f);
     s_Flt("drain_seconds", m_DrainSeconds, 2.0f, 120.0f);
@@ -1088,12 +1080,8 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("bar_top_b", m_BarTop[2], 0.0f, 1.0f);
     s_Bool("show_icon", m_ShowIcon);
     s_Bool("zoom_enabled", m_ZoomEnabled);
-    s_Flt("zoom_max", m_ZoomMax, 1.5f, 10.0f);
-    s_Flt("zoom_step", m_ZoomStep, 1.03f, 1.6f);
+    s_Flt("zoom_max", m_ZoomMax, 2.0f, 5.0f);
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
-    s_Bool("zoom_remember", m_ZoomRemember);
-    s_Bool("zoom_skip_item_check", m_ZoomAnyItem);
-    s_Bool("zoom_use_live2", m_ZoomLiveCam);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1613,7 +1601,6 @@ void BetterInstinct::CheckTemplateForZoom(ZTemplateEntityFactory* p_Factory, ZEn
 
 // Is the zoom allowed for what 47 holds right now? Everything except weapons (see UpdateWeapon / the learned weapon rule).
 bool BetterInstinct::HeldItemAllowsZoom() {
-    if (m_ZoomAnyItem) return true; // the user switched the check off
     return !m_WeaponHeld;           // only weapons block the zoom (empty hands and other items are fine)
 }
 
@@ -2490,10 +2477,10 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         }
     }
     if (s_Gate && s_Delta != 0) {
-        m_ZoomTarget *= std::pow(m_ZoomStep, static_cast<float>(s_Delta) / 120.0f);
+        m_ZoomTarget += static_cast<float>(s_Delta) / 120.0f; // one wheel notch = one whole zoom level
     }
     m_ZoomTarget = std::clamp(m_ZoomTarget, 1.0f, std::max(1.0f, m_ZoomMax));
-    if (!s_RightDown && !m_ZoomRemember) m_ZoomTarget = 1.0f;
+    if (!s_RightDown) m_ZoomTarget = 1.0f; // the zoom always starts from 1x on the next aim
     if (s_RightDown && !s_Gate) { // something is in the hands (or zoom is off): back to the game's own camera at once
         m_ZoomTarget = 1.0f;
         m_ZoomCur = 1.0f;
@@ -4059,9 +4046,12 @@ void BetterInstinct::DrawHud() {
     const float s_HalfAcross = (s_Vert ? s_Girth : s_BarLen) * 0.5f;
     const float s_Cx = std::clamp(s_Screen.x * std::clamp(m_HudX, 0.0f, 1.0f), s_HalfAcross,
                                   std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
-    const float s_IconR = s_Girth * 0.5f; // icon diameter = bar width
+    // The status icon is a round "bulb" attached to the start of the bar (below a vertical bar, left of a horizontal one).
+    const float s_IconR = s_Girth * 1.5f;
+    const float s_IconOff = s_IconR * 0.55f; // how far the bulb's center is beyond the bar's end: it merges into the bar
     const float s_LabelRoom = 4.0f * s_Ui;
-    const float s_BelowRoom = (s_Vert && m_ShowIcon) ? (s_IconR * 2.0f + 6.0f * s_Ui) : 0.0f; // vertical bar: the icon sits under it
+    const float s_BelowRoom = !m_ShowIcon ? 0.0f
+        : (s_Vert ? (s_IconOff + s_IconR + 2.0f * s_Ui) : (s_IconR - s_Girth * 0.5f + 2.0f * s_Ui)); // keep the bulb on screen
     const float s_MinBottom = (s_Vert ? s_BarLen : s_Girth) + s_LabelRoom;
     const float s_Bottom = std::clamp(s_Screen.y - m_HudYOffset * (s_Screen.y / 1080.0f), std::min(s_MinBottom, s_Screen.y - s_BelowRoom), s_Screen.y - s_BelowRoom);
     const float s_Top = s_Bottom - (s_Vert ? s_BarLen : s_Girth);
@@ -4101,6 +4091,25 @@ void BetterInstinct::DrawHud() {
     const float s_InnerB = s_Bottom - s_Inset;
     const float s_MidX = (s_InnerL + s_InnerR) * 0.5f;
     const float s_MidY = (s_InnerT + s_InnerB) * 0.5f;
+
+    // Bulb backing (only the part outside the bar, so it joins the bar without double darkening).
+    ImVec2 s_Glyph(0.0f, 0.0f); // center of the icon symbol
+    if (m_ShowIcon) {
+        const float s_BorderA = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
+        ImVec2 s_Ic;
+        if (s_Vert) {
+            s_Ic = ImVec2(s_Cx, s_Bottom + s_IconOff);
+            s_Glyph = ImVec2(s_Cx, s_Bottom + (s_IconOff + s_IconR) * 0.5f);
+            s_Dl->PushClipRect(ImVec2(0.0f, s_Bottom), ImVec2(s_Screen.x, s_Screen.y), true);
+        } else {
+            s_Ic = ImVec2(s_Left - s_IconOff, (s_Top + s_Bottom) * 0.5f);
+            s_Glyph = ImVec2(s_Left - (s_IconOff + s_IconR) * 0.5f, (s_Top + s_Bottom) * 0.5f);
+            s_Dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(s_Left, s_Screen.y), true);
+        }
+        s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(170 * s_A)), 48);
+        s_Dl->AddCircle(s_Ic, s_IconR, s_Col(1.0f, 0.9f, 0.65f, s_BorderA * s_A), 48, s_Thick);
+        s_Dl->PopClipRect();
+    }
 
     s_Dl->AddRectFilled(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), IM_COL32(10, 10, 12, static_cast<int>(170 * s_A)));
     s_Dl->AddRectFilled(ImVec2(s_InnerL, s_InnerT), ImVec2(s_InnerR, s_InnerB), IM_COL32(88, 88, 92, static_cast<int>(120 * s_A)));
@@ -4197,24 +4206,41 @@ void BetterInstinct::DrawHud() {
     const float s_Border = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
     s_Dl->AddRect(ImVec2(s_Left, s_Top), ImVec2(s_Right, s_Bottom), s_Col(1.0f, 0.9f, 0.65f, s_Border * s_A), 0.0f, 0, s_Thick);
 
-    // Round flame icon at the bottom (start) of the bar, like the Absolution Instinct meter.
+    // Status symbol in the bulb: red down arrow while Instinct is in use, golden up arrow while it can't be used
+    // (empty / recharging), and the orange flame (black inside) once it can be used again.
     if (m_ShowIcon) {
-        const ImVec2 s_Ic = s_Vert ? ImVec2(s_Cx, s_Bottom + 4.0f * s_Ui + s_IconR)
-                                   : ImVec2(s_Left - 4.0f * s_Ui - s_IconR, (s_Top + s_Bottom) * 0.5f);
-        s_Dl->AddCircleFilled(s_Ic, s_IconR, IM_COL32(10, 10, 12, static_cast<int>(190 * s_A)), 32);
-        auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
-            const float s_F = s_IconR * 0.5f * p_Scale;
-            auto P = [&](float x, float y) { return ImVec2(s_Ic.x + x * s_F, s_Ic.y + p_Dy * s_IconR + y * s_F); };
-            s_Dl->PathClear();
-            s_Dl->PathLineTo(P(0.05f, -1.15f));
-            s_Dl->PathBezierCubicCurveTo(P(0.15f, -0.55f), P(0.85f, -0.35f), P(0.70f, 0.30f));
-            s_Dl->PathBezierCubicCurveTo(P(0.60f, 0.85f), P(0.25f, 1.05f), P(0.00f, 1.05f));
-            s_Dl->PathBezierCubicCurveTo(P(-0.30f, 1.05f), P(-0.75f, 0.80f), P(-0.70f, 0.20f));
-            s_Dl->PathBezierCubicCurveTo(P(-0.65f, -0.20f), P(-0.20f, -0.45f), P(0.05f, -1.15f));
-            s_Dl->PathFillConvex(p_Color);
+        auto s_Chevron = [&](bool p_Down, float p_R, float p_G, float p_B) {
+            const float s_Hw = s_IconR * 0.62f;
+            const float s_Hh = s_Hw * 0.49f;       // same proportions as the reference arrow
+            const float s_Stroke = std::max(2.0f, s_Hw * 2.0f * 0.12f);
+            const float s_Dy = p_Down ? s_Hh : -s_Hh; // the tip
+            const ImVec2 s_P1(s_Glyph.x - s_Hw, s_Glyph.y - s_Dy);
+            const ImVec2 s_P2(s_Glyph.x, s_Glyph.y + s_Dy);
+            const ImVec2 s_P3(s_Glyph.x + s_Hw, s_Glyph.y - s_Dy);
+            const ImU32 s_C = s_Col(p_R, p_G, p_B, s_A);
+            s_Dl->AddLine(s_P1, s_P2, s_C, s_Stroke);
+            s_Dl->AddLine(s_P2, s_P3, s_C, s_Stroke);
+            for (const ImVec2& s_P : {s_P1, s_P2, s_P3}) s_Dl->AddCircleFilled(s_P, s_Stroke * 0.5f, s_C, 12); // round ends and corner
         };
-        s_Flame(1.0f, -0.02f, s_Col(s_ColBot[0], s_ColBot[1], s_ColBot[2], s_A));
-        s_Flame(0.5f, 0.24f, s_Col(s_ColTop[0], s_ColTop[1], s_ColTop[2], s_A));
+        if (s_Active) {
+            s_Chevron(true, 0.92f, 0.16f, 0.14f);   // red, pointing down
+        } else if (m_Blocked) {
+            s_Chevron(false, 1.00f, 0.78f, 0.28f);  // gold, pointing up
+        } else {
+            auto s_Flame = [&](float p_Scale, float p_Dy, ImU32 p_Color) {
+                const float s_F = s_IconR * 0.55f * p_Scale;
+                auto P = [&](float x, float y) { return ImVec2(s_Glyph.x + x * s_F, s_Glyph.y + p_Dy * s_IconR * 0.55f + y * s_F); };
+                s_Dl->PathClear();
+                s_Dl->PathLineTo(P(0.05f, -1.15f));
+                s_Dl->PathBezierCubicCurveTo(P(0.15f, -0.55f), P(0.85f, -0.35f), P(0.70f, 0.30f));
+                s_Dl->PathBezierCubicCurveTo(P(0.60f, 0.85f), P(0.25f, 1.05f), P(0.00f, 1.05f));
+                s_Dl->PathBezierCubicCurveTo(P(-0.30f, 1.05f), P(-0.75f, 0.80f), P(-0.70f, 0.20f));
+                s_Dl->PathBezierCubicCurveTo(P(-0.65f, -0.20f), P(-0.20f, -0.45f), P(0.05f, -1.15f));
+                s_Dl->PathFillConvex(p_Color);
+            };
+            s_Flame(1.0f, -0.02f, s_Col(1.00f, 0.50f, 0.08f, s_A)); // always orange
+            s_Flame(0.5f, 0.24f, s_Col(0.0f, 0.0f, 0.0f, s_A));     // always black inside
+        }
     }
 }
 
@@ -4325,14 +4351,8 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         ImGui::SameLine();
         ImGui::TextDisabled("(match your in-game Instinct setting)");
 
-        if (ImGui::Checkbox("Block Instinct when the meter is too low", &m_BlockEnabled)) s_Changed = true;
         ImGui::TextDisabled(g_HookOk.load() ? "Input guard: active" : "Input guard: NOT active (blocking unavailable)");
 
-        if (ImGui::InputText("Instinct action name(s)", m_ActionPatterns, sizeof(m_ActionPatterns))) {
-            RebuildPatterns();
-            s_Changed = true;
-        }
-        ImGui::TextDisabled("Comma-separated, matches part of the game's action name.");
 
         ImGui::Separator();
 
@@ -4389,32 +4409,17 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::PopStyleColor();
         }
 
-        if (ImGui::TreeNode("Advanced (Instinct color)")) {
-            ImGui::TextDisabled("Instinct's grey is the game's color-grading texture 008C1F5C7305A978. It is recolored on the GPU,");
-            ImGui::TextDisabled("so only the 3D scene changes. It is only used while Instinct is on.");
-            const char* s_States[] = {"Shader resource (default)", "Common"};
-            if (ImGui::Combo("GPU texture state", &m_LutBarrier, s_States, 2)) {
-                m_LutFailSig.store(0);
-                s_Changed = true;
-            }
-            ImGui::TextDisabled("Only change this if the color does not apply or the picture glitches.");
-            if (ImGui::Button("Re-read vanilla texture")) m_LutReread = true;
-            ImGui::SameLine();
-            ImGui::TextDisabled("(after a game update)");
-            ImGui::TreePop();
-        }
-
         ImGui::Separator();
 
         // --- Better Zoom ---
         if (ImGui::CollapsingHeader("Zoom (right mouse + mouse wheel)")) {
             if (ImGui::Checkbox("Enable wheel zoom", &m_ZoomEnabled)) s_Changed = true;
             ImGui::TextDisabled("Hold right mouse, then scroll. Only works while Instinct is active, and never with a weapon in hand.");
-            if (ImGui::SliderFloat("Max zoom", &m_ZoomMax, 1.5f, 10.0f, "%.1fx")) s_Changed = true;
-            if (ImGui::SliderFloat("Step per wheel notch", &m_ZoomStep, 1.03f, 1.6f, "x%.2f")) s_Changed = true;
+            {
+                int s_MaxLevel = static_cast<int>(std::lround(m_ZoomMax));
+                if (ImGui::SliderInt("Max zoom", &s_MaxLevel, 2, 5, "%dx")) { m_ZoomMax = static_cast<float>(s_MaxLevel); s_Changed = true; }
+            }
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
-            if (ImGui::Checkbox("Remember zoom level between aims", &m_ZoomRemember)) s_Changed = true;
-            if (ImGui::Checkbox("Zoom with weapons too (skip the weapon check)", &m_ZoomAnyItem)) s_Changed = true;
             {
                 ImGui::TextDisabled("Weapon check: press a button, close the menu, then hold right mouse STEADY for about 2 seconds.");
                 ImGui::TextDisabled("Do it with empty hands and with a weapon in hand (twice each is best; once with a pistol, once with a rifle).");
@@ -4445,11 +4450,6 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 std::lock_guard<std::mutex> s_LiveLock(m_ZoomMutex);
                 ImGui::TextDisabled("Live now: %s", m_CamLive.empty() ? "-" : m_CamLive.c_str());
             }
-            if (ImGui::Button("Dump info: EMPTY hands")) m_DumpRequest = 1;
-            ImGui::SameLine();
-            if (ImGui::Button("Dump info: holding a WEAPON")) m_DumpRequest = 2;
-            ImGui::TextDisabled("Hold the item first, press the button, then send me BetterInstinct.log (next to the config).");
-            if (ImGui::Checkbox("Use the live camera FOV instead of the camera profiles (does not change the picture)", &m_ZoomLiveCam)) { s_Changed = true; m_CamFovs.clear(); }
             ImGui::TextDisabled("Camera profiles found: %u   Current zoom: %.2fx", m_ZoomFound.load(), m_ZoomCur);
         }
 
@@ -4536,22 +4536,14 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::SliderFloat("Horizontal position", &m_HudX, 0.0f, 1.0f, "%.2f")) s_Changed = true;
         if (ImGui::SliderFloat("Height from bottom", &m_HudYOffset, 0.0f, 1080.0f, "%.0f px")) s_Changed = true;
         ImGui::TextDisabled("Horizontal position: 0 = left edge, 1 = right edge. A vertical bar fills upward.");
-        if (ImGui::Button("Bottom center")) { m_HudX = 0.5f; m_HudYOffset = 64.0f; s_Changed = true; }
-        ImGui::SameLine();
-        if (ImGui::Button("Top center")) { m_HudX = 0.5f; m_HudYOffset = 1010.0f; s_Changed = true; }
-        ImGui::SameLine();
-        if (ImGui::Button("Left side")) { m_HudX = 0.04f; m_HudYOffset = 380.0f; s_Changed = true; }
-        ImGui::SameLine();
-        if (ImGui::Button("Right side")) { m_HudX = 0.96f; m_HudYOffset = 380.0f; s_Changed = true; }
         if (ImGui::SliderFloat("Size", &m_HudScale, 0.5f, 3.0f, "%.2f")) s_Changed = true;
-        if (ImGui::SliderFloat("Opacity", &m_HudOpacity, 0.1f, 1.0f, "%.2f")) s_Changed = true;
         if (ImGui::Checkbox("Fire effect at the tip (like Absolution)", &m_FireFx)) s_Changed = true;
         ImGui::BeginDisabled(!m_FireFx);
         if (ImGui::SliderFloat("Fire amount", &m_FireAmount, 0.2f, 2.5f, "%.2f")) s_Changed = true;
         ImGui::EndDisabled();
         if (ImGui::ColorEdit3("Bar color: bottom", m_BarBottom)) s_Changed = true;
         if (ImGui::ColorEdit3("Bar color: top", m_BarTop)) s_Changed = true;
-        if (ImGui::Checkbox("Flame icon at the bottom of the bar", &m_ShowIcon)) s_Changed = true;
+        if (ImGui::Checkbox("Status icon on the bar (flame / arrows)", &m_ShowIcon)) s_Changed = true;
         if (ImGui::ColorEdit3("Low-meter color", m_LowColor)) s_Changed = true;
         ImGui::EndDisabled();
 
@@ -4640,12 +4632,90 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", m_SoundStatus.c_str());
         }
         ImGui::EndDisabled();
+
+        ImGui::Separator();
+        if (ImGui::Button("Reset all settings to default", ImVec2(-1, 0))) ImGui::OpenPopup("Reset all settings?");
+        if (ImGui::BeginPopupModal("Reset all settings?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Every setting goes back to its default value.");
+            if (ImGui::Button("Reset", ImVec2(120, 0))) {
+                ResetAllSettings();
+                s_Changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
     }
     ImGui::End();
 
     if (s_Changed) {
         SaveSettings();
     }
+}
+
+// Puts every setting back to its default value (the same values the members start with). The learned weapon check stays.
+void BetterInstinct::ResetAllSettings() {
+    m_InstinctKey = 0x11;
+    g_Key = m_InstinctKey;
+    m_ToggleMode = false;
+    m_BlockEnabled = true;
+    m_FocusScale = 0.50f;
+    m_BlendSpeed = 6.0f;
+    m_DrainSeconds = 15.0f;
+    m_RechargeSeconds = 30.0f;
+    m_RechargeDelay = 1.0f;
+
+    m_ZoomKey = 0;
+    m_ZoomOnlyInstinct = true;
+    m_ZoomEnabled = true;
+    m_ZoomMax = 3.0f;
+    m_ZoomSmooth = 10.0f;
+    m_ZoomLiveCam = true;
+
+    m_HudEnabled = true;
+    m_HudAlways = false;
+    m_HudVertical = false;
+    m_HudX = 0.5f;
+    m_FireFx = true;
+    m_FireAmount = 1.0f;
+    m_HudWidth = 0.17f;
+    m_HudYOffset = 64.0f;
+    m_HudScale = 1.0f;
+    m_HudOpacity = 0.95f;
+    m_FillColor[0] = 1.00f; m_FillColor[1] = 0.78f; m_FillColor[2] = 0.28f;
+    m_LowColor[0] = 0.86f; m_LowColor[1] = 0.20f; m_LowColor[2] = 0.18f;
+    m_BarBottom[0] = 1.00f; m_BarBottom[1] = 0.50f; m_BarBottom[2] = 0.10f;
+    m_BarTop[0] = 1.00f; m_BarTop[1] = 0.88f; m_BarTop[2] = 0.25f;
+    m_ShowIcon = true;
+
+    m_TintRemove = false;
+    m_TintEnabled = false;
+    m_InstinctTint[0] = 0.30f; m_InstinctTint[1] = 0.70f; m_InstinctTint[2] = 1.00f;
+    m_TintStrength = 1.00f;
+    m_TintBrightness = 1.00f;
+    m_TintKeepBrightness = true;
+    m_LutBarrier = 0;
+    m_LutFailSig.store(0);
+
+    InitGlowDefaults(); // the game's own people / item colors
+
+    m_SoundEnabled = true;
+    m_SoundSource = 0;
+    m_SoundVolume = 0.6f;
+    m_FadeOutOn = true;
+    m_FadeOutMs = 400.0f;
+    m_FadeInOn = true;
+    m_FadeInMs = 300.0f;
+    m_PresetName.clear();
+    m_CustomPath[0] = '\0';
+    m_Testing = false;
+    CloseSound();
+    ScanSounds();
+    ApplySoundVolume();
+
+    std::snprintf(m_ActionPatterns, sizeof(m_ActionPatterns), "%s", "instinct,focus");
+    RebuildPatterns();
 }
 
 DEFINE_ZHM_PLUGIN(BetterInstinct)
