@@ -40,6 +40,7 @@ public:
 
 private:
     void OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent);
+    void OnLateFrameUpdate(const SGameUpdateEvent& p_UpdateEvent); // runs again at the other ends of the update order (camera zoom)
 
     void LoadSettings();
     void SaveSettings();
