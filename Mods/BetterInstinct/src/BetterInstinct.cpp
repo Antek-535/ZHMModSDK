@@ -2315,24 +2315,36 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
     // Every learned value votes: it votes WEAPON when it looks like it did while a weapon was held, and EMPTY when it looks like it
     // did with empty hands. Values that look like neither don't vote. More WEAPON than EMPTY votes = weapon. (Before, ALL values
     // had to match exactly, so one useless value or a different weapon than the learned one silently allowed the zoom.)
-    if (!p_RightDown) m_WeaponLatch = false;
-    bool s_Weapon = false;
-    if (!m_WeaponRules.empty() && p_RightDown && m_LearnMode == 0) {
+    if (!p_RightDown) { m_WeaponLatch = false; m_WeaponEvalWait = 0.0f; }
+    bool s_Weapon = p_RightDown && m_WeaponHeld; // between two votes the last result stands
+    m_WeaponEvalWait -= p_Dt;
+    if (!m_WeaponRules.empty() && p_RightDown && m_LearnMode == 0 && m_WeaponEvalWait <= 0.0f) {
+        m_WeaponEvalWait = 0.1f; // reading the player's memory is expensive: not every frame
+        s_Weapon = false;
+        // Look up each object once and check its memory range once (not once per value).
         const uint8_t* s_Bases[kLearnSlots] = {};
-        bool s_Have[kLearnSlots] = {};
+        int s_MaxIdx[kLearnSlots];
+        for (int& s_M : s_MaxIdx) s_M = -1;
+        for (const SWeaponRule& s_R : m_WeaponRules) s_MaxIdx[s_R.Slot] = std::max(s_MaxIdx[s_R.Slot], s_R.Index);
+        for (int s_S = 0; s_S < kLearnSlots; ++s_S) {
+            if (s_MaxIdx[s_S] < 0) continue;
+            const uint8_t* s_B = nullptr;
+            if (!GetSlotBase(s_S, s_B)) continue;
+            bool s_Readable = false;
+            auto s_Check = [&]() { s_Readable = CanWriteMemory(s_B, (static_cast<size_t>(s_MaxIdx[s_S]) + 1) * 4); };
+            if (SafeCall(s_Check) && s_Readable) s_Bases[s_S] = s_B;
+        }
         int s_WVotes = 0, s_EVotes = 0;
         for (const SWeaponRule& s_R : m_WeaponRules) {
-            if (!s_Have[s_R.Slot]) { s_Have[s_R.Slot] = true; GetSlotBase(s_R.Slot, s_Bases[s_R.Slot]); }
+            const uint8_t* s_Base = s_Bases[s_R.Slot];
+            if (!s_Base) continue;
             uint32_t s_V = 0;
             bool s_Ok = false;
-            const uint8_t* s_P = s_Bases[s_R.Slot] ? s_Bases[s_R.Slot] + static_cast<size_t>(s_R.Index) * 4 : nullptr;
             auto s_Read = [&]() {
-                if (!s_P || !CanWriteMemory(s_P, 4)) return;
-                std::memcpy(&s_V, s_P, 4);
+                std::memcpy(&s_V, s_Base + static_cast<size_t>(s_R.Index) * 4, 4);
                 s_Ok = true;
             };
-            if (!SafeCall(s_Read)) s_Ok = false;
-            if (!s_Ok) continue;
+            if (!SafeCall(s_Read) || !s_Ok) continue;
             bool s_IsW = false, s_IsE = false;
             if (s_R.Mode == 0) {
                 s_IsW = s_V == s_R.Value;
