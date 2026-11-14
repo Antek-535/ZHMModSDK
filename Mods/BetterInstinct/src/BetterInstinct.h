@@ -81,6 +81,7 @@ private:
     bool OpenSound();
     void CloseSound();
     void EnsureZoomSounds();
+    bool OpenZoomSound();
     void PlayZoomSound();
     std::wstring ZoomSoundFile();
     void CloseZoomSounds();
@@ -414,6 +415,9 @@ private:
     bool m_SndPlaying = false;
     float m_SndGain = 0.0f;          // fade factor 0..1
     int m_SndDir = 0;                // +1 fading in, -1 fading out, 0 steady
+    float m_SndFadeTime = 0.0f;      // how long the current fade-out has taken (a fade can never hang)
+    float m_SndWatchTimer = 0.0f;    // watchdog: checks now and then that no sound is playing by accident
+    float m_ZoomPrepTimer = 0.0f;    // retry timer for opening the zoom sound ahead of time
     bool m_Testing = false;
     float m_TestTimer = 0.0f;                      // the sound test stops by itself after a few seconds
     bool m_SoundWasWanted = false;
