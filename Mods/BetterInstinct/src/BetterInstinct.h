@@ -81,7 +81,8 @@ private:
     bool OpenSound();
     void CloseSound();
     void EnsureZoomSounds();
-    void PlayZoomSound(bool p_In);
+    void PlayZoomSound();
+    std::wstring ZoomSoundFile();
     void CloseZoomSounds();
     void ApplySoundVolume();
     void StartSound();
@@ -362,7 +363,10 @@ private:
     float m_ZoomSmooth = 10.0f;      // higher = snappier
     bool m_ZoomSoundEnabled = true;  // a short sound for every zoom step
     float m_ZoomSoundVolume = 0.6f;
-    int m_ZoomSndState[2] = {0, 0};  // [0] zoom out, [1] zoom in: 0 = not opened, 1 = open, 2 = could not be opened
+    char m_ZoomSoundPath[520] = {};  // the player's own zoom sound (empty = the built-in one); ONE sound for zoom in and out
+    bool m_ZoomSndOpen = false;
+    std::string m_ZoomSoundStatus;
+    std::atomic<int> m_ZoomSoundRequest{0}; // set by the game thread, played from the UI thread (like the Instinct sound)
     bool m_ZoomLiveCam = true;         // true = scale the live camera FOV (works); false = scale the UnAimed camera profiles (never found them in the logs)
 
     bool m_HudEnabled = true;
@@ -411,6 +415,7 @@ private:
     float m_SndGain = 0.0f;          // fade factor 0..1
     int m_SndDir = 0;                // +1 fading in, -1 fading out, 0 steady
     bool m_Testing = false;
+    float m_TestTimer = 0.0f;                      // the sound test stops by itself after a few seconds
     bool m_SoundWasWanted = false;
 
     // --- UI state ---
