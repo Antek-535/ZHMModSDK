@@ -389,6 +389,7 @@ void SendKey(int p_Vk, bool p_Up) {
 
 std::atomic<bool> g_BrowseBusy{false};   // a dialog is currently open
 std::atomic<bool> g_BrowseReady{false};  // the player picked a file (g_BrowseResult)
+std::atomic<int> g_BrowseTarget{0};      // which sound the dialog is for: 0 = Instinct sound, 1 = zoom sound
 std::mutex g_BrowseMutex;
 std::wstring g_BrowseResult;
 std::wstring g_BrowseStartDir;
@@ -413,7 +414,7 @@ DWORD WINAPI BrowseThreadProc(LPVOID p_Param) {
     s_Ofn.lpstrFile = s_File;
     s_Ofn.nMaxFile = static_cast<DWORD>(sizeof(s_File) / sizeof(s_File[0]));
     s_Ofn.lpstrInitialDir = s_Dir.empty() ? nullptr : s_Dir.c_str();
-    s_Ofn.lpstrTitle = L"Choose an Instinct sound";
+    s_Ofn.lpstrTitle = g_BrowseTarget.load() == 1 ? L"Choose a zoom sound" : L"Choose an Instinct sound";
     s_Ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameW(&s_Ofn)) {
@@ -971,6 +972,7 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("zoom_max", m_ZoomMax);
         s_Flt("zoom_smooth", m_ZoomSmooth);
         s_Bool("zoom_sound", m_ZoomSoundEnabled);
+        s_Str("zoom_sound_path", m_ZoomSoundPath);
         s_Flt("zoom_sound_volume", m_ZoomSoundVolume);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
@@ -1104,6 +1106,7 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("zoom_max", m_ZoomMax, 2.0f, 5.0f);
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
     s_Bool("zoom_sound", m_ZoomSoundEnabled);
+    s_Str("zoom_sound_path", m_ZoomSoundPath, sizeof(m_ZoomSoundPath));
     s_Flt("zoom_sound_volume", m_ZoomSoundVolume, 0.0f, 1.0f);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
@@ -1177,49 +1180,60 @@ void BetterInstinct::EnsurePresets() {
     }
 }
 
-// The zoom sounds live in InstinctSounds\Zoom\ ("Zoom In" / "Zoom Out", .wav or .mp3): replace them to use your own.
+// The built-in zoom sound lives in InstinctSounds\Zoom\Zoom Tick.wav (made on first run). The player can pick their own.
 void BetterInstinct::EnsureZoomSounds() {
     std::error_code s_Ec;
     const fs::path s_Dir = fs::path(m_SoundDir) / L"Zoom";
     fs::create_directories(s_Dir, s_Ec);
-    for (int s_In = 0; s_In < 2; ++s_In) {
-        const fs::path s_Wav = s_Dir / (s_In ? L"Zoom In.wav" : L"Zoom Out.wav");
-        const fs::path s_Mp3 = s_Dir / (s_In ? L"Zoom In.mp3" : L"Zoom Out.mp3");
-        if (!fs::exists(s_Wav, s_Ec) && !fs::exists(s_Mp3, s_Ec)) WriteWav(s_Wav, MakeZoomTick(s_In != 0), 0.6f);
-    }
+    const fs::path s_Tick = s_Dir / L"Zoom Tick.wav";
+    if (!fs::exists(s_Tick, s_Ec)) WriteWav(s_Tick, MakeZoomTick(true), 0.6f);
 }
 
-void BetterInstinct::PlayZoomSound(bool p_In) {
+std::wstring BetterInstinct::ZoomSoundFile() {
+    std::error_code s_Ec;
+    if (m_ZoomSoundPath[0]) {
+        const fs::path s_Own = fs::path(Utf8ToWide(m_ZoomSoundPath));
+        if (fs::exists(s_Own, s_Ec)) return s_Own.wstring();
+    }
+    const fs::path s_Tick = fs::path(m_SoundDir) / L"Zoom" / L"Zoom Tick.wav";
+    if (!fs::exists(s_Tick, s_Ec)) EnsureZoomSounds();
+    return s_Tick.wstring();
+}
+
+// Must run on the UI thread (the one that plays the Instinct sound): the MCI player did not work from the game's update thread.
+void BetterInstinct::PlayZoomSound() {
     if (!m_ZoomSoundEnabled || m_SoundDir.empty()) return;
-    const int s_I = p_In ? 1 : 0;
-    const std::wstring s_Alias = p_In ? L"instzin" : L"instzout";
-    if (m_ZoomSndState[s_I] == 2) return; // did not open: don't try again on every notch
-    if (m_ZoomSndState[s_I] == 0) {
+    if (!m_ZoomSndOpen) {
+        const std::wstring s_File = ZoomSoundFile();
         std::error_code s_Ec;
-        fs::path s_File = fs::path(m_SoundDir) / L"Zoom" / (p_In ? L"Zoom In.wav" : L"Zoom Out.wav");
-        if (!fs::exists(s_File, s_Ec)) s_File.replace_extension(L".mp3");
-        if (!fs::exists(s_File, s_Ec)) { EnsureZoomSounds(); s_File = fs::path(m_SoundDir) / L"Zoom" / (p_In ? L"Zoom In.wav" : L"Zoom Out.wav"); }
-        const std::wstring s_Cmd = L"open \"" + s_File.wstring() + L"\" type mpegvideo alias " + s_Alias;
-        if (!fs::exists(s_File, s_Ec) || mciSendStringW(s_Cmd.c_str(), nullptr, 0, nullptr) != 0) {
-            m_ZoomSndState[s_I] = 2;
+        if (!fs::exists(fs::path(s_File), s_Ec)) {
+            m_ZoomSoundStatus = "Zoom sound file not found.";
             return;
         }
-        m_ZoomSndState[s_I] = 1;
+        mciSendStringW(L"close instinctzoom", nullptr, 0, nullptr);
+        const std::wstring s_Cmd = L"open \"" + s_File + L"\" type mpegvideo alias instinctzoom";
+        const MCIERROR s_Err = mciSendStringW(s_Cmd.c_str(), nullptr, 0, nullptr);
+        if (s_Err != 0) {
+            wchar_t s_Text[256] = {};
+            mciGetErrorStringW(s_Err, s_Text, 256);
+            m_ZoomSoundStatus = "Couldn't open the zoom sound (use .wav or .mp3): " + WideToUtf8(s_Text);
+            return;
+        }
+        m_ZoomSndOpen = true;
+        m_ZoomSoundStatus.clear();
     }
     const int s_Vol = std::clamp(static_cast<int>(m_ZoomSoundVolume * 1000.0f), 0, 1000);
-    mciSendStringW((L"setaudio " + s_Alias + L" volume to " + std::to_wstring(s_Vol)).c_str(), nullptr, 0, nullptr);
-    mciSendStringW((L"play " + s_Alias + L" from 0").c_str(), nullptr, 0, nullptr);
+    mciSendStringW((L"setaudio instinctzoom volume to " + std::to_wstring(s_Vol)).c_str(), nullptr, 0, nullptr);
+    mciSendStringW(L"seek instinctzoom to start", nullptr, 0, nullptr);
+    mciSendStringW(L"play instinctzoom", nullptr, 0, nullptr);
 }
 
 void BetterInstinct::CloseZoomSounds() {
-    for (int s_I = 0; s_I < 2; ++s_I) {
-        if (m_ZoomSndState[s_I] == 1) {
-            const std::wstring s_Alias = s_I ? L"instzin" : L"instzout";
-            mciSendStringW((L"stop " + s_Alias).c_str(), nullptr, 0, nullptr);
-            mciSendStringW((L"close " + s_Alias).c_str(), nullptr, 0, nullptr);
-        }
-        m_ZoomSndState[s_I] = 0;
+    if (m_ZoomSndOpen) {
+        mciSendStringW(L"stop instinctzoom", nullptr, 0, nullptr);
+        mciSendStringW(L"close instinctzoom", nullptr, 0, nullptr);
     }
+    m_ZoomSndOpen = false;
 }
 
 void BetterInstinct::ScanSounds() {
@@ -1327,6 +1341,13 @@ void BetterInstinct::StopSound() {
 
 // Runs every frame from the UI callback, so sound also stops cleanly when you leave the mission.
 void BetterInstinct::UpdateSound(float p_Dt, bool p_InPlay) {
+    // The sound test is only meant to be short: it always ends by itself, so it can never keep playing after the window is gone.
+    if (m_Testing) {
+        m_TestTimer += p_Dt;
+        if (m_TestTimer > 6.0f) m_Testing = false;
+    } else {
+        m_TestTimer = 0.0f;
+    }
     const bool s_Wanted = m_SoundEnabled && ((m_Active.load() && p_InPlay) || m_Testing);
 
     if (s_Wanted && !m_SoundWasWanted) {
@@ -1335,6 +1356,7 @@ void BetterInstinct::UpdateSound(float p_Dt, bool p_InPlay) {
         StopSound();
     }
     m_SoundWasWanted = s_Wanted;
+    if (!s_Wanted && m_SndPlaying && m_SndDir == 0) StopSound(); // safety net: nothing wants the sound, so it must not be playing
 
     if (m_SndPlaying && m_SndDir != 0) {
         if (m_SndDir > 0) {
@@ -2549,7 +2571,7 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
         m_ZoomTarget += static_cast<float>(s_Delta) / 120.0f; // one wheel notch = one whole zoom level
     }
     m_ZoomTarget = std::clamp(m_ZoomTarget, 1.0f, std::max(1.0f, m_ZoomMax));
-    if (s_Gate && s_Delta != 0 && std::fabs(m_ZoomTarget - s_TargetBefore) > 0.001f) PlayZoomSound(m_ZoomTarget > s_TargetBefore); // only when the level really changed
+    if (s_Gate && s_Delta != 0 && std::fabs(m_ZoomTarget - s_TargetBefore) > 0.001f) m_ZoomSoundRequest.store(1); // only when the level really changed (played from the UI thread)
     if (!s_RightDown) m_ZoomTarget = 1.0f; // the zoom always starts from 1x on the next aim
     if (s_RightDown && !s_Gate) { // something is in the hands (or zoom is off): back to the game's own camera at once
         m_ZoomTarget = 1.0f;
@@ -4345,6 +4367,7 @@ void BetterInstinct::OnDrawMenu() {
 void BetterInstinct::OnDrawUI(bool p_HasFocus) {
     DrawHud();
     UpdateSound(m_LastHudDt, m_InPlay);
+    if (m_ZoomSoundRequest.exchange(0) != 0) PlayZoomSound();
 
     // A file picked in the "Browse..." dialog (it runs on its own thread): use it as the custom sound and save.
     if (g_BrowseReady.exchange(false)) {
@@ -4354,7 +4377,17 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             s_Picked = g_BrowseResult;
         }
         const std::string s_Utf8 = WideToUtf8(s_Picked);
-        if (!s_Utf8.empty() && s_Utf8.size() < sizeof(m_CustomPath)) {
+        if (g_BrowseTarget.load() == 1) { // the zoom sound
+            if (!s_Utf8.empty() && s_Utf8.size() < sizeof(m_ZoomSoundPath)) {
+                std::snprintf(m_ZoomSoundPath, sizeof(m_ZoomSoundPath), "%s", s_Utf8.c_str());
+                CloseZoomSounds();
+                m_ZoomSoundStatus.clear();
+                SaveSettings();
+                PlayZoomSound(); // a short preview of the chosen sound
+            } else if (!s_Utf8.empty()) {
+                m_ZoomSoundStatus = "That file path is too long.";
+            }
+        } else if (!s_Utf8.empty() && s_Utf8.size() < sizeof(m_CustomPath)) {
             std::snprintf(m_CustomPath, sizeof(m_CustomPath), "%s", s_Utf8.c_str());
             m_SoundSource = 1;
             CloseSound();
@@ -4510,11 +4543,30 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
             if (ImGui::Checkbox("Sound effect for each zoom step", &m_ZoomSoundEnabled)) { s_Changed = true; CloseZoomSounds(); }
             ImGui::BeginDisabled(!m_ZoomSoundEnabled);
-            if (ImGui::SliderFloat("Zoom sound volume", &m_ZoomSoundVolume, 0.0f, 1.0f, "%.2f")) s_Changed = true;
-            if (ImGui::Button("Test zoom in")) PlayZoomSound(true);
+            ImGui::BeginDisabled(g_BrowseBusy.load());
+            if (ImGui::Button(g_BrowseBusy.load() ? "Choose a file in the dialog..." : "Browse for your own zoom sound...")) {
+                std::wstring s_StartDir = m_SoundDir;
+                if (m_ZoomSoundPath[0]) {
+                    std::error_code s_BrowseEc;
+                    const fs::path s_Parent = fs::path(Utf8ToWide(m_ZoomSoundPath)).parent_path();
+                    if (!s_Parent.empty() && fs::is_directory(s_Parent, s_BrowseEc)) s_StartDir = s_Parent.wstring();
+                }
+                g_BrowseTarget = 1;
+                StartBrowse(s_StartDir);
+            }
+            ImGui::EndDisabled();
             ImGui::SameLine();
-            if (ImGui::Button("Test zoom out")) PlayZoomSound(false);
-            ImGui::TextDisabled("Your own sounds: put \"Zoom In\" and \"Zoom Out\" (.wav / .mp3) in mods\\InstinctSounds\\Zoom\\");
+            if (ImGui::Button("Use default")) {
+                m_ZoomSoundPath[0] = '\0';
+                CloseZoomSounds();
+                m_ZoomSoundStatus.clear();
+                s_Changed = true;
+            }
+            ImGui::TextDisabled("Zoom sound (same for zooming in and out): %s",
+                                m_ZoomSoundPath[0] ? WideToUtf8(fs::path(Utf8ToWide(m_ZoomSoundPath)).filename().wstring()).c_str() : "built-in");
+            if (ImGui::SliderFloat("Zoom sound volume", &m_ZoomSoundVolume, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+            if (ImGui::Button("Test zoom sound")) PlayZoomSound();
+            if (!m_ZoomSoundStatus.empty()) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", m_ZoomSoundStatus.c_str());
             ImGui::EndDisabled();
             {
                 ImGui::TextDisabled("Weapon check: press a button, close the menu, then hold right mouse STEADY for about 2 seconds.");
@@ -4669,6 +4721,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 const fs::path s_Parent = fs::path(Utf8ToWide(m_CustomPath)).parent_path();
                 if (!s_Parent.empty() && fs::is_directory(s_Parent, s_BrowseEc)) s_StartDir = s_Parent.wstring();
             }
+            g_BrowseTarget = 0;
             StartBrowse(s_StartDir);
         }
         ImGui::EndDisabled();
@@ -4745,6 +4798,8 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
             if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+    } else {
+        m_Testing = false; // window collapsed: nobody could press Stop
     }
     ImGui::End();
 
@@ -4773,6 +4828,7 @@ void BetterInstinct::ResetAllSettings() {
     m_ZoomLiveCam = true;
     m_ZoomSoundEnabled = true;
     m_ZoomSoundVolume = 0.6f;
+    m_ZoomSoundPath[0] = '\0';
     CloseZoomSounds();
 
     m_HudEnabled = true;
