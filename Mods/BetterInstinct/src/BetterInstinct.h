@@ -80,6 +80,9 @@ private:
     std::wstring CurrentSoundPath() const;
     bool OpenSound();
     void CloseSound();
+    void EnsureZoomSounds();
+    void PlayZoomSound(bool p_In);
+    void CloseZoomSounds();
     void ApplySoundVolume();
     void StartSound();
     void StopSound();
@@ -357,6 +360,9 @@ private:
     bool m_ZoomEnabled = true;       // wheel zoom while holding right mouse (empty hands / non-throwable item)
     float m_ZoomMax = 3.0f;          // furthest zoom (2 to 5), 1 = vanilla; each wheel notch is one whole level
     float m_ZoomSmooth = 10.0f;      // higher = snappier
+    bool m_ZoomSoundEnabled = true;  // a short sound for every zoom step
+    float m_ZoomSoundVolume = 0.6f;
+    int m_ZoomSndState[2] = {0, 0};  // [0] zoom out, [1] zoom in: 0 = not opened, 1 = open, 2 = could not be opened
     bool m_ZoomLiveCam = true;         // true = scale the live camera FOV (works); false = scale the UnAimed camera profiles (never found them in the logs)
 
     bool m_HudEnabled = true;
@@ -373,6 +379,7 @@ private:
     float m_LowColor[3] = {0.86f, 0.20f, 0.18f};
     float m_BarBottom[3] = {1.00f, 0.50f, 0.10f}; // color at the bottom (start) of the bar: orange
     float m_BarTop[3] = {1.00f, 0.88f, 0.25f};    // color at the top (end) of the bar: yellow
+    float m_IconSize = 2.0f;                      // diameter of the status circle, in bar widths
     bool m_ShowIcon = true;                       // round flame icon at the bottom of the bar
 
     bool m_TintRemove = false;       // no Instinct color at all: the grey grading is replaced by an identity LUT (outlines only)
