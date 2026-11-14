@@ -230,6 +230,7 @@ private:
     void UpdateWeapon(float p_Dt, bool p_RightDown);
     void LearnSample(SLearnSet& p_Set);
     void ComputeWeaponRules();
+    void LoadDefaultWeaponRules();
     bool GetSlotBase(int p_Slot, const uint8_t*& p_Base);
     void SaveWeaponRules();
     void LoadWeaponRules();
