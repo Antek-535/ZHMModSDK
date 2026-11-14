@@ -1200,32 +1200,51 @@ std::wstring BetterInstinct::ZoomSoundFile() {
     return s_Tick.wstring();
 }
 
+// Opens the zoom sound device (once). Called ahead of time from the UI thread (see OnDrawUI), so the first zoom step in the
+// game finds it ready instead of having to open the file at that very moment.
+bool BetterInstinct::OpenZoomSound() {
+    if (m_ZoomSndOpen) return true;
+    if (m_SoundDir.empty()) return false;
+    const std::wstring s_File = ZoomSoundFile();
+    std::error_code s_Ec;
+    if (!fs::exists(fs::path(s_File), s_Ec)) {
+        m_ZoomSoundStatus = "Zoom sound file not found.";
+        return false;
+    }
+    mciSendStringW(L"close instinctzoom", nullptr, 0, nullptr);
+    const std::wstring s_Cmd = L"open \"" + s_File + L"\" type mpegvideo alias instinctzoom";
+    const MCIERROR s_Err = mciSendStringW(s_Cmd.c_str(), nullptr, 0, nullptr);
+    if (s_Err != 0) {
+        wchar_t s_Text[256] = {};
+        mciGetErrorStringW(s_Err, s_Text, 256);
+        m_ZoomSoundStatus = "Couldn't open the zoom sound (use .wav or .mp3): " + WideToUtf8(s_Text);
+        return false;
+    }
+    m_ZoomSndOpen = true;
+    m_ZoomSoundStatus.clear();
+    return true;
+}
+
 // Must run on the UI thread (the one that plays the Instinct sound): the MCI player did not work from the game's update thread.
 void BetterInstinct::PlayZoomSound() {
     if (!m_ZoomSoundEnabled || m_SoundDir.empty()) return;
-    if (!m_ZoomSndOpen) {
-        const std::wstring s_File = ZoomSoundFile();
-        std::error_code s_Ec;
-        if (!fs::exists(fs::path(s_File), s_Ec)) {
-            m_ZoomSoundStatus = "Zoom sound file not found.";
-            return;
-        }
-        mciSendStringW(L"close instinctzoom", nullptr, 0, nullptr);
-        const std::wstring s_Cmd = L"open \"" + s_File + L"\" type mpegvideo alias instinctzoom";
-        const MCIERROR s_Err = mciSendStringW(s_Cmd.c_str(), nullptr, 0, nullptr);
-        if (s_Err != 0) {
-            wchar_t s_Text[256] = {};
-            mciGetErrorStringW(s_Err, s_Text, 256);
-            m_ZoomSoundStatus = "Couldn't open the zoom sound (use .wav or .mp3): " + WideToUtf8(s_Text);
-            return;
-        }
-        m_ZoomSndOpen = true;
-        m_ZoomSoundStatus.clear();
-    }
+
     const int s_Vol = std::clamp(static_cast<int>(m_ZoomSoundVolume * 1000.0f), 0, 1000);
-    mciSendStringW((L"setaudio instinctzoom volume to " + std::to_wstring(s_Vol)).c_str(), nullptr, 0, nullptr);
-    mciSendStringW(L"seek instinctzoom to start", nullptr, 0, nullptr);
-    mciSendStringW(L"play instinctzoom", nullptr, 0, nullptr);
+    const std::wstring s_VolCmd = L"setaudio instinctzoom volume to " + std::to_wstring(s_Vol);
+    // "play ... from 0" is one command (the old separate "seek" + "play" could be dropped while the player was still busy).
+    auto s_TryPlay = [&]() -> bool {
+        if (!OpenZoomSound()) return false;
+        mciSendStringW(s_VolCmd.c_str(), nullptr, 0, nullptr);
+        return mciSendStringW(L"play instinctzoom from 0", nullptr, 0, nullptr) == 0;
+    };
+
+    if (!s_TryPlay()) {
+        // The player was in a bad state (or never opened properly): throw it away, open it fresh and try once more.
+        CloseZoomSounds();
+        if (!s_TryPlay()) {
+            if (m_ZoomSoundStatus.empty()) m_ZoomSoundStatus = "Couldn't play the zoom sound.";
+        }
+    }
 }
 
 void BetterInstinct::CloseZoomSounds() {
@@ -1270,6 +1289,15 @@ std::wstring BetterInstinct::CurrentSoundPath() const {
     return L"";
 }
 
+// Asks Windows whether an MCI device with this alias exists and is playing (independent of our own flags).
+static bool MciDeviceExists(const wchar_t* p_Alias, bool* p_Playing = nullptr) {
+    wchar_t s_Buf[64] = {};
+    const std::wstring s_Cmd = std::wstring(L"status ") + p_Alias + L" mode";
+    const MCIERROR s_Err = mciSendStringW(s_Cmd.c_str(), s_Buf, 64, nullptr);
+    if (p_Playing) *p_Playing = (s_Err == 0) && (_wcsicmp(s_Buf, L"playing") == 0);
+    return s_Err == 0;
+}
+
 bool BetterInstinct::OpenSound() {
     const std::wstring s_Path = CurrentSoundPath();
     std::error_code s_Ec;
@@ -1291,14 +1319,18 @@ bool BetterInstinct::OpenSound() {
 }
 
 void BetterInstinct::CloseSound() {
-    if (m_SndOpen) {
+    // Always stop + close, whatever our own flags say, and check that the device is really gone. Before, this only ran when
+    // m_SndOpen was set: if a close ever failed or the flags got out of step, the looping sound kept playing forever.
+    for (int i = 0; i < 3; ++i) {
         mciSendStringW(L"stop instinctsnd", nullptr, 0, nullptr);
         mciSendStringW(L"close instinctsnd", nullptr, 0, nullptr);
+        if (!MciDeviceExists(L"instinctsnd")) break;
     }
     m_SndOpen = false;
     m_SndPlaying = false;
     m_SndDir = 0;
     m_SndGain = 0.0f;
+    m_SndFadeTime = 0.0f;
 }
 
 void BetterInstinct::ApplySoundVolume() {
@@ -1333,6 +1365,7 @@ void BetterInstinct::StopSound() {
     if (!m_SndPlaying) return;
 
     if (m_FadeOutOn && m_FadeOutMs > 0.0f) {
+        if (m_SndDir != -1) m_SndFadeTime = 0.0f;
         m_SndDir = -1;
     } else {
         CloseSound();
@@ -1358,6 +1391,19 @@ void BetterInstinct::UpdateSound(float p_Dt, bool p_InPlay) {
     m_SoundWasWanted = s_Wanted;
     if (!s_Wanted && m_SndPlaying && m_SndDir == 0) StopSound(); // safety net: nothing wants the sound, so it must not be playing
 
+    // Watchdog: when nothing wants the sound and we think it is off, ask Windows too. If a player is still playing (a leftover
+    // from a failed close, a settings reset, ...), shut it down. This is what stops an "Instinct sound that never ends".
+    if (!s_Wanted && !m_SndPlaying) {
+        m_SndWatchTimer += p_Dt;
+        if (m_SndWatchTimer >= 0.5f) {
+            m_SndWatchTimer = 0.0f;
+            bool s_Playing = false;
+            if (MciDeviceExists(L"instinctsnd", &s_Playing) && s_Playing) CloseSound();
+        }
+    } else {
+        m_SndWatchTimer = 0.0f;
+    }
+
     if (m_SndPlaying && m_SndDir != 0) {
         if (m_SndDir > 0) {
             m_SndGain += p_Dt / std::max(m_FadeInMs * 0.001f, 0.001f);
@@ -1365,7 +1411,8 @@ void BetterInstinct::UpdateSound(float p_Dt, bool p_InPlay) {
             ApplySoundVolume();
         } else {
             m_SndGain -= p_Dt / std::max(m_FadeOutMs * 0.001f, 0.001f);
-            if (m_SndGain <= 0.0f) {
+            m_SndFadeTime += p_Dt;
+            if (m_SndGain <= 0.0f || m_SndFadeTime > m_FadeOutMs * 0.001f + 0.5f) { // (the time limit: a fade can never hang)
                 CloseSound();
             } else {
                 ApplySoundVolume();
@@ -4367,6 +4414,15 @@ void BetterInstinct::OnDrawMenu() {
 void BetterInstinct::OnDrawUI(bool p_HasFocus) {
     DrawHud();
     UpdateSound(m_LastHudDt, m_InPlay);
+    // Keep the zoom sound player open and ready, so the first zoom step in the game plays right away (it used to only work
+    // after pressing "Test zoom sound", because that was what opened the player).
+    if (m_ZoomSoundEnabled && !m_ZoomSndOpen) {
+        m_ZoomPrepTimer -= m_LastHudDt;
+        if (m_ZoomPrepTimer <= 0.0f) {
+            m_ZoomPrepTimer = 2.0f; // if the file is missing/broken, don't retry every frame
+            OpenZoomSound();
+        }
+    }
     if (m_ZoomSoundRequest.exchange(0) != 0) PlayZoomSound();
 
     // A file picked in the "Browse..." dialog (it runs on its own thread): use it as the custom sound and save.
@@ -4871,7 +4927,11 @@ void BetterInstinct::ResetAllSettings() {
     m_PresetName.clear();
     m_CustomPath[0] = '\0';
     m_Testing = false;
-    CloseSound();
+    m_TestTimer = 0.0f;
+    CloseSound();            // hard stop (also kills a looping leftover)
+    m_SoundWasWanted = false; // so the sound logic starts clean after the reset
+    m_SndWatchTimer = 0.0f;
+    m_ZoomPrepTimer = 0.0f;
     ScanSounds();
     ApplySoundVolume();
 
