@@ -528,6 +528,21 @@ Samples PresetPulseSweep() { // 1.5 s loop, fades to silence at both ends
     return s;
 }
 
+Samples MakeZoomTick(bool p_Up) { // a short blip: rising for zoom in, falling for zoom out
+    const uint32_t n = static_cast<uint32_t>(kRate * 0.11f);
+    Samples s(n);
+    double s_Phase = 0.0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / kRate;
+        const float k = static_cast<float>(i) / n;
+        const float f = p_Up ? 520.0f + 300.0f * k : 820.0f - 300.0f * k;
+        s_Phase += 2.0 * kPi * f / kRate;
+        const float env = std::min(1.0f, t / 0.004f) * std::exp(-t * 30.0f);
+        s[i] = (static_cast<float>(std::sin(s_Phase)) + 0.3f * static_cast<float>(std::sin(2.0 * s_Phase))) * env * 0.75f;
+    }
+    return s;
+}
+
 // Case-insensitive "does p_Hay contain p_NeedleLower" (p_NeedleLower must already be lowercase). No allocations.
 bool ContainsNoCase(const char* p_Hay, const std::string& p_NeedleLower) {
     if (p_NeedleLower.empty()) return false;
@@ -579,6 +594,7 @@ BetterInstinct::~BetterInstinct() {
     if (m_HasPlayer.load()) RestoreGlowColors(); // put the game's own colors back
     RestoreTint();
     CloseSound();
+    CloseZoomSounds();
     g_Guard.reset(); // removes the input hooks
 
     if (m_Touched && Globals::GameTimeManager) {
@@ -615,6 +631,7 @@ void BetterInstinct::OnEngineInitialized() {
         std::error_code s_Ec;
         fs::create_directories(fs::path(m_SoundDir), s_Ec);
         EnsurePresets();
+        EnsureZoomSounds();
         LoadSoundText();
         ScanSounds();
     } catch (...) {
@@ -949,9 +966,12 @@ bool BetterInstinct::SaveConfigFile() {
         s_Flt("bar_top_g", m_BarTop[1]);
         s_Flt("bar_top_b", m_BarTop[2]);
         s_Bool("show_icon", m_ShowIcon);
+        s_Flt("icon_size", m_IconSize);
         s_Bool("zoom_enabled", m_ZoomEnabled);
         s_Flt("zoom_max", m_ZoomMax);
         s_Flt("zoom_smooth", m_ZoomSmooth);
+        s_Bool("zoom_sound", m_ZoomSoundEnabled);
+        s_Flt("zoom_sound_volume", m_ZoomSoundVolume);
         s_Flt("fill_r", m_FillColor[0]);
         s_Flt("fill_g", m_FillColor[1]);
         s_Flt("fill_b", m_FillColor[2]);
@@ -1079,9 +1099,12 @@ bool BetterInstinct::LoadConfigFile() {
     s_Flt("bar_top_g", m_BarTop[1], 0.0f, 1.0f);
     s_Flt("bar_top_b", m_BarTop[2], 0.0f, 1.0f);
     s_Bool("show_icon", m_ShowIcon);
+    s_Flt("icon_size", m_IconSize, 1.2f, 3.0f);
     s_Bool("zoom_enabled", m_ZoomEnabled);
     s_Flt("zoom_max", m_ZoomMax, 2.0f, 5.0f);
     s_Flt("zoom_smooth", m_ZoomSmooth, 2.0f, 40.0f);
+    s_Bool("zoom_sound", m_ZoomSoundEnabled);
+    s_Flt("zoom_sound_volume", m_ZoomSoundVolume, 0.0f, 1.0f);
     s_Flt("fill_r", m_FillColor[0], 0.0f, 1.0f);
     s_Flt("fill_g", m_FillColor[1], 0.0f, 1.0f);
     s_Flt("fill_b", m_FillColor[2], 0.0f, 1.0f);
@@ -1151,6 +1174,51 @@ void BetterInstinct::EnsurePresets() {
         if (!fs::exists(s_Path, s_Ec)) {
             WriteWav(s_Path, s_Preset.Make(), 0.6f);
         }
+    }
+}
+
+// The zoom sounds live in InstinctSounds\Zoom\ ("Zoom In" / "Zoom Out", .wav or .mp3): replace them to use your own.
+void BetterInstinct::EnsureZoomSounds() {
+    std::error_code s_Ec;
+    const fs::path s_Dir = fs::path(m_SoundDir) / L"Zoom";
+    fs::create_directories(s_Dir, s_Ec);
+    for (int s_In = 0; s_In < 2; ++s_In) {
+        const fs::path s_Wav = s_Dir / (s_In ? L"Zoom In.wav" : L"Zoom Out.wav");
+        const fs::path s_Mp3 = s_Dir / (s_In ? L"Zoom In.mp3" : L"Zoom Out.mp3");
+        if (!fs::exists(s_Wav, s_Ec) && !fs::exists(s_Mp3, s_Ec)) WriteWav(s_Wav, MakeZoomTick(s_In != 0), 0.6f);
+    }
+}
+
+void BetterInstinct::PlayZoomSound(bool p_In) {
+    if (!m_ZoomSoundEnabled || m_SoundDir.empty()) return;
+    const int s_I = p_In ? 1 : 0;
+    const std::wstring s_Alias = p_In ? L"instzin" : L"instzout";
+    if (m_ZoomSndState[s_I] == 2) return; // did not open: don't try again on every notch
+    if (m_ZoomSndState[s_I] == 0) {
+        std::error_code s_Ec;
+        fs::path s_File = fs::path(m_SoundDir) / L"Zoom" / (p_In ? L"Zoom In.wav" : L"Zoom Out.wav");
+        if (!fs::exists(s_File, s_Ec)) s_File.replace_extension(L".mp3");
+        if (!fs::exists(s_File, s_Ec)) { EnsureZoomSounds(); s_File = fs::path(m_SoundDir) / L"Zoom" / (p_In ? L"Zoom In.wav" : L"Zoom Out.wav"); }
+        const std::wstring s_Cmd = L"open \"" + s_File.wstring() + L"\" type mpegvideo alias " + s_Alias;
+        if (!fs::exists(s_File, s_Ec) || mciSendStringW(s_Cmd.c_str(), nullptr, 0, nullptr) != 0) {
+            m_ZoomSndState[s_I] = 2;
+            return;
+        }
+        m_ZoomSndState[s_I] = 1;
+    }
+    const int s_Vol = std::clamp(static_cast<int>(m_ZoomSoundVolume * 1000.0f), 0, 1000);
+    mciSendStringW((L"setaudio " + s_Alias + L" volume to " + std::to_wstring(s_Vol)).c_str(), nullptr, 0, nullptr);
+    mciSendStringW((L"play " + s_Alias + L" from 0").c_str(), nullptr, 0, nullptr);
+}
+
+void BetterInstinct::CloseZoomSounds() {
+    for (int s_I = 0; s_I < 2; ++s_I) {
+        if (m_ZoomSndState[s_I] == 1) {
+            const std::wstring s_Alias = s_I ? L"instzin" : L"instzout";
+            mciSendStringW((L"stop " + s_Alias).c_str(), nullptr, 0, nullptr);
+            mciSendStringW((L"close " + s_Alias).c_str(), nullptr, 0, nullptr);
+        }
+        m_ZoomSndState[s_I] = 0;
     }
 }
 
@@ -2476,10 +2544,12 @@ void BetterInstinct::UpdateZoom(float p_Dt) {
             m_ZoomLogDirty = false;
         }
     }
+    const float s_TargetBefore = m_ZoomTarget;
     if (s_Gate && s_Delta != 0) {
         m_ZoomTarget += static_cast<float>(s_Delta) / 120.0f; // one wheel notch = one whole zoom level
     }
     m_ZoomTarget = std::clamp(m_ZoomTarget, 1.0f, std::max(1.0f, m_ZoomMax));
+    if (s_Gate && s_Delta != 0 && std::fabs(m_ZoomTarget - s_TargetBefore) > 0.001f) PlayZoomSound(m_ZoomTarget > s_TargetBefore); // only when the level really changed
     if (!s_RightDown) m_ZoomTarget = 1.0f; // the zoom always starts from 1x on the next aim
     if (s_RightDown && !s_Gate) { // something is in the hands (or zoom is off): back to the game's own camera at once
         m_ZoomTarget = 1.0f;
@@ -4047,7 +4117,7 @@ void BetterInstinct::DrawHud() {
     const float s_Cx = std::clamp(s_Screen.x * std::clamp(m_HudX, 0.0f, 1.0f), s_HalfAcross,
                                   std::max(s_HalfAcross, s_Screen.x - s_HalfAcross));
     // The status icon is a round "bulb" attached to the start of the bar (below a vertical bar, left of a horizontal one).
-    const float s_IconR = s_Girth * 1.5f;
+    const float s_IconR = s_Girth * 0.5f * m_IconSize; // the circle's diameter is m_IconSize bar widths
     // Center of the bulb beyond the bar's end: exactly where the circle is as wide as the bar, so the bar's two edges run
     // straight into the circle's outline (a full circle, not a cut-off one).
     const float s_IconOff = std::sqrt(std::max(0.0f, s_IconR * s_IconR - (s_Girth * 0.5f) * (s_Girth * 0.5f)));
@@ -4097,7 +4167,7 @@ void BetterInstinct::DrawHud() {
     // Bulb backing (only the part outside the bar, so it joins the bar without double darkening).
     ImVec2 s_Glyph(0.0f, 0.0f); // center of the icon symbol
     if (m_ShowIcon) {
-        const float s_BorderA = s_Active ? 0.55f + 0.2f * std::sin(s_Time * 6.0f) : 0.35f;
+        const float s_BorderA = 0.4f; // the circle's outline is steady: only the arrows pulse
         ImVec2 s_Ic;
         if (s_Vert) {
             s_Ic = ImVec2(s_Cx, s_Bottom + s_IconOff);
@@ -4225,15 +4295,16 @@ void BetterInstinct::DrawHud() {
     // Status symbol in the bulb: red down arrow while Instinct is in use, golden up arrow while it can't be used
     // (empty / recharging), and the orange flame (black inside) once it can be used again.
     if (m_ShowIcon) {
+        const float s_Pulse = 0.55f + 0.45f * std::sin(s_Time * 7.0f); // the arrows light up and fade again, over and over
         auto s_Chevron = [&](bool p_Down, float p_R, float p_G, float p_B) {
-            const float s_Hw = s_IconR * 0.36f;
+            const float s_Hw = s_IconR * 0.42f;
             const float s_Hh = s_Hw * 0.49f;       // same proportions as the reference arrow
             const float s_Stroke = std::max(1.5f, s_Hw * 2.0f * 0.13f);
             const float s_Dy = p_Down ? s_Hh : -s_Hh; // the tip
             const ImVec2 s_P1(s_Glyph.x - s_Hw, s_Glyph.y - s_Dy);
             const ImVec2 s_P2(s_Glyph.x, s_Glyph.y + s_Dy);
             const ImVec2 s_P3(s_Glyph.x + s_Hw, s_Glyph.y - s_Dy);
-            const ImU32 s_C = s_Col(p_R, p_G, p_B, s_A);
+            const ImU32 s_C = s_Col(p_R, p_G, p_B, s_A * s_Pulse);
             s_Dl->AddLine(s_P1, s_P2, s_C, s_Stroke);
             s_Dl->AddLine(s_P2, s_P3, s_C, s_Stroke);
             for (const ImVec2& s_P : {s_P1, s_P2, s_P3}) s_Dl->AddCircleFilled(s_P, s_Stroke * 0.5f, s_C, 12); // round ends and corner
@@ -4437,6 +4508,14 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                 if (ImGui::SliderInt("Max zoom", &s_MaxLevel, 2, 5, "%dx")) { m_ZoomMax = static_cast<float>(s_MaxLevel); s_Changed = true; }
             }
             if (ImGui::SliderFloat("Smoothing", &m_ZoomSmooth, 2.0f, 40.0f, "%.0f")) s_Changed = true;
+            if (ImGui::Checkbox("Sound effect for each zoom step", &m_ZoomSoundEnabled)) { s_Changed = true; CloseZoomSounds(); }
+            ImGui::BeginDisabled(!m_ZoomSoundEnabled);
+            if (ImGui::SliderFloat("Zoom sound volume", &m_ZoomSoundVolume, 0.0f, 1.0f, "%.2f")) s_Changed = true;
+            if (ImGui::Button("Test zoom in")) PlayZoomSound(true);
+            ImGui::SameLine();
+            if (ImGui::Button("Test zoom out")) PlayZoomSound(false);
+            ImGui::TextDisabled("Your own sounds: put \"Zoom In\" and \"Zoom Out\" (.wav / .mp3) in mods\\InstinctSounds\\Zoom\\");
+            ImGui::EndDisabled();
             {
                 ImGui::TextDisabled("Weapon check: press a button, close the menu, then hold right mouse STEADY for about 2 seconds.");
                 ImGui::TextDisabled("Do it with empty hands and with a weapon in hand (twice each is best; once with a pistol, once with a rifle).");
@@ -4561,6 +4640,9 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
         if (ImGui::ColorEdit3("Bar color: bottom", m_BarBottom)) s_Changed = true;
         if (ImGui::ColorEdit3("Bar color: top", m_BarTop)) s_Changed = true;
         if (ImGui::Checkbox("Status icon on the bar (flame / arrows)", &m_ShowIcon)) s_Changed = true;
+        ImGui::BeginDisabled(!m_ShowIcon);
+        if (ImGui::SliderFloat("Icon size", &m_IconSize, 1.2f, 3.0f, "%.2fx bar width")) s_Changed = true;
+        ImGui::EndDisabled();
         if (ImGui::ColorEdit3("Low-meter color", m_LowColor)) s_Changed = true;
         ImGui::EndDisabled();
 
@@ -4689,6 +4771,9 @@ void BetterInstinct::ResetAllSettings() {
     m_ZoomMax = 3.0f;
     m_ZoomSmooth = 10.0f;
     m_ZoomLiveCam = true;
+    m_ZoomSoundEnabled = true;
+    m_ZoomSoundVolume = 0.6f;
+    CloseZoomSounds();
 
     m_HudEnabled = true;
     m_HudAlways = false;
@@ -4705,6 +4790,7 @@ void BetterInstinct::ResetAllSettings() {
     m_BarBottom[0] = 1.00f; m_BarBottom[1] = 0.50f; m_BarBottom[2] = 0.10f;
     m_BarTop[0] = 1.00f; m_BarTop[1] = 0.88f; m_BarTop[2] = 0.25f;
     m_ShowIcon = true;
+    m_IconSize = 2.0f;
 
     m_TintRemove = false;
     m_TintEnabled = false;
