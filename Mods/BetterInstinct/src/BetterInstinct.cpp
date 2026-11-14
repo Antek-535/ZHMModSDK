@@ -2349,6 +2349,84 @@ void BetterInstinct::SaveWeaponRules() {
     }
 }
 
+// The weapon check that comes with the mod (learned once with empty hands / pistol / rifle), so nothing has to be learned by hand.
+// It is used when there is no learned file, and again after "Forget". Learning yourself replaces it.
+namespace {
+struct SDefaultWeaponRule { int Slot, Index, Mode; uint32_t Value, Empty; };
+const SDefaultWeaponRule kDefaultWeaponRules[] = {
+    {0, 626, 0, 257u, 0u},
+    {0, 628, 0, 2u, 0u},
+    {0, 629, 0, 2u, 0u},
+    {0, 630, 0, 2u, 0u},
+    {0, 642, 0, 17072u, 0u},
+    {0, 906, 0, 1025u, 1u},
+    {1, 46, 0, 257u, 1u},
+    {1, 860, 0, 257u, 0u},
+    {1, 862, 0, 2u, 0u},
+    {1, 863, 0, 2u, 0u},
+    {1, 864, 0, 2u, 0u},
+    {1, 876, 0, 17072u, 0u},
+    {1, 1140, 0, 1025u, 1u},
+    {2, 64, 0, 257u, 1u},
+    {2, 878, 0, 257u, 0u},
+    {2, 880, 0, 2u, 0u},
+    {2, 881, 0, 2u, 0u},
+    {2, 882, 0, 2u, 0u},
+    {2, 894, 0, 17072u, 0u},
+    {5, 209, 0, 1u, 0u},
+    {5, 211, 0, 1u, 0u},
+    {5, 273, 0, 1u, 0u},
+    {5, 275, 0, 1u, 0u},
+    {6, 34, 0, 3u, 8u},
+    {19, 406, 0, 12u, 13u},
+    {22, 198, 0, 257u, 1u},
+    {24, 16, 0, 0u, 2u},
+    {26, 53, 0, 1u, 0u},
+    {26, 55, 0, 1u, 0u},
+    {26, 460, 0, 257u, 1u},
+    {0, 994, 2, 0u, 1065353216u},
+    {0, 1276, 1, 998911820u, 0u},
+    {0, 1277, 1, 1032828504u, 0u},
+    {0, 1278, 1, 3212795357u, 0u},
+    {0, 1281, 1, 75104258u, 0u},
+    {1, 1228, 2, 0u, 1065353216u},
+    {1, 1510, 1, 998911820u, 0u},
+    {1, 1511, 1, 1032828504u, 0u},
+    {1, 1512, 1, 3212795357u, 0u},
+    {1, 1515, 1, 75104258u, 0u},
+    {5, 208, 1, 2989441712u, 0u},
+    {5, 210, 1, 2989439104u, 0u},
+    {5, 272, 1, 2989441712u, 0u},
+    {5, 274, 1, 2989439104u, 0u},
+    {13, 46, 2, 0u, 934453312u},
+    {13, 48, 2, 0u, 934453304u},
+    {13, 58, 2, 0u, 934455344u},
+    {18, 12, 1, 65792u, 0u},
+    {18, 32, 1, 1065353216u, 0u},
+    {18, 33, 1, 1065353216u, 0u},
+    {18, 34, 1, 1045220557u, 0u},
+    {19, 504, 1, 65792u, 0u},
+    {26, 52, 1, 2989441712u, 0u},
+    {26, 54, 1, 2989439104u, 0u},
+};
+} // namespace
+
+void BetterInstinct::LoadDefaultWeaponRules() {
+    m_WeaponRules.clear();
+    for (const SDefaultWeaponRule& s_D : kDefaultWeaponRules) {
+        if (s_D.Slot < 0 || s_D.Slot >= kLearnSlots || s_D.Index < 0 || s_D.Index >= LearnSlotDwords(s_D.Slot)) continue;
+        SWeaponRule s_R;
+        s_R.Slot = s_D.Slot;
+        s_R.Index = s_D.Index;
+        s_R.Mode = s_D.Mode;
+        s_R.Value = s_D.Value;
+        s_R.Empty = s_D.Empty;
+        s_R.HasEmpty = true;
+        m_WeaponRules.push_back(s_R);
+    }
+    m_WeaponRuleCount.store(static_cast<int>(m_WeaponRules.size()));
+}
+
 void BetterInstinct::LoadWeaponRules() {
     m_WeaponRules.clear();
     try {
@@ -2374,6 +2452,7 @@ void BetterInstinct::LoadWeaponRules() {
         }
     } catch (...) {
     }
+    if (m_WeaponRules.empty()) LoadDefaultWeaponRules(); // nothing learned by the player: use the built-in check
     m_WeaponRuleCount.store(static_cast<int>(m_WeaponRules.size()));
 }
 
@@ -2393,11 +2472,10 @@ void BetterInstinct::UpdateWeapon(float p_Dt, bool p_RightDown) {
     } else if (s_Req == 3) {
         m_LearnE = SLearnSet();
         m_LearnW = SLearnSet();
-        m_WeaponRules.clear();
+        LoadDefaultWeaponRules(); // back to the built-in weapon check
         m_LearnMode = 0;
         m_WeaponHeld = false;
         m_WeaponLatch = false;
-        m_WeaponRuleCount.store(0);
         m_LearnRoundsE.store(0);
         m_LearnRoundsW.store(0);
         SaveWeaponRules();
@@ -4638,7 +4716,7 @@ void BetterInstinct::OnDrawUI(bool p_HasFocus) {
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "LEARNING %s: hold right mouse steady... (%d/30)",
                                        s_LM == 1 ? "EMPTY hands" : "WEAPON", m_LearnUiTaken.load());
                 }
-                static const char* s_WTxt[] = {"not learned yet (zoom is NOT blocked with weapons until you learn it)",
+                static const char* s_WTxt[] = {"no weapon check available",
                                                "learned, but nothing differed between the two states: repeat with right mouse held steady",
                                                "ready: no weapon in hand", "ready: WEAPON detected, zoom off"};
                 ImGui::TextDisabled("Weapon check: %s", s_WTxt[std::clamp(m_WeaponState.load(), 0, 3)]);
